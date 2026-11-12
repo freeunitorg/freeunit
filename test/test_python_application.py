@@ -142,24 +142,26 @@ def test_python_application_query_string():
 def test_python_application_query_string_space():
     client.load('query_string')
 
-    resp = client.get(url='/ ?var1=val1&var2=val2')
+    resp = client.get(url='/%20?var1=val1&var2=val2')
     assert (
         resp['headers']['Query-String'] == 'var1=val1&var2=val2'
     ), 'Query-String space'
 
-    resp = client.get(url='/ %20?var1=val1&var2=val2')
+    resp = client.get(url='/%20%20?var1=val1&var2=val2')
     assert (
         resp['headers']['Query-String'] == 'var1=val1&var2=val2'
     ), 'Query-String space 2'
 
-    resp = client.get(url='/ %20 ?var1=val1&var2=val2')
+    resp = client.get(url='/%20%20%20?var1=val1&var2=val2')
     assert (
         resp['headers']['Query-String'] == 'var1=val1&var2=val2'
     ), 'Query-String space 3'
 
-    resp = client.get(url='/blah %20 blah? var1= val1 & var2=val2')
+    resp = client.get(
+        url='/blah%20%20%20blah?%20var1=%20val1%20&%20var2=val2'
+    )
     assert (
-        resp['headers']['Query-String'] == ' var1= val1 & var2=val2'
+        resp['headers']['Query-String'] == '%20var1=%20val1%20&%20var2=val2'
     ), 'Query-String space 4'
 
 

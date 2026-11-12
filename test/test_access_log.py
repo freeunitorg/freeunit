@@ -323,7 +323,8 @@ def test_access_log_text_escape(wait_for_record):
     set_format('$remote_addr "$uri" $status')
 
     assert (
-        client.get(url='/%0d%0a1.2.3.4 "GET /forged" 200')['status'] == 200
+        client.get(url='/%0d%0a1.2.3.4%20"GET%20/forged"%20200')['status']
+        == 200
     )
     assert wait_for_record(r'\\x0D\\x0A', 'access.log') is not None
 

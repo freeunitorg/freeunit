@@ -130,24 +130,26 @@ def test_asgi_application_prefix():
 def test_asgi_application_query_string_space():
     client.load('query_string')
 
-    resp = client.get(url='/ ?var1=val1&var2=val2')
+    resp = client.get(url='/%20?var1=val1&var2=val2')
     assert (
         resp['headers']['query-string'] == 'var1=val1&var2=val2'
     ), 'query-string space'
 
-    resp = client.get(url='/ %20?var1=val1&var2=val2')
+    resp = client.get(url='/%20%20?var1=val1&var2=val2')
     assert (
         resp['headers']['query-string'] == 'var1=val1&var2=val2'
     ), 'query-string space 2'
 
-    resp = client.get(url='/ %20 ?var1=val1&var2=val2')
+    resp = client.get(url='/%20%20%20?var1=val1&var2=val2')
     assert (
         resp['headers']['query-string'] == 'var1=val1&var2=val2'
     ), 'query-string space 3'
 
-    resp = client.get(url='/blah %20 blah? var1= val1 & var2=val2')
+    resp = client.get(
+        url='/blah%20%20%20blah?%20var1=%20val1%20&%20var2=val2'
+    )
     assert (
-        resp['headers']['query-string'] == ' var1= val1 & var2=val2'
+        resp['headers']['query-string'] == '%20var1=%20val1%20&%20var2=val2'
     ), 'query-string space 4'
 
 

@@ -722,23 +722,27 @@ def test_static_space_in_name(temp_dir):
     Path(f'{assets_dir}/dir/file').rename(f'{assets_dir}/dir/fi le')
 
     assert waitforfiles(f'{assets_dir}/dir/fi le')
-    assert client.get(url='/dir/fi le')['body'] == 'blah', 'file name'
+    assert client.get(url='/dir/fi%20le')['body'] == 'blah', 'file name'
 
     Path(f'{assets_dir}/dir').rename(f'{assets_dir}/di r')
     assert waitforfiles(f'{assets_dir}/di r/fi le')
-    assert client.get(url='/di r/fi le')['body'] == 'blah', 'dir name'
+    assert client.get(url='/di%20r/fi%20le')['body'] == 'blah', 'dir name'
 
     Path(f'{assets_dir}/di r').rename(f'{assets_dir}/ di r ')
     assert waitforfiles(f'{assets_dir}/ di r /fi le')
     assert (
-        client.get(url='/ di r /fi le')['body'] == 'blah'
+        client.get(url='/%20di%20r%20/fi%20le')['body'] == 'blah'
     ), 'dir name enclosing'
 
     assert (
-        client.get(url='/%20di%20r%20/fi le')['body'] == 'blah'
+        client.get(url='/%20di%20r%20/fi%20le')['body'] == 'blah'
     ), 'dir encoded'
-    assert client.get(url='/ di r %2Ffi le')['body'] == 'blah', 'slash encoded'
-    assert client.get(url='/ di r /fi%20le')['body'] == 'blah', 'file encoded'
+    assert (
+        client.get(url='/%20di%20r%20%2Ffi%20le')['body'] == 'blah'
+    ), 'slash encoded'
+    assert (
+        client.get(url='/%20di%20r%20/fi%20le')['body'] == 'blah'
+    ), 'file encoded'
     assert (
         client.get(url='/%20di%20r%20%2Ffi%20le')['body'] == 'blah'
     ), 'encoded'
@@ -768,12 +772,12 @@ def test_static_space_in_name(temp_dir):
             f'{assets_dir}/ di r /фа йл'
         )
         assert waitforfiles(f'{assets_dir}/ di r /фа йл')
-        assert client.get(url='/ di r /фа йл')['body'] == 'blah'
+        assert client.get(url='/%20di%20r%20/фа%20йл')['body'] == 'blah'
 
         Path(f'{assets_dir}/ di r ').rename(f'{assets_dir}/ди ректория')
         assert waitforfiles(f'{assets_dir}/ди ректория/фа йл')
         assert (
-            client.get(url='/ди ректория/фа йл')['body'] == 'blah'
+            client.get(url='/ди%20ректория/фа%20йл')['body'] == 'blah'
         ), 'dir name 2'
 
 
