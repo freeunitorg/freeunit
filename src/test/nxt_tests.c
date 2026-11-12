@@ -320,6 +320,91 @@ nxt_http_date_range_test(nxt_thread_t *thr)
 }
 
 
+/*
+ * nxt_encode_complex_uri() and nxt_is_complex_uri_encoded() pass the first
+ * "?" and the first "#" raw.  A NUL byte after them must be escaped, and the
+ * walk must not read past its "?#\0" literal.  The child runs the cases, so
+ * a sanitizer report on that read fails the test.
+ */
+
+static int
+nxt_complex_uri_test_child(void *data)
+{
+    u_char        *end;
+    size_t        n;
+    nxt_bool_t    enc;
+    nxt_uint_t    i;
+    nxt_thread_t  *thr;
+    u_char        buf[64];
+
+    static const struct {
+        nxt_str_t   in;
+        nxt_str_t   out;
+        nxt_bool_t  encoded;
+    } cases[] = {
+        { nxt_string("/a?\0"),       nxt_string("/a?%00"),         0 },
+        { nxt_string("/a#\0"),       nxt_string("/a#%00"),         0 },
+        { nxt_string("/a?#\0"),      nxt_string("/a?#%00"),        0 },
+        { nxt_string("/a?\0 "),      nxt_string("/a?%00%20"),      0 },
+        { nxt_string("/a?#\0\0 "),   nxt_string("/a?#%00%00%20"),  0 },
+        { nxt_string("/a?\0#b"),     nxt_string("/a?%00#b"),       0 },
+        { nxt_string("\0?"),         nxt_string("%00?"),           0 },
+        { nxt_string("/a?\r\n#\r"),  nxt_string("/a?%0D%0A#%0D"),  0 },
+        { nxt_string("/a?b#c"),      nxt_string("/a?b#c"),         1 },
+        { nxt_string("/a?b?c#d#"),   nxt_string("/a?b%3Fc#d%23"),  0 },
+        { nxt_string("#?"),          nxt_string("#%3F"),           0 },
+        { nxt_string("/a?%00"),      nxt_string("/a?%2500"),       1 },
+    };
+
+    thr = data;
+
+    for (i = 0; i < nxt_nitems(cases); i++) {
+        enc = nxt_is_complex_uri_encoded(cases[i].in.start,
+                                         cases[i].in.length);
+
+        NXT_TEST_CHECK(thr->log, enc == cases[i].encoded,
+                       "complex uri test failed: case %ui is %sencoded",
+                       i, enc ? "" : "not ");
+
+        n = nxt_encode_complex_uri(NULL, cases[i].in.start,
+                                   cases[i].in.length);
+
+        NXT_TEST_CHECK(thr->log,
+                       cases[i].in.length + 2 * n == cases[i].out.length,
+                       "complex uri test failed: case %ui counts %uz",
+                       i, n);
+
+        end = (u_char *) nxt_encode_complex_uri(buf, cases[i].in.start,
+                                                cases[i].in.length);
+
+        NXT_TEST_CHECK(thr->log,
+                       nxt_str_eq(&cases[i].out, buf, (size_t) (end - buf)),
+                       "complex uri test failed: case %ui gave \"%*s\", "
+                       "not \"%V\"", i, (size_t) (end - buf), buf,
+                       &cases[i].out);
+    }
+
+    return 0;
+}
+
+
+static nxt_int_t
+nxt_complex_uri_test(nxt_thread_t *thr)
+{
+    int  ret;
+
+    ret = nxt_test_in_child(thr, "complex uri test",
+                            nxt_complex_uri_test_child, thr);
+
+    NXT_TEST_CHECK(thr->log, ret == 0,
+                   "complex uri test failed: the child gave %d", ret);
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log, "complex uri test passed");
+
+    return NXT_OK;
+}
+
+
 static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
     nxt_checked_test, nxt_port_mmap_read_test,
     nxt_router_response_parse_test, nxt_port_frag_test,
@@ -327,6 +412,7 @@ static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
     nxt_nncq_wrap_test,
     nxt_app_queue_test, nxt_size_bound_test, nxt_mp_cluster_cache_test,
     nxt_casecmp_test, nxt_http_comp_name_test, nxt_http_date_range_test,
+    nxt_complex_uri_test,
 #if (NXT_HAVE_REGEX)
     nxt_regex_test,
 #endif

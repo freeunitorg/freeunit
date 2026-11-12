@@ -660,6 +660,12 @@ nxt_encode_complex_uri(u_char *dst, u_char *src, size_t length)
 
     static const u_char  hex[16] NXT_NONSTRING = "0123456789ABCDEF";
 
+    /*
+     * The first "?" and the first "#" pass raw, but not a "?" after a "#".
+     * The NUL bytes at the end of "reserved" mark that a "#" was seen.  A NUL
+     * byte in "src" must not match them: it is escaped, and "reserved" stays
+     * in the literal.
+     */
     reserved = (u_char *) "?#\0";
 
     end = src + length;
@@ -674,12 +680,12 @@ nxt_encode_complex_uri(u_char *dst, u_char *src, size_t length)
             ch = *src++;
 
             if (nxt_uri_escape[ch >> 5] & (1U << (ch & 0x1f))) {
-                if (ch == reserved[0]) {
+                if (ch != '\0' && ch == reserved[0]) {
                     reserved++;
                     continue;
                 }
 
-                if (ch == reserved[1]) {
+                if (ch != '\0' && ch == reserved[1]) {
                     reserved += 2;
                     continue;
                 }
@@ -695,10 +701,10 @@ nxt_encode_complex_uri(u_char *dst, u_char *src, size_t length)
         ch = *src++;
 
         if (nxt_uri_escape[ch >> 5] & (1U << (ch & 0x1f))) {
-            if (ch == reserved[0]) {
+            if (ch != '\0' && ch == reserved[0]) {
                 reserved++;
 
-            } else if (ch == reserved[1]) {
+            } else if (ch != '\0' && ch == reserved[1]) {
                 reserved += 2;
 
             } else {
@@ -722,6 +728,7 @@ nxt_is_complex_uri_encoded(u_char *src, size_t length)
     u_char   *reserved, *end, ch;
     uint8_t  d0, d1;
 
+    /* The same walk as in nxt_encode_complex_uri(). */
     reserved = (u_char *) "?#\0";
 
     for (end = src + length; src < end; src++) {
@@ -748,12 +755,12 @@ nxt_is_complex_uri_encoded(u_char *src, size_t length)
                 continue;
             }
 
-            if (ch == reserved[0]) {
+            if (ch != '\0' && ch == reserved[0]) {
                 reserved++;
                 continue;
             }
 
-            if (ch == reserved[1]) {
+            if (ch != '\0' && ch == reserved[1]) {
                 reserved += 2;
                 continue;
             }
