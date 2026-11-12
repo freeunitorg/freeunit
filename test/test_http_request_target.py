@@ -84,6 +84,43 @@ def test_http_request_target_raw_space(target, version):
 
 @pytest.mark.parametrize(
     'target',
+    [
+        '/pa\tth',
+        '/\t',
+        '/?q=a\x0bb',
+        '/pa\x0cth',
+        '/pa\x01th',
+        '/#a\x1bb',
+        '/pa\x7fth',
+    ],
+)
+def test_http_request_target_control_character(target):
+    with socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout=10
+    ) as sock:
+        sock.sendall(request(target) + request('/probe', connection='close'))
+        response = recv_to_close(sock)
+
+    assert response.startswith(b'HTTP/1.1 400 '), response
+    assert response.count(b'HTTP/1.') == 1, response
+
+
+def test_http_request_target_encoded_control_and_utf8():
+    with socket.create_connection(
+        ('127.0.0.1', port_map.port(8080)), timeout=10
+    ) as sock:
+        sock.sendall(request('/pa%09th'))
+        response = client.recvall(sock, framed=True, read_timeout=10)
+        assert response.startswith(b'HTTP/1.1 201 '), response
+
+        sock.sendall(request('/caf\u00e9', connection='close'))
+        response = recv_to_close(sock)
+        assert response.startswith(b'HTTP/1.1 201 '), response
+        assert response.count(b'HTTP/1.') == 1, response
+
+
+@pytest.mark.parametrize(
+    'target',
     ['/pa%20th?q=a%20b+c', '/pa+th?q=a+b%20c'],
 )
 def test_http_request_target_encoded_space_keepalive(target):

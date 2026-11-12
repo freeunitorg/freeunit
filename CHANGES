@@ -1,11 +1,13 @@
 
 Changes with FreeUnit 1.38.0                                     09 Nov 2026
 
-    *) Change: a request target that contains an unencoded space now gets a
-       400 response. Before, the space was accepted as part of the target.
-       The control API uses the same parser and closes the connection on
-       such a request. Percent-encoded spaces in paths and arguments remain
-       supported.
+    *) Change: a request target that contains an unencoded space, a control
+       character such as HTAB, or DEL now gets a 400 response. Before, the
+       unencoded space, DEL and the control characters other than NUL, CR
+       and LF were accepted as part of the target. The control API uses the
+       same parser and closes the connection on such a request.
+       Percent-encoded spaces and control characters in paths and arguments
+       remain supported.
 
     *) Feature: PHP exposes the decoded, normalized request path, without
        the query, in $_SERVER['UNIT_REWRITTEN_PATH'] when it differs from
