@@ -375,6 +375,19 @@ nxt_process_child_fixup(nxt_task_t *task, nxt_process_t *process)
     rt = task->thread->runtime;
 
     /*
+     * main creates the control listen socket before it forks.  Only the
+     * controller accepts connections on it.  Close it in every other
+     * child.  main keeps it for a restart of the controller.
+     */
+    if (ptype != NXT_PROCESS_CONTROLLER
+        && rt->controller_socket != NULL
+        && rt->controller_socket->socket != -1)
+    {
+        nxt_socket_close(task, rt->controller_socket->socket);
+        rt->controller_socket->socket = -1;
+    }
+
+    /*
      * Remove not ready processes.
      *
      * These walks hand unreferenced processes to nxt_process_close_ports(),
