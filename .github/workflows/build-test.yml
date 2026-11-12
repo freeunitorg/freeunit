@@ -962,6 +962,13 @@ jobs:
       - name: Setup rust
         run: |
           curl https://sh.rustup.rs | sh -s -- -y
+
+          # test/test_wasm-wasi-component-p3.py builds its WASI 0.3 guests
+          # with rustc's wasm32-wasip2 target, not with cargo-component.
+          # Without the target the test skips, so CI would never run the
+          # WASI 0.3 path that this leg is here to cover.  ~8 s and 25 MiB
+          # of rust-std on first install.
+          "$HOME/.cargo/bin/rustup" target add wasm32-wasip2
         if: steps.metadata.outputs.module == 'wasm-wasi-component'
 
       # Prebuilt binary instead of `cargo install cargo-component` (which

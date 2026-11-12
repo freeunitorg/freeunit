@@ -1,0 +1,27 @@
+[package]
+name = "test_wasi_component"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A WASI 0.3 (wasi:http@0.3.0) guest.  Unlike the WASI 0.2 guests next to
+# it, it is not built with "cargo component": rustc's wasm32-wasip2 target
+# links a component, and wasip3 adds the wasi:http/service@0.3.0 export.
+#
+#   cargo build --release --target wasm32-wasip2
+#
+# wasip3 0.9 is the last release on WASI 0.3.0; 0.10 targets 0.3.2, which
+# Wasmtime 48 does not implement.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasip3 = { version = "=0.9.0", features = ["async-spawn"] }
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+debug = false
+strip = true
+lto = true
