@@ -35,7 +35,7 @@ typedef enum {
     NXT_HTTP_TARGET_SPACE = 1,   /* \s  */
     NXT_HTTP_TARGET_HASH,        /*  #  */
     NXT_HTTP_TARGET_AGAIN,
-    NXT_HTTP_TARGET_BAD,         /* \0\r\n */
+    NXT_HTTP_TARGET_BAD,         /* control characters and DEL */
 
     /* traps below are used for extended check only */
 
@@ -47,15 +47,36 @@ typedef enum {
 
 
 static const uint8_t  nxt_http_target_chars[256] nxt_aligned(64) = {
-    /* \0                               \n        \r       */
-        4, 0, 0, 0,  0, 0, 0, 0,   0, 0, 4, 0,  0, 4, 0, 0,
-        0, 0, 0, 0,  0, 0, 0, 0,   0, 0, 0, 0,  0, 0, 0, 0,
+    /*
+     * RFC 9112 section 3.2 allows no whitespace and RFC 3986 allows no
+     * control character in a request target.  A recipient can also take
+     * HTAB, VT, FF or a bare CR as a request-line delimiter (RFC 9112
+     * section 3).  So every control character and DEL is an error.
+     */
+
+    /* 0x00 - 0x0F: control characters */
+        4, 4, 4, 4,  4, 4, 4, 4,   4, 4, 4, 4,  4, 4, 4, 4,
+
+    /* 0x10 - 0x1F: control characters */
+        4, 4, 4, 4,  4, 4, 4, 4,   4, 4, 4, 4,  4, 4, 4, 4,
 
     /* \s  !  "  #   $  %  &  '    (  )  *  +   ,  -  .  / */
         1, 0, 0, 2,  0, 8, 0, 0,   0, 0, 0, 0,  0, 0, 6, 5,
 
     /*  0  1  2  3   4  5  6  7    8  9  :  ;   <  =  >  ? */
         0, 0, 0, 0,  0, 0, 0, 0,   0, 0, 0, 0,  0, 0, 0, 7,
+
+    /*  @  A  B  C   D  E  F  G    H  I  J  K   L  M  N  O */
+        0, 0, 0, 0,  0, 0, 0, 0,   0, 0, 0, 0,  0, 0, 0, 0,
+
+    /*  P  Q  R  S   T  U  V  W    X  Y  Z  [   \  ]  ^  _ */
+        0, 0, 0, 0,  0, 0, 0, 0,   0, 0, 0, 0,  0, 0, 0, 0,
+
+    /*  `  a  b  c   d  e  f  g    h  i  j  k   l  m  n  o */
+        0, 0, 0, 0,  0, 0, 0, 0,   0, 0, 0, 0,  0, 0, 0, 0,
+
+    /*  p  q  r  s   t  u  v  w    x  y  z  {   |  }  ~ DEL */
+        0, 0, 0, 0,  0, 0, 0, 0,   0, 0, 0, 0,  0, 0, 0, 4,
 };
 
 
