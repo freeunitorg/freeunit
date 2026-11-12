@@ -1,5 +1,143 @@
 
-Changes with FreeUnit 1.38.0                                     09 Nov 2026
+Changes with FreeUnit 1.37.3                                     12 Nov 2026
+
+    *) Security: the router process could crash when a WebSocket connection
+       ended while messages of the application were still unsent, or when
+       the send timeout ended a WebSocket request, also on a TLS listener.
+       The router could also read memory that it had freed. The memory of
+       the unsent messages was not released: shared memory of the
+       application, and memory of the router for small messages. After
+       enough such connections the application stopped answering. Now the
+       router releases these messages when the request closes, and reads
+       nothing more on a WebSocket connection that is closing.
+
+    *) Security: the router decoded the value of a variable in a "rewrite"
+       or a "pass" template after it inserted the value: "$uri" and "$arg_*"
+       were decoded a second time, and "$host" was decoded at all. So the
+       action could use another path, or another application, target, route
+       or upstream, than the one that the route rules matched. After a
+       "rewrite", a "proxy" action also sent a "?" or "#" that the new path
+       held as data unencoded, so the upstream got another path and query
+       than the router matched. Now the router keeps the value of a variable
+       as data, and a "proxy" upstream gets these bytes as "%3F" and "%23".
+       These defects are related to the CR, LF and space in the rewritten
+       proxy target that 1.37.2 fixed.
+
+       The result of an njs "rewrite" or "pass" template was decoded in the
+       same way. It is now kept as data too.
+
+    *) Security: a request target that contains an unencoded space, a
+       control character such as HTAB, or DEL now gets a 400 response.
+       Before, the unencoded space, DEL and the control characters other
+       than NUL, CR and LF were accepted as part of the target. The control
+       API uses the same parser and closes the connection on such a request.
+       Percent-encoded spaces and control characters in paths and arguments
+       remain supported.
+
+    *) Security: the request target kept a raw "#" and the text after it,
+       while the route rules matched only the path before the "#". A "proxy"
+       upstream, an application and "$request_uri" got that fragment, so an
+       upstream or an application could use another path than the one that
+       the route rules matched. The fragment is no longer sent to a proxy
+       upstream or to an application, and "$request_uri" does not hold it.
+
+    *) Security: at the upgrade of a WebSocket connection, the router
+       released the buffers that hold the request header, but the request
+       still read them until the connection closed. So the access log record
+       of a WebSocket request could hold bytes of another request, and the
+       router could read freed memory to write it. On a system with the musl
+       C library, such as Alpine Linux, the router process ended. In some
+       cases the router also lost a buffer of 2048 bytes for each connection
+       and logged the alert "freed pointer is out of pool", or read a frame
+       header from a wrong offset. Now the header buffers stay until the
+       WebSocket connection closes. With the default settings, this is at
+       most 2048 + 4 * 8192 = 34816 bytes for each open WebSocket
+       connection. For this defect only, turning off the access log on an
+       earlier version stopped the crash and the wrong record in tests. It
+       does not stop the loss of the buffers.
+
+    *) Security: the timer code could run the handler of a timer that had
+       expired and was armed again before its handler ran, while the timer
+       was back in the timer tree. Under heavy load the router could then
+       end a request that the application was still answering, and the
+       client got a wrong 503 response. The router could also free a request
+       whose timer was still linked, and use the freed memory. The handler
+       now runs only for a timer that is out of the tree.
+
+    *) Security: the proxy could release the buffer of an upstream response
+       header while it still parsed that header after an interim (1xx)
+       response, and then read freed memory. Now the buffer stays until the
+       header is complete. A final header that does not fit in the buffer
+       still gets 502.
+
+    *) Security: the router formatted the "Last-Modified" header field of a
+       static file with no range check of the modification time. A time
+       outside the years 1000 to 9999 gave a malformed date, and a time far
+       outside this range could crash the router. Now such a file is served
+       without "Last-Modified". A date in "If-Modified-Since" or "If-Range"
+       does not match such a file, and "If-Unmodified-Since" is ignored for
+       it. Its "ETag" is still sent.
+
+    *) Security: the router, the discovery process, the prototype processes
+       and the application processes of embedded language modules kept the
+       listen socket of the control API open. Now only the main process and
+       the controller keep it.
+
+    *) Change: the value of a variable other than "$request_uri" in a
+       "rewrite" or a "pass" template is now used as data. This can change
+       the result of a working configuration. The literal text of a
+       template, "$request_uri", the resolving of "." and ".." segments, and
+       the query string are not changed.
+
+       In a "rewrite", a "%XX" in a value is not decoded, and a "?" or "#"
+       in a value no longer ends the path or drops the rest of the template.
+       A "%" that two hex digits do not follow no longer gives status 500. A
+       NUL byte in a value now gives status 500. A "rewrite" that takes an
+       encoded URI from a header, a cookie or an argument, such as
+       "$header_x_original_uri", now gets that text as it is, not decoded.
+
+       After a "rewrite", a "proxy" upstream gets a "?" or "#" of the new
+       path as "%3F" or "%23". So a "rewrite" can no longer give the
+       upstream a query of its own: the upstream gets the query of the
+       request.
+
+       In a "pass", a "%XX" in a value is not decoded. A request whose value
+       held an encoded name now gets status 404. A value that is
+       percent-encoded on purpose, such as a cookie written with
+       encodeURIComponent(), is no longer decoded. A value can no longer
+       select a name that holds a slash; before, "%2F" in the value did
+       that. The literal text is decoded as before, so "routes/a%2Fb" still
+       names the route "a/b".
+
+       An njs "rewrite" or "pass" result is now used as data too. A "%XX" in
+       it is not decoded, and a "?" or "#" in it no longer ends the path. A
+       NUL byte in it gives status 500. To keep the old meaning, call
+       decodeURIComponent() on text that is encoded on purpose. An njs
+       "pass" can no longer select a name that holds a slash.
+
+    *) Bugfix: when the read of a response header from a proxied upstream
+       ended without a complete header, for example after the timeout, the
+       router did not free the header buffer and the memory of the request.
+       Now the router frees them when it frees the upstream connection.
+
+    *) Bugfix: with "chunked_transform" enabled, the router kept a buffer
+       for each distinct number of bytes that followed a chunked request
+       body on a connection. The memory was not released until the router
+       restarted. Now the buffer is released when the next request on the
+       connection ends, or when the connection closes.
+
+    *) Bugfix: on a listener with a fixed address, such as "127.0.0.1:8080",
+       the next request on a keep-alive connection after a configuration
+       update read the address of the listener from freed memory of the old
+       configuration. So "SERVER_ADDR", "SERVER_PORT" and the "destination"
+       route option could get a wrong value. During a configuration update
+       under load, the router process could end. Now each request takes the
+       address from its own configuration.
+
+    *) Bugfix: a NUL byte after "?" or "#" in the "location" of a "return"
+       action was sent raw in the "Location" header field, and the encoder
+       read past the end of a constant string. Now the byte is sent as
+       "%00".
 
 
 Changes with FreeUnit 1.37.2                                     09 Nov 2026

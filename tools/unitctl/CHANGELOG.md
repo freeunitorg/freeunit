@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.37.3] - 2026-11-12
+
+### Changed
+- Version bump to track the FreeUnit 1.37.3 release.
+
 ## [1.37.2] - 2026-11-09
 
 ### Security
@@ -119,7 +124,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Previous releases
 See earlier versions for additional change history.
 
-[Unreleased]: https://github.com/freeunitorg/freeunit/compare/unitctl/1.37.2...HEAD
+[Unreleased]: https://github.com/freeunitorg/freeunit/compare/unitctl/1.37.3...HEAD
+[1.37.3]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.37.3
 [1.37.2]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.37.2
 [1.37.1]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.37.1
 [1.37.0]: https://github.com/freeunitorg/freeunit/releases/tag/unitctl/1.37.0
