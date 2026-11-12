@@ -238,13 +238,95 @@ nxt_http_comp_name_test(nxt_thread_t *thr)
 }
 
 
+/*
+ * A static file mtime goes to nxt_gmtime() and nxt_http_date() only when
+ * nxt_http_date_valid() accepts it.  Every day that it accepts must give
+ * a month and a weekday inside the name tables and a year of 4 digits.
+ * The times next to the range must be refused.
+ */
+
+static nxt_int_t
+nxt_http_date_range_test(nxt_thread_t *thr)
+{
+    u_char      *end;
+    struct tm   tm;
+    nxt_uint_t  i;
+    nxt_time_t  s;
+    u_char      buf[NXT_HTTP_DATE_LEN];
+
+    static const struct {
+        nxt_time_t  time;
+        const char  *date;
+    } dates[] = {
+#if (NXT_TIME_T_SIZE > 4)
+        { NXT_HTTP_DATE_MIN, "Wed, 01 Jan 1000 00:00:00 GMT" },
+        { NXT_HTTP_DATE_MAX, "Fri, 31 Dec 9999 23:59:59 GMT" },
+#else
+        { INT32_MIN, "Fri, 13 Dec 1901 20:45:52 GMT" },
+        { INT32_MAX, "Tue, 19 Jan 2038 03:14:07 GMT" },
+#endif
+        { 0, "Thu, 01 Jan 1970 00:00:00 GMT" },
+    };
+
+#if (NXT_TIME_T_SIZE > 4)
+    static const nxt_time_t  invalid[] = {
+        NXT_HTTP_DATE_MIN - 1, NXT_HTTP_DATE_MAX + 1,
+        -62135596800LL, -62162000000LL, -62200000000LL, 865550880000LL,
+        INT64_MIN, INT64_MAX,
+    };
+
+    for (i = 0; i < nxt_nitems(invalid); i++) {
+        NXT_TEST_CHECK(thr->log, !nxt_http_date_valid(invalid[i]),
+                       "http date range test failed: %T is accepted",
+                       invalid[i]);
+    }
+
+    for (s = NXT_HTTP_DATE_MIN; s <= NXT_HTTP_DATE_MAX; s += 86400) {
+        NXT_TEST_CHECK(thr->log, nxt_http_date_valid(s),
+                       "http date range test failed: %T is refused", s);
+
+        nxt_gmtime(s, &tm);
+
+        NXT_TEST_CHECK(thr->log,
+                       tm.tm_mon >= 0 && tm.tm_mon <= 11
+                       && tm.tm_wday >= 0 && tm.tm_wday <= 6
+                       && tm.tm_year >= 1000 - 1900
+                       && tm.tm_year <= 9999 - 1900,
+                       "http date range test failed: %T gives month %d, "
+                       "weekday %d, year %d", s, tm.tm_mon, tm.tm_wday,
+                       tm.tm_year + 1900);
+    }
+#endif
+
+    for (i = 0; i < nxt_nitems(dates); i++) {
+        s = dates[i].time;
+
+        NXT_TEST_CHECK(thr->log, nxt_http_date_valid(s),
+                       "http date range test failed: %T is refused", s);
+
+        nxt_gmtime(s, &tm);
+        end = nxt_http_date(buf, &tm);
+
+        NXT_TEST_CHECK(thr->log,
+                       (size_t) (end - buf) == NXT_HTTP_DATE_LEN
+                       && memcmp(buf, dates[i].date, NXT_HTTP_DATE_LEN) == 0,
+                       "http date range test failed: %T gives \"%*s\"",
+                       s, (size_t) (end - buf), buf);
+    }
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log, "http date range test passed");
+
+    return NXT_OK;
+}
+
+
 static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
     nxt_checked_test, nxt_port_mmap_read_test,
     nxt_router_response_parse_test, nxt_port_frag_test,
     nxt_port_release_test, nxt_process_use_test, nxt_nncq_bound_test,
     nxt_nncq_wrap_test,
     nxt_app_queue_test, nxt_size_bound_test, nxt_mp_cluster_cache_test,
-    nxt_casecmp_test, nxt_http_comp_name_test,
+    nxt_casecmp_test, nxt_http_comp_name_test, nxt_http_date_range_test,
 #if (NXT_HAVE_REGEX)
     nxt_regex_test,
 #endif
