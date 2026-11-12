@@ -1,0 +1,140 @@
+name: "Homebrew"
+
+# The repository is a Homebrew tap: HomebrewFormula links to pkg/brew.
+# This workflow checks that the formulae point at published files with the
+# right checksums, and builds, tests and audits them on macOS.  The formulae
+# build released files, not the pull request's source, so the workflow runs
+# only when they change, and once a week to catch a Homebrew change.
+
+on:
+  pull_request:
+    paths:
+      - 'pkg/brew/**'
+      - HomebrewFormula
+      - '.github/workflows/homebrew.yml'
+  push:
+    branches: master
+    paths:
+      - 'pkg/brew/**'
+      - HomebrewFormula
+      - '.github/workflows/homebrew.yml'
+  schedule:
+    - cron: '41 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # update.sh downloads every file the formulae name and computes its
+  # checksum.  Run for the version already in the formulae, it must change
+  # nothing.
+  checksums:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the formulae against the release files
+        run: |
+          ver="$(sed -n 's#.*/releases/download/\([0-9.]*\)/unit-.*#\1#p' pkg/brew/freeunit.rb)"
+          echo "version in the formulae: $ver"
+          sh pkg/brew/update.sh "$ver"
+          git diff --exit-code pkg/brew
+
+      # After a release, the formulae stay at the previous version until
+      # pkg/brew/update.sh runs; the weekly run says so.
+      - name: Check that the formulae name the newest release
+        if: github.event_name != 'pull_request'
+        run: |
+          ver="$(sed -n 's#.*/releases/download/\([0-9.]*\)/unit-.*#\1#p' pkg/brew/freeunit.rb)"
+          new="$(git ls-remote --tags --refs origin \
+                 | sed -n 's#.*refs/tags/\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$#\1#p' \
+                 | sort -V | tail -n 1)"
+          if [ "$ver" != "$new" ]; then
+            echo "::error::the formulae name $ver, the newest release tag is $new; run pkg/brew/update.sh $new"
+            exit 1
+          fi
+
+  formulae:
+    needs: checksums
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-15, macos-15-intel ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      HOMEBREW_NO_INSTALL_CLEANUP: 1
+      HOMEBREW_NO_ANALYTICS: 1
+    steps:
+      - uses: actions/checkout@v7
+
+      # A local tap holds a copy of the formulae, so the job tests the files
+      # of this commit and not the tap's default branch.
+      # Homebrew looks for formulae in HomebrewFormula when the repository
+      # is tapped; check that it still leads to them.
+      - name: Check the tap layout
+        run: |
+          test -L HomebrewFormula
+          test -f HomebrewFormula/freeunit.rb
+          test -f HomebrewFormula/unitctl.rb
+
+      # A pull request tests the Homebrew of the runner image; the weekly
+      # run updates it first, to test what users have.
+      - name: Homebrew version
+        run: |
+          if [ "${{ github.event_name }}" != pull_request ]; then
+            brew update
+          fi
+          brew --version
+
+      - name: Put the formulae in a local tap
+        run: |
+          brew tap-new --no-git freeunit/ci
+          cp pkg/brew/*.rb "$(brew --repository freeunit/ci)/Formula/"
+          # Homebrew 6 loads a formula of another tap only once it is
+          # trusted; an older Homebrew has no "brew trust".
+          if brew trust --help > /dev/null 2>&1; then
+            brew trust --formula freeunit/ci/freeunit freeunit/ci/unitctl
+          fi
+
+      - name: Style
+        run: brew style --formula freeunit/ci/freeunit freeunit/ci/unitctl
+
+      - name: Audit
+        run: brew audit --formula --online freeunit/ci/freeunit freeunit/ci/unitctl
+
+      - name: Build freeunit from source
+        run: brew install --build-from-source --verbose freeunit/ci/freeunit
+
+      - name: Test freeunit
+        run: brew test --verbose freeunit/ci/freeunit
+
+      # The service needs the directories that post_install_steps makes.
+      - name: Check the directories of the service
+        run: |
+          p="$(brew --prefix)"
+          test -d "$p/var/lib/unit"
+          test -d "$p/var/log/unit"
+          test -d "$p/var/run/unit"
+          test -d "$p/lib/unit/modules"
+          test -f "$(brew --prefix freeunit/ci/freeunit)/include/nxt_unit.h"
+          # unitctl finds the socket of the service from this option.
+          "$(brew --prefix freeunit/ci/freeunit)/sbin/unitd" --version 2>&1 \
+            | grep -F -- "--control=unix:$p/var/run/unit/control.unit.sock"
+
+      - name: Show the linked libraries
+        run: otool -L "$(brew --prefix freeunit/ci/freeunit)/sbin/unitd"
+
+      - name: Install and test unitctl
+        run: |
+          brew install freeunit/ci/unitctl
+          brew test --verbose freeunit/ci/unitctl
+          ! grep -q '%%VERSION%%' \
+            "$(brew --prefix freeunit/ci/unitctl)/share/man/man1/unitctl.1"
