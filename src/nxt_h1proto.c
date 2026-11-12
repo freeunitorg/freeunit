@@ -3014,6 +3014,17 @@ nxt_h1p_shutdown(nxt_task_t *task, nxt_conn_t *c)
                 nxt_debug(task, "h1p already scheduled ws shutdown");
             }
 
+            /*
+             * The connection closes when the timer runs.  Until then it
+             * has no request, and the read and write handlers and the
+             * connection timers expect one.  So read nothing more and
+             * stop the connection timers, as nxt_conn_close() and its
+             * close handler do.
+             */
+            c->block_read = 1;
+            nxt_timer_disable(task->thread->engine, &c->read_timer);
+            nxt_timer_disable(task->thread->engine, &c->write_timer);
+
             return;
         }
     }
@@ -3048,6 +3059,12 @@ nxt_h1p_closing(nxt_task_t *task, nxt_conn_t *c)
 
     if (c->u.tls != NULL) {
         c->write_state = &nxt_h1p_shutdown_state;
+
+        /*
+         * The TLS shutdown clears c->read_state and can wait for the
+         * socket.  A read that is already queued must not run then.
+         */
+        c->block_read = 1;
 
         c->io->shutdown(task, c, NULL);
         return;

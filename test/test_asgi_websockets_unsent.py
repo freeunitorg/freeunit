@@ -150,3 +150,48 @@ def test_asgi_websockets_writes_after_client_left_released():
     reset(ws_open())
 
     answered(client_wsgi, 'answered')
+
+
+def test_asgi_websockets_send_timeout_frame_header():
+    """The send timeout ends the request while bytes of a frame header
+    arrive.  The router closes the connection one pass of the event loop
+    later, and in that pass it must not read for the closed request."""
+
+    client.load('websockets/send_bulk', processes=1)
+
+    assert 'success' in client.conf(
+        {'http': {'send_timeout': 2}}, 'settings'
+    ), 'send_timeout'
+
+    router = int(pid_by_name('router'))
+
+    # An empty PONG frame, sent one byte at a time.
+    pong = b'\x8a\x80\x00\x00\x00\x00'
+
+    for i in range(3):
+        sock = ws_open()
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        # 9 MiB: more than the kernel holds for a client that does not
+        # read, so that the send timer runs.
+        ws.frame_write(sock, ws.OP_TEXT, '36 262144')
+        time.sleep(0.5)
+
+        end = time.time() + 3.5
+        sent = 0
+
+        try:
+            while time.time() < end:
+                sock.sendall(pong[sent % 6 : sent % 6 + 1])
+                sent += 1
+                time.sleep(0.001)
+
+        except OSError:
+            pass
+
+        time.sleep(0.5)
+        sock.close()
+
+        assert pid_by_name('router') == str(router), f'router after {i + 1}'
+
+    answered(client, 'answered')

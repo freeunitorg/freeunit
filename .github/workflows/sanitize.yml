@@ -184,6 +184,11 @@ jobs:
             # test_asgi_websockets_unsent is here because a WebSocket that
             # ends with unsent data can leave the router with a freed buffer
             # in its write chain.  Without ASan that read is often silent.
+            #
+            # test_asgi_websockets_unsent_tls is here because the old code
+            # ran a queued read after the TLS shutdown had cleared the read
+            # state.  A release build crashes there too.  No other test of
+            # this list closes a TLS connection with unsent data.
             tests: >-
               test/test_graceful_reload.py
               test/test_state_store.py
@@ -203,6 +208,7 @@ jobs:
               test/test_python_local_addr_reconf.py
               test/test_static_mtime_range.py
               test/test_asgi_websockets_unsent.py
+              test/test_asgi_websockets_unsent_tls.py
           - runtime: php
             apt: ""
             configure: php
