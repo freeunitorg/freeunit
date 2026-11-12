@@ -3517,10 +3517,17 @@ nxt_h1p_peer_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
 
     n = c->io->recvbuf(c, b);
 
+    /*
+     * NXT_AGAIN does not end the read.  A buffer that was already in
+     * c->read holds a partly read response header, and the parser state
+     * and the stored fields point into it.  Keep it, the next read appends
+     * to it.  Free only a new buffer, or any buffer on a close or an error.
+     */
+
     if (n > 0) {
         c->read = b;
 
-    } else {
+    } else if (n != NXT_AGAIN || b != c->read) {
         c->read = NULL;
         nxt_http_proxy_buf_mem_free(task, r, b);
     }

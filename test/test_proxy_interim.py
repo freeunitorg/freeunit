@@ -61,6 +61,52 @@ OVERSIZED_HINTS = 'HTTP/1.1 103 Early Hints\r\n' + (
 
 assert len(OVERSIZED_HINTS) > 64 * 1024, len(OVERSIZED_HINTS)
 
+# The header buffer is 64 KiB.  The first part is a 1xx that is not complete
+# and leaves 100 bytes of the buffer free.  The second part is exactly 100
+# bytes: the end of the 1xx and the start of the final header.  So a read
+# fills the buffer.  The proxy drops the 1xx, which frees space in the
+# buffer, and reads again at once.  That read gets nothing, because the
+# upstream pauses before the rest of the final header.  The proxy must keep
+# the buffer while it waits: the parser points into it.
+FILL_FIRST = 64 * 1024 - 100
+
+FILL_MARKER = 'intact-final-value-0123456789'
+
+FILL_HEAD = (
+    f'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Final: {FILL_MARKER}\r\n'
+    'X-Pad: '
+)
+
+
+def fill_parts(pad_length):
+    """The 1xx ends 4 bytes into the second part.  The X-Pad value of the
+    final header starts in the second part and is "pad_length" bytes."""
+
+    hints = 'HTTP/1.1 103 Early Hints\r\nX-Hint-Pad: '
+    hints += 'h' * (FILL_FIRST - len(hints)) + '\r\n\r\n'
+    response = hints + FILL_HEAD + 'a' * pad_length + '\r\n\r\nOK'
+    second = FILL_FIRST + 100
+
+    return [
+        response[:FILL_FIRST],
+        response[FILL_FIRST:second],
+        response[second:],
+    ]
+
+
+# The final header alone fits in the buffer.
+FILL_PAD = 4096
+FILL = fill_parts(FILL_PAD)
+
+# The final header alone is bigger than the buffer.
+FILL_OVERSIZED = fill_parts(64 * 1024)
+
+assert FILL[1].startswith('\r\n\r\n' + FILL_HEAD) and len(FILL[1]) == 100
+assert FILL[1].endswith('a') and FILL_OVERSIZED[1] == FILL[1]
+
+# Seconds between the parts of these targets.  The default is 0.1.
+PAUSE = {'/fill': 0.4, '/fill-oversized': 0.4}
+
 # 101 for a WebSocket handshake.
 WS_SWITCH = (
     'HTTP/1.1 101 Switching Protocols\r\n'
@@ -120,6 +166,10 @@ UPSTREAM_RESPONSES = {
     '/truncated': 'HTTP/1.1 100 Continue\r\n\r\n',
     # A 1xx bigger than the header buffer.
     '/oversized': OVERSIZED_HINTS + FINAL,
+    # The 1xx and the start of the final header fill the header buffer.
+    '/fill': FILL,
+    # The same, with a final header bigger than the header buffer.
+    '/fill-oversized': FILL_OVERSIZED,
     # The second request.
     '/ok': FINAL,
 }
@@ -183,7 +233,7 @@ def run_server(server_port):
             try:
                 for i, part in enumerate(response):
                     if i > 0:
-                        time.sleep(0.1)
+                        time.sleep(PAUSE.get(target, 0.1))
 
                     conn.sendall(part.encode())
 
@@ -393,6 +443,23 @@ def test_proxy_interim_expect_continue():
     check(raw[len(router_continue) :], body=f'got {len(body)}')
 
 
+def test_proxy_interim_fill_header_buffer():
+    """A dropped 1xx frees space in a full header buffer.  The upstream then
+    pauses in the final header.  The proxy kept the buffer for the parser
+    only while bytes arrived: on a read that got nothing it freed the
+    buffer, and the next read parsed freed memory.  Now the buffer is kept,
+    and the final response arrives whole."""
+
+    raw = get('/fill')
+
+    check(raw)
+
+    assert f'X-Final: {FILL_MARKER}\r\n' in raw, f'field lost: {raw[:200]!r}'
+    assert (
+        f'X-Pad: {"a" * FILL_PAD}\r\n' in raw
+    ), f'X-Pad value changed: {raw[:200]!r}'
+
+
 def test_proxy_interim_fields_not_leaked():
     """Fields of a 1xx, also those after the 16 inline fields, are dropped."""
 
@@ -457,3 +524,16 @@ def test_proxy_interim_bad_gateway(target):
 
     assert raw.startswith('HTTP/1.1 502'), f'expected 502: {raw[:200]!r}'
     assert 'HTTP/1.1 200' not in raw, f'final relayed: {raw[:200]!r}'
+
+
+def test_proxy_interim_fill_oversized():
+    """The same start as test_proxy_interim_fill_header_buffer(), but the
+    final header does not fit in the buffer.  The proxy answers 502 and
+    sends no byte of the partial header."""
+
+    raw = get_alone('/fill-oversized')
+
+    assert raw.startswith('HTTP/1.1 502'), f'expected 502: {raw[:200]!r}'
+
+    for part in ('HTTP/1.1 200', 'X-Final', FILL_MARKER, 'X-Pad', 'a' * 16):
+        assert part not in raw, f'partial header relayed: {raw[:200]!r}'

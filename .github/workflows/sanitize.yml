@@ -116,6 +116,10 @@ jobs:
             # configured below.  In the release test legs both the assertions
             # and ASan's report are compiled out.
             #
+            # test_proxy_interim drops 1xx responses of the upstream and keeps
+            # the response header buffer between reads.  Without ASan and
+            # UBSan a released buffer can still hold the old bytes.
+            #
             # test_chunked's split-read case drives a chunked request body whose
             # framing arrives in its own segments, which is how the request read
             # buffer reaches the parser's recycle path.  Without ASan a stale
@@ -179,6 +183,7 @@ jobs:
               test/test_static.py
               test/test_conn_task_race.py
               test/test_proxy.py
+              test/test_proxy_interim.py
               test/test_chunked.py
               test/test_conn_recycle.py
               test/test_app_lifecycle.py
