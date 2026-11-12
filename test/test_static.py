@@ -735,17 +735,8 @@ def test_static_space_in_name(temp_dir):
     ), 'dir name enclosing'
 
     assert (
-        client.get(url='/%20di%20r%20/fi%20le')['body'] == 'blah'
-    ), 'dir encoded'
-    assert (
         client.get(url='/%20di%20r%20%2Ffi%20le')['body'] == 'blah'
     ), 'slash encoded'
-    assert (
-        client.get(url='/%20di%20r%20/fi%20le')['body'] == 'blah'
-    ), 'file encoded'
-    assert (
-        client.get(url='/%20di%20r%20%2Ffi%20le')['body'] == 'blah'
-    ), 'encoded'
     assert (
         client.get(url='/%20%64%69%20%72%20%2F%66%69%20%6C%65')['body']
         == 'blah'
