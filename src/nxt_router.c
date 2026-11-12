@@ -9464,7 +9464,9 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     u_char              *pos, *end, *p, c;
     size_t              fields_count, req_size, size, free_size;
     size_t              copy_size;
+    uint32_t            target_path_len;
     nxt_off_t           content_length;
+    nxt_bool_t          path_is_target;
     const char          *sep;
     nxt_buf_t               *b, *buf, *out, **tail;
     nxt_http_field_t        *field, *dup;
@@ -9494,6 +9496,25 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
         return NULL;
     }
 
+    /*
+     * The application protocol has no separate "rewrite happened" flag: the
+     * PHP module reads the resolved req->path and req->target pointers.  Keep
+     * a separate path copy only when the path bytes differ from the target's
+     * path or a rewrite action ran.  The parser also marks a target complex
+     * when a path segment starts with '.', although the decoded bytes may be
+     * unchanged, and that must not count as a difference.
+     */
+
+    target_path_len = (r->args->start != NULL)
+                      ? (uint32_t) (r->args->start - r->target.start - 1)
+                      : (uint32_t) r->target.length;
+
+    path_is_target = (r->path->start == r->target.start
+                      || (!r->uri_changed
+                          && r->path->length == target_path_len
+                          && memcmp(r->path->start, r->target.start,
+                                    r->path->length) == 0));
+
     /* Every length is of data the request holds, so the sum cannot wrap. */
 
     req_size = sizeof(nxt_unit_request_t)
@@ -9504,7 +9525,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
                + nxt_sockaddr_port_length(r->local) + 1
                + r->server_name.length + 1
                + r->target.length + 1
-               + (r->path->start != r->target.start ? r->path->length + 1 : 0);
+               + (path_is_target ? 0 : r->path->length + 1);
 
     content_length = r->content_length_n < 0 ? 0 : r->content_length_n;
     fields_count = 0;
@@ -9603,7 +9624,7 @@ nxt_router_prepare_msg(nxt_task_t *task, nxt_http_request_t *r,
     *p++ = '\0';
 
     req->path_length = (uint32_t) r->path->length;
-    if (r->path->start == r->target.start) {
+    if (path_is_target) {
         nxt_unit_sptr_set(&req->path, target_pos);
 
     } else {

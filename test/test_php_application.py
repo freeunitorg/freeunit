@@ -221,6 +221,12 @@ def test_php_application_query_string_rewrite():
         '/?x=1',
         '/index.php',
         '/index.php/info?a=1',
+        '/.well-known/acme-challenge/token',
+        '/.hidden/',
+        '/.env',
+        '/.env?x=1',
+        '/a/.b/c',
+        '/x/.y/z',
     ],
 )
 def test_php_application_rewritten_path_verbatim(url):
@@ -241,17 +247,19 @@ def test_php_application_rewritten_path_verbatim(url):
 
 
 @pytest.mark.parametrize(
-    'url, path',
+    'url, path, query',
     [
-        ('/a%20b?x=1', '/a b'),
-        ('/a/b/../c', '/a/c'),
-        ('/a/%2e%2e/c', '/c'),
-        ('//a//b/./c', '/a/b/c'),
-        ('/a%2Fb', '/a/b'),
-        ('/%E4%B8%AD', '/中'),
+        ('/a%20b?x=1', '/a b', 'x=1'),
+        ('/a/b/../c', '/a/c', ''),
+        ('/a/%2e%2e/c', '/c', ''),
+        ('//a//b/./c', '/a/b/c', ''),
+        ('/a%2Fb', '/a/b', ''),
+        ('/%6Eew', '/new', ''),
+        ('/a%3Fb%23c?x=%2F', '/a?b#c', 'x=%2F'),
+        ('/%E4%B8%AD', '/中', ''),
     ],
 )
-def test_php_application_rewritten_path_normalized(url, path):
+def test_php_application_rewritten_path_normalized(url, path, query):
     client.load('rewritten_path')
     assert 'success' in client.conf(
         '"index.php"', 'applications/rewritten_path/script',
@@ -261,11 +269,12 @@ def test_php_application_rewritten_path_normalized(url, path):
     assert resp['status'] == 200
     data = resp['body']
 
-    # The decoded, normalized path differs from the verbatim target, so PHP
+    # The decoded, normalized path differs from the target's path, so PHP
     # sees that path in UNIT_REWRITTEN_PATH even without a route rewrite.
     assert data['present'] is True
     assert data['path'] == path
     assert data['request_uri'] == url
+    assert data['query'] == query
 
 
 @pytest.mark.parametrize(
