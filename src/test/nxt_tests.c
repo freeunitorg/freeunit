@@ -416,7 +416,7 @@ static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
 #if (NXT_HAVE_REGEX)
     nxt_regex_test,
 #endif
-    nxt_usdt_test,
+    nxt_usdt_test, nxt_timer_rearm_test,
 };
 
 
