@@ -743,7 +743,13 @@ nxt_http_action_init(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
     nxt_conf_get_string(acf.pass, &pass);
 
-    action->u.tstr = nxt_tstr_compile(rtcf->tstr_state, &pass, 0);
+    /*
+     * nxt_http_pass_segments() decodes each segment of the result.  A
+     * variable such as $uri is already decoded: it is written encoded, so
+     * that the name is the value that the route rules compared.
+     */
+    action->u.tstr = nxt_tstr_compile(rtcf->tstr_state, &pass,
+                                      NXT_TSTR_URI_ENCODE);
     if (nxt_slow_path(action->u.tstr == NULL)) {
         return NXT_ERROR;
     }
@@ -1619,7 +1625,9 @@ nxt_http_action_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
         return NULL;
     }
 
-    action->u.tstr = nxt_tstr_compile(rtcf->tstr_state, pass, 0);
+    /* As in nxt_http_action_init(): a variable value is data. */
+    action->u.tstr = nxt_tstr_compile(rtcf->tstr_state, pass,
+                                      NXT_TSTR_URI_ENCODE);
     if (nxt_slow_path(action->u.tstr == NULL)) {
         return NULL;
     }
