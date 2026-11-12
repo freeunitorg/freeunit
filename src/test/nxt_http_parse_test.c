@@ -328,6 +328,46 @@ static nxt_http_parse_test_case_t  nxt_http_test_cases[] = {
         NULL, { NULL }
     },
     {
+        nxt_string("GET /pa\tth HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /\t HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /?q=a\vb HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa\fth HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa\rth HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa\001th HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /#a\033b HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
+        nxt_string("GET /pa\177th HTTP/1.1\r\n\r\n"),
+        NXT_HTTP_PARSE_INVALID,
+        NULL, { NULL }
+    },
+    {
         nxt_string("GET /./pa th HTTP/1.1\r\n\r\n"),
         NXT_HTTP_PARSE_INVALID,
         NULL, { NULL }
@@ -417,6 +457,30 @@ static nxt_http_parse_test_case_t  nxt_http_test_cases[] = {
             nxt_string("q=a%20b+c"),
             "HTTP/1.1",
             0, 1, 0
+        }}
+    },
+    {
+        nxt_string("GET /pa%09th HTTP/1.1\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("/pa%09th"),
+            nxt_null_string,
+            "HTTP/1.1",
+            0, 1, 0
+        }}
+    },
+    {
+        nxt_string("GET /caf\303\251~ HTTP/1.1\r\n\r\n"),
+        NXT_DONE,
+        &nxt_http_parse_test_request_line,
+        { .request_line = {
+            nxt_string("GET"),
+            nxt_string("/caf\303\251~"),
+            nxt_null_string,
+            "HTTP/1.1",
+            0, 0, 0
         }}
     },
     {

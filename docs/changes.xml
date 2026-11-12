@@ -12,10 +12,12 @@
 
 <change type="change">
 <para>
-a request target that contains an unencoded space now gets a 400 response.
-Before, the space was accepted as part of the target.  The control API uses
-the same parser and closes the connection on such a request.  Percent-encoded
-spaces in paths and arguments remain supported.
+a request target that contains an unencoded space, a control character such
+as HTAB, or DEL now gets a 400 response.  Before, the unencoded space, DEL and
+the control characters other than NUL, CR and LF were accepted as part of the
+target.  The control API uses the same parser and closes the connection on
+such a request.  Percent-encoded spaces and control characters in paths and
+arguments remain supported.
 </para>
 </change>
 
