@@ -76,6 +76,22 @@ Changes with FreeUnit 1.37.2                                     09 Nov 2026
        upstream. The router now percent-encodes the rewritten target by its
        actual content before it builds the upstream request line.
 
+    *) Feature: the "limits": {"pending_requests"} application option bounds
+       the number of requests that may wait in the application queue for a
+       worker to take them; when the limit is reached, new requests get a
+       503 response at once and an info line is logged.
+
+    *) Bugfix: when a client closed an HTTP/1.x connection while its request
+       was waiting in the application queue, the router did not notice the
+       close and still handed the request to a worker once one became free.
+       The router now watches the connection while the request waits, takes
+       the request out of the queue when the client resets the connection,
+       and releases its shared memory.
+
+    *) Feature: when an application request exceeds "limits": {"timeout"},
+       the router now logs an info line that says whether the request
+       expired in the queue waiting for a worker or in the worker itself.
+
     *) Bugfix: when the router got no shared memory for a WebSocket frame
        from the client, because it could not create a new segment, or could
        not hand the frame to the application, it closed the connection

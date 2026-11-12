@@ -69,6 +69,9 @@ static nxt_app_t  nxt_router_app_timeout_test_app;
 
 static nxt_uint_t  nxt_router_app_timeout_test_completions;
 static nxt_uint_t  nxt_router_app_timeout_test_alerts;
+static nxt_uint_t  nxt_router_app_timeout_test_infos;
+static u_char      nxt_router_app_timeout_test_info[256];
+static size_t      nxt_router_app_timeout_test_info_length;
 
 
 typedef struct {
@@ -89,16 +92,45 @@ nxt_router_app_timeout_test_completion(nxt_task_t *task, void *obj, void *data)
 
 /*
  * The log of the engine task, which the deadline runs on.  It counts the
- * alerts and prints nothing.
+ * alerts, records the info lines and prints nothing.
  */
 
 static void nxt_cdecl
 nxt_router_app_timeout_test_log(nxt_uint_t level, nxt_log_t *log,
     const char *fmt, ...)
 {
+    u_char   *p, *end;
+    va_list  args;
+
     if (level == NXT_LOG_ALERT) {
         nxt_router_app_timeout_test_alerts++;
+        return;
     }
+
+    if (level != NXT_LOG_INFO) {
+        return;
+    }
+
+    nxt_router_app_timeout_test_infos++;
+
+    p = nxt_router_app_timeout_test_info;
+    end = p + sizeof(nxt_router_app_timeout_test_info);
+
+    va_start(args, fmt);
+    p = nxt_vsprintf(p, end, fmt, args);
+    va_end(args);
+
+    nxt_router_app_timeout_test_info_length = p
+                                          - nxt_router_app_timeout_test_info;
+}
+
+
+static nxt_bool_t
+nxt_router_app_timeout_test_info_is(const u_char *expect, size_t length)
+{
+    return nxt_router_app_timeout_test_infos == 1
+           && nxt_router_app_timeout_test_info_length == length
+           && memcmp(nxt_router_app_timeout_test_info, expect, length) == 0;
 }
 
 
@@ -311,6 +343,21 @@ nxt_router_app_timeout_test_arm(nxt_task_t *task, nxt_event_engine_t *engine,
     req_rpc_data->rpc_cancel = (rpc_port != NULL);
 
     /*
+     * The production call parks the request, retains its pool, takes a use
+     * of the shared port and arms the deadline: with "timeout": 0 that is
+     * NXT_APP_ACK_TIMEOUT.  "max_processes" is 0, so it starts no process.
+     */
+    if (nxt_router_test_app_port_get(task, app, req_rpc_data) != NXT_OK) {
+        t->r = r;
+        t->req_rpc_data = req_rpc_data;
+        t->header = header;
+        t->body = body;
+        t->stream = 0;
+
+        return NXT_DECLINED;
+    }
+
+    /*
      * The message chain nxt_router_app_prepare_request() leaves behind: the
      * header buffer that went through the queue, marked sent, and the body
      * behind it, which nxt_router_req_headers_ack_handler() sends only once a
@@ -336,13 +383,6 @@ nxt_router_app_timeout_test_arm(nxt_task_t *task, nxt_event_engine_t *engine,
     {
         return NXT_ERROR;
     }
-
-    /*
-     * The production call parks the request, retains its pool, takes a use
-     * of the shared port and arms the deadline: with "timeout": 0 that is
-     * NXT_APP_ACK_TIMEOUT.  "max_processes" is 0, so it starts no process.
-     */
-    nxt_router_test_app_port_get(task, app, req_rpc_data);
 
     t->r = r;
     t->req_rpc_data = req_rpc_data;
@@ -394,10 +434,12 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
     nxt_app_queue_t                    *queue;
     nxt_event_engine_t                 engine, *saved_engine;
     nxt_router_app_timeout_test_req_t  claimed, unclaimed, skipped, untimed;
-    nxt_router_app_timeout_test_req_t  acked, requeued, taken, lost;
+    nxt_router_app_timeout_test_req_t  acked, timed, requeued, taken, lost;
+    nxt_router_app_timeout_test_req_t  bounded, excess;
     nxt_port_t                         *dead_port;
     uint32_t                           cookie;
     uint8_t                            rbuf[NXT_APP_QUEUE_MSG_SIZE];
+    u_char                             expect[128], *p;
     nxt_port_t                         *worker_port;
     nxt_bool_t                         worker_hashed;
     nxt_atomic_t                       app_use;
@@ -413,9 +455,12 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
     claimed.stream = 0;
     untimed.stream = 0;
     acked.stream = 0;
+    timed.stream = 0;
     requeued.stream = 0;
     taken.stream = 0;
     lost.stream = 0;
+    bounded.stream = 0;
+    excess.stream = 0;
     dead_port = NULL;
     worker_port = NULL;
     worker_hashed = 0;
@@ -466,6 +511,7 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
      */
 
     engine_log = *thr->log;
+    engine_log.level = NXT_LOG_WARN;
     engine_log.handler = nxt_router_app_timeout_test_log;
 
     engine.task.thread = thr;
@@ -550,7 +596,7 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
     app->processes = 1;
 
     /* Never reached by the releases below, so the deadline cannot free it. */
-    app->use_count = 16;
+    app->use_count = 24;
 
     /*
      * The pool the requests live in.  Retained beyond what the legs release,
@@ -562,7 +608,7 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
         goto done;
     }
 
-    for (n = 0; n < 8; n++) {
+    for (n = 0; n < 16; n++) {
         nxt_mp_retain(req_mp);
     }
 
@@ -736,8 +782,13 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
     }
 
     nxt_router_app_timeout_test_completions = 0;
+    nxt_router_app_timeout_test_infos = 0;
+    nxt_router_app_timeout_test_info_length = 0;
+    engine_log.level = NXT_LOG_INFO;
 
     nxt_router_app_timeout_test_tick(task, &engine, app->timeout);
+
+    engine_log.level = NXT_LOG_WARN;
 
     if (unclaimed.req_rpc_data->msg_info.cancel != NXT_MSG_RETRACTED
         || unclaimed.r->error == 0 || unclaimed.r->req_rpc_data != NULL)
@@ -747,6 +798,21 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
                       "answered (cancel %d, error %d)",
                       (int) unclaimed.req_rpc_data->msg_info.cancel,
                       (int) unclaimed.r->error);
+        goto done;
+    }
+
+    if (!nxt_router_app_timeout_test_info_is(
+            (const u_char *) "app \"app-timeout-test\": request expired in "
+            "the queue after 1000 ms",
+            nxt_length("app \"app-timeout-test\": request expired in the "
+                       "queue after 1000 ms")))
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: queue expiry logged %ui "
+                      "info line(s) (\"%*s\")",
+                      nxt_router_app_timeout_test_infos,
+                      nxt_router_app_timeout_test_info_length,
+                      nxt_router_app_timeout_test_info);
         goto done;
     }
 
@@ -1076,6 +1142,71 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
     acked.stream = 0;
 
     /*
+     * With a timeout configured, the acknowledgement re-arms the deadline for
+     * the worker's response, and an expiry logs the worker pid and abandons
+     * the port until the worker finishes.
+     */
+
+    app->timeout = 1000;
+
+    if (nxt_slow_path(nxt_router_app_timeout_test_arm(task, &engine, req_mp,
+                                                      app, engine_port, 0,
+                                                      &timed)
+                      != NXT_OK))
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: could not arm a request");
+        goto done;
+    }
+
+    timed.header->next = NULL;
+
+    if (nxt_slow_path(!nxt_router_app_timeout_test_claim(queue))) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: the worker could not claim "
+                      "the queued message");
+        goto done;
+    }
+
+    nxt_router_app_timeout_test_late(task, engine_port, timed.stream,
+                                     _NXT_PORT_MSG_REQ_HEADERS_ACK, 0);
+
+    nxt_router_app_timeout_test_infos = 0;
+    nxt_router_app_timeout_test_info_length = 0;
+    engine_log.level = NXT_LOG_INFO;
+
+    nxt_router_app_timeout_test_tick(task, &engine, app->timeout);
+
+    engine_log.level = NXT_LOG_WARN;
+
+    p = nxt_sprintf(expect, expect + sizeof(expect),
+                    "app \"app-timeout-test\": request expired in worker %PI "
+                    "after 1000 ms", nxt_pid);
+
+    if (timed.r->status != NXT_HTTP_SERVICE_UNAVAILABLE
+        || timed.r->req_rpc_data != NULL
+        || worker_port->detached != 1
+        || !nxt_router_app_timeout_test_info_is(expect, p - expect))
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: worker expiry answered %d, "
+                      "detached %d, logged %ui info line(s) (\"%*s\")",
+                      (int) timed.r->status, (int) worker_port->detached,
+                      nxt_router_app_timeout_test_infos,
+                      nxt_router_app_timeout_test_info_length,
+                      nxt_router_app_timeout_test_info);
+        goto done;
+    }
+
+    nxt_router_app_timeout_test_late(task, engine_port, timed.stream,
+                                     _NXT_PORT_MSG_RPC_ERROR, 1);
+
+    timed.stream = 0;
+    app->timeout = 0;
+
+    nxt_router_app_timeout_test_tick(task, &engine, 2 * NXT_APP_ACK_TIMEOUT);
+
+    /*
      * Leg 7: "timeout": 0, and the last process died before it claimed the
      * request: the router retracted it, and it waits in app->requeue_req
      * for a new process (nxt_router_app_requeue_handler()).  That is a wait
@@ -1339,6 +1470,104 @@ nxt_router_app_timeout_test(nxt_thread_t *thr)
 
     nxt_router_app_timeout_test_tick(task, &engine, 2 * NXT_APP_ACK_TIMEOUT);
 
+    /*
+     * Leg 9: "limits": {"pending_requests"} (#198).  With max_pending_requests
+     * set to 1, one request may wait in the queue; a second request arriving
+     * before an acknowledgement is answered 503 at once and logs the limit,
+     * and once the first request is unlinked the slot is free again.
+     */
+
+    app->processes = 1;
+    app->timeout = 1000;
+    app->max_pending_requests = 1;
+
+    if (nxt_slow_path(nxt_router_app_timeout_test_arm(task, &engine, req_mp,
+                                                      app, engine_port, 0,
+                                                      &bounded)
+                      != NXT_OK))
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: could not arm a request");
+        goto done;
+    }
+
+    if (app->pending_requests != 1 || app->active_requests != 1) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: pending/active requests %uA/%uA "
+                      "after arming one request, expected 1/1",
+                      app->pending_requests, app->active_requests);
+        goto done;
+    }
+
+    nxt_router_app_timeout_test_infos = 0;
+    nxt_router_app_timeout_test_info_length = 0;
+    engine_log.level = NXT_LOG_INFO;
+
+    if (nxt_router_app_timeout_test_arm(&engine.task, &engine, req_mp, app,
+                                        engine_port, 0, &excess)
+        != NXT_DECLINED)
+    {
+        engine_log.level = NXT_LOG_WARN;
+
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: a request above "
+                      "max_pending_requests was admitted");
+        goto done;
+    }
+
+    engine_log.level = NXT_LOG_WARN;
+
+    if (excess.r->status != NXT_HTTP_SERVICE_UNAVAILABLE
+        || excess.r->req_rpc_data != NULL
+        || app->pending_requests != 1
+        || app->active_requests != 1)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: rejected pending request left "
+                      "status %d, rpc_data %p, pending/active %uA/%uA",
+                      (int) excess.r->status, excess.r->req_rpc_data,
+                      app->pending_requests, app->active_requests);
+        goto done;
+    }
+
+    if (!nxt_router_app_timeout_test_info_is(
+            (const u_char *) "app \"app-timeout-test\": pending requests "
+            "limit 1 reached",
+            nxt_length("app \"app-timeout-test\": pending requests limit 1 "
+                       "reached")))
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: pending requests limit logged "
+                      "%ui info line(s) (\"%*s\")",
+                      nxt_router_app_timeout_test_infos,
+                      nxt_router_app_timeout_test_info_length,
+                      nxt_router_app_timeout_test_info);
+        goto done;
+    }
+
+    nxt_router_app_timeout_test_tick(task, &engine, app->timeout);
+
+    if (bounded.r->status != NXT_HTTP_SERVICE_UNAVAILABLE
+        || bounded.r->req_rpc_data != NULL
+        || app->pending_requests != 0
+        || app->active_requests != 0)
+    {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                      "router app timeout test: expired bounded request left "
+                      "status %d, pending/active %uA/%uA",
+                      (int) bounded.r->status,
+                      app->pending_requests, app->active_requests);
+        goto done;
+    }
+
+    bounded.stream = 0;
+
+    while (nxt_app_queue_recv(queue, rbuf, &cookie) >= 0) {
+        /* Drain the retracted message. */
+    }
+
+    nxt_router_app_timeout_test_tick(task, &engine, 2 * app->timeout);
+
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "router app timeout test passed");
 
     ret = NXT_OK;
@@ -1380,6 +1609,10 @@ done:
             nxt_port_rpc_cancel(task, engine_port, acked.stream);
         }
 
+        if (timed.stream != 0) {
+            nxt_port_rpc_cancel(task, engine_port, timed.stream);
+        }
+
         if (requeued.stream != 0) {
             nxt_port_rpc_cancel(task, engine_port, requeued.stream);
         }
@@ -1390,6 +1623,14 @@ done:
 
         if (lost.stream != 0) {
             nxt_port_rpc_cancel(task, engine_port, lost.stream);
+        }
+
+        if (bounded.stream != 0) {
+            nxt_port_rpc_cancel(task, engine_port, bounded.stream);
+        }
+
+        if (excess.stream != 0) {
+            nxt_port_rpc_cancel(task, engine_port, excess.stream);
         }
 
         if (engine_port->pair[0] != -1) {

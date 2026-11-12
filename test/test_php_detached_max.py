@@ -12,6 +12,8 @@ prototype must never exceed "max".
 
 import os
 import signal
+import socket
+import struct
 import subprocess
 import threading
 import time
@@ -224,7 +226,7 @@ def test_php_detached_completion_releases_the_worker():
     assert app_processes().get('detached', 0) == 0, 'detached count cleared'
 
 
-def test_php_detached_parked_request_times_out():
+def test_php_detached_parked_request_times_out(wait_for_record):
     """limits.timeout bounds the wait for capacity, and the request never runs.
 
     The second request cannot be served until the detached work ends, so a
@@ -249,6 +251,13 @@ def test_php_detached_parked_request_times_out():
 
     assert resp['status'] == 503, f'parked request timed out, got {resp}'
     assert elapsed < timeout + 5, f'answered at the deadline, took {elapsed:.1f}s'
+    assert (
+        wait_for_record(
+            r'\[info\].*app "detached_worker": request expired in the queue '
+            r'after 3000 ms'
+        )
+        is not None
+    ), 'queue expiry logged'
     # The end-to-end half of the claim.  What it cannot show is the race
     # underneath it -- a worker claiming the slot in the same instant the
     # timer fires -- because that window is a single CAS.  That half is
@@ -260,6 +269,195 @@ def test_php_detached_parked_request_times_out():
     time.sleep(3)
     assert not os.path.exists(ran), (
         'the timed-out request executed after the worker freed up'
+    )
+
+    assert drain(), 'the detached work finished and the count cleared'
+
+
+def test_php_detached_parked_request_client_closes():
+    """A queued request whose client disconnects is retracted before a worker runs it."""
+
+    aborted = marker('client_closed_ran')
+    pipe1 = marker('client_pipe1_ran')
+    pipe2 = marker('client_pipe2_ran')
+    served = marker('client_served_ran')
+    short = 4
+
+    client.load(
+        'detached_worker',
+        processes={'max': 1, 'spare': 0, 'idle_timeout': IDLE_TIMEOUT},
+        limits={'timeout': 30},
+    )
+
+    assert client.get(url=f'/?sleep={short}')['status'] == 200
+
+    sock = client.get(url=f'/?ran={aborted}', start=True, no_recv=True)
+    time.sleep(0.2)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+    sock.close()
+
+    # A second request arriving on a keep-alive connection while the first is
+    # queued must not be treated as a disconnect or corrupt the read buffer.
+    pipe_sock = client.get(
+        url=f'/?ran={pipe1}',
+        headers={'Host': 'localhost', 'Connection': 'keep-alive'},
+        start=True,
+        no_recv=True,
+    )
+    time.sleep(0.2)
+    pipe_sock.sendall(
+        f'GET /?ran={pipe2} HTTP/1.1\r\n'
+        'Host: localhost\r\n'
+        'Connection: close\r\n\r\n'.encode()
+    )
+
+    resp = client.get(url=f'/?ran={served}', read_timeout=short + 15)
+    assert resp['status'] == 200, f'live request behind disconnected one failed: {resp}'
+
+    pipe_raw = client.recvall(pipe_sock, read_timeout=10).decode()
+    pipe_sock.close()
+
+    assert pipe_raw.count('HTTP/1.1 200 OK') == 2, (
+        f'expected two pipelined 200 responses, got: {pipe_raw!r}'
+    )
+    assert os.path.exists(pipe1), 'the first pipelined request executed'
+    assert os.path.exists(pipe2), 'the second pipelined request executed'
+    assert os.path.exists(served), 'the live request executed'
+    assert not os.path.exists(aborted), (
+        'the disconnected request executed after the worker freed up'
+    )
+
+    assert drain(), 'the detached work finished and the count cleared'
+
+
+def test_php_detached_pending_requests_limit(wait_for_record):
+    """'limits': {'pending_requests'} bounds waiting requests and answers 503."""
+
+    queued = marker('pending_queued_ran')
+    rejected = marker('pending_rejected_ran')
+    aborted = marker('pending_aborted_ran')
+    replacement = marker('pending_replacement_ran')
+    short = 4
+
+    client.load(
+        'detached_worker',
+        processes={'max': 1, 'spare': 0, 'idle_timeout': IDLE_TIMEOUT},
+        limits={'timeout': 30, 'pending_requests': 1},
+    )
+
+    path = '/config/applications/detached_worker/limits/pending_requests'
+
+    resp = client.conf('"soon"', path)
+    assert 'error' in resp, f'non-integer pending_requests rejected: {resp}'
+
+    resp = client.conf('-1', path)
+    assert 'error' in resp, f'negative pending_requests rejected: {resp}'
+    assert (
+        resp.get('detail')
+        == 'The "pending_requests" number must be equal to or greater than 0.'
+    ), resp
+
+    resp = client.conf('131073', path)
+    assert 'error' in resp, f'above-max pending_requests rejected: {resp}'
+    assert (
+        resp.get('detail')
+        == 'The "pending_requests" number must not exceed 131072.'
+    ), resp
+
+    assert 'success' in client.conf('131072', path)
+    assert 'success' in client.conf('0', path)
+    assert 'success' in client.conf('1', path)
+
+    assert client.get(url=f'/?sleep={short}')['status'] == 200
+
+    # A disconnected client frees its pending_requests slot immediately.
+    abort_sock = client.get(url=f'/?ran={aborted}', start=True, no_recv=True)
+    time.sleep(0.2)
+    abort_sock.setsockopt(
+        socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0)
+    )
+    abort_sock.close()
+    time.sleep(0.1)
+
+    # Hold the single pending_requests slot with a live queued request.
+    queued_sock = client.get(url=f'/?ran={queued}', start=True, no_recv=True)
+    time.sleep(0.2)
+
+    t0 = time.monotonic()
+    resp = client.get(url=f'/?ran={rejected}', read_timeout=5)
+    elapsed = time.monotonic() - t0
+
+    assert resp['status'] == 503, (
+        f'request above pending_requests limit was not answered 503: {resp}'
+    )
+    assert elapsed < short - 1, (
+        f'503 waited {elapsed:.1f}s instead of failing immediately'
+    )
+    assert wait_for_record(
+        r'\[info\].*app "detached_worker": pending requests limit 1 reached'
+    ), 'pending requests limit was not logged'
+
+    queued_raw = client.recvall(queued_sock, read_timeout=short + 10).decode()
+    queued_sock.close()
+
+    assert 'HTTP/1.1 200 OK' in queued_raw, (
+        f'queued request inside the limit did not succeed: {queued_raw!r}'
+    )
+    assert os.path.exists(queued), 'the queued request executed'
+    assert not os.path.exists(rejected), 'the rejected request never executed'
+    assert not os.path.exists(aborted), 'the aborted request never executed'
+
+    resp = client.get(url=f'/?ran={replacement}', read_timeout=10)
+    assert resp['status'] == 200
+    assert os.path.exists(replacement), 'the application serves again once drained'
+
+    assert drain(), 'the detached work finished and the count cleared'
+
+
+def test_php_detached_pending_requests_not_inherited():
+    """An application without "pending_requests" is not bounded by another's.
+
+    The router parses every application of a configuration into one reused
+    structure, so a limit that is not reset leaks into the applications that
+    follow.  Put a limited application first and check that the unlimited one
+    queues two requests behind a busy worker without a 503.
+    """
+
+    first = marker('inherit_first_ran')
+    second = marker('inherit_second_ran')
+    short = 4
+
+    client.load(
+        'detached_worker',
+        processes={'max': 1, 'spare': 0, 'idle_timeout': IDLE_TIMEOUT},
+        limits={'timeout': 30},
+    )
+
+    app = client.conf_get('/config/applications/detached_worker')
+    limited = dict(app, limits={'timeout': 30, 'pending_requests': 1})
+
+    # A changed configuration, so the router parses the application again
+    # instead of keeping the one it has.
+    app['limits'] = {'timeout': 31}
+
+    assert 'success' in client.conf(
+        {'limited': limited, 'detached_worker': app}, 'applications'
+    )
+
+    assert client.get(url=f'/?sleep={short}')['status'] == 200
+
+    sock1 = client.get(url=f'/?ran={first}', start=True, no_recv=True)
+    time.sleep(0.2)
+    sock2 = client.get(url=f'/?ran={second}', start=True, no_recv=True)
+
+    raw1 = client.recvall(sock1, read_timeout=short + 10).decode()
+    raw2 = client.recvall(sock2, read_timeout=short + 10).decode()
+    sock1.close()
+    sock2.close()
+
+    assert 'HTTP/1.1 200 OK' in raw1, f'first queued request: {raw1!r}'
+    assert 'HTTP/1.1 200 OK' in raw2, (
+        f'second queued request inherited a pending_requests limit: {raw2!r}'
     )
 
     assert drain(), 'the detached work finished and the count cleared'
@@ -356,7 +554,7 @@ def test_php_detached_start_after_the_worker_went_idle():
     assert os.path.exists(done), 'the detached work ran to completion'
 
 
-def test_php_timed_out_request_keeps_the_worker_busy():
+def test_php_timed_out_request_keeps_the_worker_busy(wait_for_record):
     """A request the router gave up on must not free the worker running it.
 
     The script holds the worker past limits.timeout and then answers normally:
@@ -437,6 +635,13 @@ def test_php_timed_out_request_keeps_the_worker_busy():
         pids = f.read().split()
 
     assert len(pids) == 1, f'the request executed {len(pids)} times: {pids}'
+    assert (
+        wait_for_record(
+            rf'\[info\].*app "detached_worker": request expired in worker '
+            rf'{pids[0]} after 2000 ms'
+        )
+        is not None
+    ), 'worker expiry logged'
 
     assert client.get()['status'] == 200, 'the worker serves again'
 

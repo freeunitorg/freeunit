@@ -134,6 +134,33 @@ target by its actual content before it builds the upstream request line.
 </para>
 </change>
 
+<change type="feature">
+<para>
+the "limits": {"pending_requests"} application option bounds the number of
+requests that may wait in the application queue for a worker to take them; when
+the limit is reached, new requests get a 503 response at once and an info line
+is logged.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+when a client closed an HTTP/1.x connection while its request was waiting in
+the application queue, the router did not notice the close and still handed the
+request to a worker once one became free.  The router now watches the
+connection while the request waits, takes the request out of the queue when the
+client resets the connection, and releases its shared memory.
+</para>
+</change>
+
+<change type="feature">
+<para>
+when an application request exceeds "limits": {"timeout"}, the router now logs
+an info line that says whether the request expired in the queue waiting for a
+worker or in the worker itself.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 when the router got no shared memory for a WebSocket frame from the client,
