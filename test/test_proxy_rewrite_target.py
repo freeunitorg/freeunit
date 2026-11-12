@@ -99,3 +99,82 @@ def test_proxy_rewrite_target_crlf():
     assert b'\r\nInjected' not in sent, 'no raw CRLF injected upstream'
     # The rewritten target reached the upstream percent-encoded instead.
     assert b'%0D%0AInjected' in sent, 'rewritten target is re-encoded'
+
+
+def proxied_target(url):
+    out_file = upstream_file()
+
+    if os.path.exists(out_file):
+        os.unlink(out_file)
+
+    client.get(url=url, headers={'Host': 'localhost', 'Connection': 'close'})
+
+    for _ in range(50):
+        if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+            break
+        time.sleep(0.1)
+
+    assert os.path.exists(out_file), f'upstream received {url}'
+
+    with open(out_file, 'rb') as f:
+        line = f.read().split(b'\r\n', 1)[0]
+
+    print(f'client {url!r} upstream {line!r}')
+
+    return line.split(b' ')[1]
+
+
+def test_proxy_rewrite_target_delimiters():
+    # "$request_uri" is parsed again as an encoded target, so "%3F" and
+    # "%23" become a "?" and a "#" in the path.  They are path data: the
+    # upstream must get them encoded, not as a query or fragment delimiter.
+    # The query is sent as the router holds it: a rewrite does not change
+    # it, so the text after a raw "?" of a rewrite result is not sent, and a
+    # "%3F" in a rewrite result is path data too.  A target that was not
+    # rewritten goes out as the client sent it.
+    assert 'success' in client.conf(
+        {
+            "rewrite": [
+                {
+                    "match": {"uri": "/r/*"},
+                    "action": {
+                        "rewrite": "$request_uri",
+                        "pass": "routes/proxy",
+                    },
+                },
+                {
+                    "match": {"uri": "/q/*"},
+                    "action": {"rewrite": "/qq?k=v", "pass": "routes/proxy"},
+                },
+                {
+                    "match": {"uri": "/p/*"},
+                    "action": {"rewrite": "/pp%3Fk=v", "pass": "routes/proxy"},
+                },
+                {"action": {"pass": "routes/proxy"}},
+            ],
+            "proxy": [
+                {"action": {"proxy": f"http://127.0.0.1:{UPSTREAM_PORT}"}}
+            ],
+        },
+        'routes',
+    ), 'delimiter routes'
+
+    cases = [
+        ('/r/a%3Fb', b'/r/a%3Fb'),
+        ('/r/a%23b', b'/r/a%23b'),
+        ('/r/a%3Fb?q=1', b'/r/a%3Fb?q=1'),
+        ('/r/a%23b%3Fc?q=%3F', b'/r/a%23b%3Fc?q=%3F'),
+        ('/r/a%3Fb?', b'/r/a%3Fb'),
+        ('/r/a%2520b?x', b'/r/a%2520b?x'),
+        ('/r/plain', b'/r/plain'),
+        ('/r/plain?q=1', b'/r/plain?q=1'),
+        ('/n/a%3Fb?q=%23', b'/n/a%3Fb?q=%23'),
+        ('/n/a%3fb', b'/n/a%3fb'),
+        ('/q/x', b'/qq'),
+        ('/q/x?a=1', b'/qq?a=1'),
+        ('/p/x?a=1', b'/pp%3Fk=v?a=1'),
+    ]
+
+    seen = [(url, proxied_target(url)) for url, _ in cases]
+
+    assert seen == [(url, want) for url, want in cases]

@@ -11,6 +11,7 @@
 #include <nxt_h1proto.h>
 #include <nxt_websocket.h>
 #include <nxt_websocket_header.h>
+#include <nxt_checked.h>
 
 
 /*
@@ -3354,15 +3355,24 @@ nxt_h1p_peer_request_target(nxt_http_request_t *r, nxt_str_t *target)
      * (e.g. "$uri") can place a raw CR, LF or space into r->path.  Encode by
      * the path's actual content so such a byte cannot break the upstream
      * request line (request smuggling / header injection).
+     *
+     * r->path is a decoded path only.  A "?" or "#" in it is data, so it is
+     * encoded too.  The query follows from r->args.
      */
-    encode = nxt_encode_complex_uri(NULL, r->path->start, r->path->length);
+    encode = nxt_encode_uri(NULL, r->path->start, r->path->length);
 
     if (encode == 0 && r->args->length == 0) {
         *target = *r->path;
         return NXT_OK;
     }
 
-    size = r->path->length + encode * 2 + 1 + r->args->length;
+    if (nxt_slow_path(nxt_size_mul(encode, 2, &size) != 0
+                      || nxt_size_add(size, r->path->length, &size) != 0
+                      || nxt_size_add(size, 1, &size) != 0
+                      || nxt_size_add(size, r->args->length, &size) != 0))
+    {
+        return NXT_ERROR;
+    }
 
     target->start = nxt_mp_nget(r->mem_pool, size);
     if (target->start == NULL) {
@@ -3370,8 +3380,8 @@ nxt_h1p_peer_request_target(nxt_http_request_t *r, nxt_str_t *target)
     }
 
     if (encode > 0) {
-        p = (u_char *) nxt_encode_complex_uri(target->start, r->path->start,
-                                              r->path->length);
+        p = (u_char *) nxt_encode_uri(target->start, r->path->start,
+                                      r->path->length);
 
     } else {
         p = nxt_cpymem(target->start, r->path->start, r->path->length);
