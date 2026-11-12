@@ -547,6 +547,7 @@ jobs:
             # Re-measure a file when its cost changes.
             heavy="
               test/test_settings.py:125
+              test/test_proxy_header_timeout.py:121
               test/test_app_start_timeout.py:72
               test/test_otel.py:34
               test/test_proxy.py:27

@@ -3763,6 +3763,9 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
         break;
     }
 
+    /* nxt_h1p_peer_free() frees a buffer that is still in c->read. */
+    c->read = NULL;
+
     nxt_http_proxy_buf_mem_free(task, r, b);
 
     r->state->error_handler(task, r, peer);
@@ -4258,11 +4261,30 @@ static const nxt_conn_state_t  nxt_h1p_peer_close_state
 static void
 nxt_h1p_peer_free(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_buf_t   *b;
     nxt_conn_t  *c;
 
     c = obj;
 
     nxt_debug(task, "h1p peer free");
+
+    /*
+     * A response header that is not complete is still in c->read when the
+     * header read ends by a timeout, by an error event, or by a close that
+     * the event engine reports without a read.  Free it here.  No ready
+     * handler of the read state is queued now: the engine runs the read
+     * work queue before the queues of the close.  A queued
+     * nxt_conn_io_read() can still run after this function.  It returns
+     * on c->block_read and does not use c->read.  The buffer holds a
+     * retain of the request pool, so the request in b->parent is still
+     * valid.
+     */
+    b = c->read;
+
+    if (b != NULL) {
+        c->read = NULL;
+        nxt_http_proxy_buf_mem_free(task, b->parent, b);
+    }
 
     nxt_conn_free(task, c);
 }
