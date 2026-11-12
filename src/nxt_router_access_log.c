@@ -9,6 +9,7 @@
 #include <nxt_conf.h>
 #include <nxt_http.h>
 #include <nxt_checked.h>
+#include <nxt_log_sink.h>
 
 
 typedef struct {
@@ -36,13 +37,6 @@ struct nxt_router_access_log_format_s {
 };
 
 
-/*
- * The writer contract: at most three write() calls per record, the first and
- * two retries.  A call interrupted by a signal is not counted.
- */
-#define NXT_ACCESS_LOG_WRITE_ATTEMPTS  3
-
-
 static nxt_router_access_log_format_t *nxt_router_access_log_format_create(
     nxt_task_t *task, nxt_router_conf_t *rtcf, nxt_conf_value_t *value);
 static void nxt_router_access_log_warn(nxt_task_t *task,
@@ -54,8 +48,6 @@ static void nxt_router_access_log_record(nxt_task_t *task,
     nxt_router_access_log_t *access_log, u_char *start, size_t length);
 static nxt_int_t nxt_router_access_log_write(
     nxt_router_access_log_t *access_log, u_char *start, size_t length);
-static ssize_t nxt_router_access_log_write_fd(nxt_fd_t fd, u_char *start,
-    size_t length);
 static nxt_int_t nxt_router_access_log_repair(
     nxt_router_access_log_t *access_log);
 static nxt_int_t nxt_router_access_log_mark_lost(
@@ -200,6 +192,8 @@ nxt_router_access_log_get(nxt_task_t *task, nxt_router_t *router,
     }
 
     access_log->fd = -1;
+    access_log->sink = &nxt_log_file_sink;
+    access_log->sink_ctx = &access_log->fd;
     access_log->handler = &nxt_router_access_log_writer;
     access_log->count = 1;
     access_log->lock = 0;
@@ -460,101 +454,44 @@ nxt_router_access_log_record(nxt_task_t *task,
 
 
 /*
- * One record is one write() and a bounded retry loop: a short write is
- * completed with the same buffer, so the record is never split into two
- * records or resumed after a later record has been appended.  The descriptor
- * is blocking, so a short write is rare (a full disk, a quota, a signal after
- * some bytes), and the loop makes at most NXT_ACCESS_LOG_WRITE_ATTEMPTS calls
- * that are not interrupted by a signal.  The bound keeps the mutex held for a
- * bounded number of calls: a descriptor that keeps taking less than the rest
- * ends the record as a failed write.  A write of no byte or an error other
- * than EINTR ends it too.  When a part of the buffer was written, the log now
- * ends inside a line and is torn: the next write repairs it first.  A write
- * that fails before its first byte leaves the log on a line boundary.  The
- * caller holds access_log->mutex; the loop alone is not atomic.
+ * The sink contract is on nxt_log_sink.h.  The caller holds access_log->mutex
+ * and owns the whole-record invariant: a short write leaves the line torn,
+ * and a failed record is counted by the caller.  The sink state is the
+ * descriptor for the built-in file destination; a module sink brings its own
+ * context and is installed when the loader exists.
  */
 
 static nxt_int_t
-nxt_router_access_log_write(nxt_router_access_log_t *access_log, u_char *start,
-    size_t length)
+nxt_router_access_log_write(nxt_router_access_log_t *access_log,
+    u_char *start, size_t length)
 {
-    size_t      left;
-    ssize_t     n;
-    u_char      *p;
-    nxt_uint_t  attempts;
+    ssize_t               n;
+    const nxt_log_sink_t  *sink;
+    void                  *sink_ctx;
 
-    p = start;
-    left = length;
-    attempts = 0;
+    sink = access_log->sink;
 
-    for ( ;; ) {
-        n = nxt_router_access_log_write_fd(access_log->fd, p, left);
+    if (sink == NULL) {
+        sink = &nxt_log_file_sink;
+        sink_ctx = &access_log->fd;
 
-        if (n == -1 && nxt_errno == NXT_EINTR) {
-            continue;
-        }
-
-        if (n <= 0) {
-            break;
-        }
-
-        p += n;
-        left -= n;
-
-        if (left == 0) {
-            return NXT_OK;
-        }
-
-        if (++attempts == NXT_ACCESS_LOG_WRITE_ATTEMPTS) {
-            break;
-        }
+    } else {
+        sink_ctx = access_log->sink_ctx;
     }
 
-    if (p != start) {
+    n = sink->write(sink_ctx, start, length);
+
+    if (n == (ssize_t) length) {
+        return NXT_OK;
+    }
+
+    if (n > 0) {
         access_log->torn = 1;
     }
 
     return NXT_ERROR;
 }
 
-
-#if (NXT_TESTS)
-
-/*
- * The faults of the next write() calls, for the access log test, one per
- * call in order: -1 fails the call with ENOSPC before any byte, -2 fails it
- * with EINTR before any byte, and n >= 0 lets the call write at most n
- * bytes.  nxt_router_access_log_test_faults is the number of faults left;
- * the calls after them are not changed.
- */
-
-const ssize_t  *nxt_router_access_log_test_fault;
-nxt_uint_t     nxt_router_access_log_test_faults;
-
-#endif
-
-
-static ssize_t
-nxt_router_access_log_write_fd(nxt_fd_t fd, u_char *start, size_t length)
-{
-#if (NXT_TESTS)
-    ssize_t  fault;
-
-    if (nxt_router_access_log_test_faults != 0) {
-        nxt_router_access_log_test_faults--;
-        fault = *nxt_router_access_log_test_fault++;
-
-        if (fault < 0) {
-            nxt_set_errno((fault == -2) ? NXT_EINTR : NXT_ENOSPC);
-            return -1;
-        }
-
-        length = nxt_min(length, (size_t) fault);
-    }
-#endif
-
-    return write(fd, start, length);
-}
 
 
 /*
@@ -915,6 +852,10 @@ nxt_router_access_log_release(nxt_task_t *task, nxt_thread_spinlock_t *lock,
     if (access_log != NULL) {
 
         nxt_thread_mutex_destroy(&access_log->mutex);
+
+        if (access_log->sink != NULL && access_log->sink->close != NULL) {
+            access_log->sink->close(access_log->sink_ctx);
+        }
 
         if (access_log->fd != -1) {
             nxt_fd_close(access_log->fd);

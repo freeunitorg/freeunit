@@ -27,6 +27,7 @@ typedef int                        nxt_err_t;
 #define NXT_ENOTDIR                ENOTDIR
 #define NXT_EISDIR                 EISDIR
 #define NXT_EINVAL                 EINVAL
+#define NXT_EIO                    EIO
 #define NXT_ENOSPC                 ENOSPC
 #define NXT_EPIPE                  EPIPE
 #define NXT_EINPROGRESS            EINPROGRESS
