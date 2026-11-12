@@ -22,11 +22,11 @@ spaces in paths and arguments remain supported.
 <change type="feature">
 <para>
 PHP exposes the decoded, normalized request path, without the query, in
-$_SERVER['UNIT_REWRITTEN_PATH'] whenever it differs from the verbatim request
-target in REQUEST_URI: after a route "rewrite" action, or when the target was
-percent-encoded or carried redundant or dot path segments.  The variable is
-absent when the target already is that path.  REQUEST_URI keeps the original
-request target.  See https://github.com/nginx/unit/issues/1615.
+$_SERVER['UNIT_REWRITTEN_PATH'] when it differs from the target's path in
+REQUEST_URI, or after a route "rewrite" action.  It is absent for a request
+whose target needs no rewrite and no decoding or normalization.  REQUEST_URI
+keeps the original request target.  See
+https://github.com/nginx/unit/issues/1615.
 </para>
 </change>
 
