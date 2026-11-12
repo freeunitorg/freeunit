@@ -774,11 +774,17 @@ nxt_h1p_ws_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
 
     n = c->io->recvbuf(c, b);
 
+    /*
+     * With no data, free only a buffer that this call allocated.  A buffer
+     * that came in as c->read holds a part of a frame header, and this call
+     * did not allocate it.  It stays in c->read: the next read appends to
+     * it, or nxt_h1p_shutdown() releases it through its completion handler.
+     */
+
     if (n > 0) {
         c->read = b;
 
-    } else {
-        c->read = NULL;
+    } else if (b != c->read) {
         nxt_mp_free(c->mem_pool, b);
     }
 
