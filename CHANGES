@@ -49,6 +49,11 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        "opcache.restrict_api" is set, when the script is not cached, and on
        PHP older than 8.1.
 
+    *) Feature: the release has a binary archive of unitd for macOS 13 or
+       later, arm64 and x86_64, with OpenSSL and PCRE2 linked in, and
+       libunit with its headers. The workflow that builds it checks that
+       unitd loads only system libraries and serves a test configuration.
+
 
 Changes with FreeUnit 1.37.2                                     09 Nov 2026
 

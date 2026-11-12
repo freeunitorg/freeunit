@@ -1,0 +1,134 @@
+name: "Release (macOS archive)"
+
+# Builds freeunit-X.Y.Z-macos-arm64.tar.gz and -macos-x86_64.tar.gz with
+# pkg/macos/build-tarball.sh: unitd with OpenSSL and PCRE2 linked in,
+# libunit and its headers.  The script checks that unitd loads only system
+# libraries and that it serves a test configuration.
+#
+# A version tag attaches both archives and their .sha256 files to the
+# release.  The build is reproducible, and a file that the release already
+# has is never replaced.  To add them to an older release, run the workflow by hand with
+# its tag and "publish" set: the source comes from the tag, the script from
+# the branch the workflow runs on.  A pull request that changes the script
+# or this file builds the archives without publishing them.
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-build[0-9]+'
+  pull_request:
+    paths:
+      - 'pkg/macos/**'
+      - '.github/workflows/release-macos.yml'
+  # The script builds the whole tree, and the runner image and Xcode change
+  # under it: build weekly, so that a break shows up here and not on the
+  # release tag.  The release job does not run for this event.
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, e.g. 1.37.2 (empty: this branch)"
+        default: ""
+        type: string
+      publish:
+        description: "Attach the archives to the release of the tag"
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ macos-15, macos-15-intel ]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      TMPDIR: /tmp
+    steps:
+      - name: Check out the build script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          path: ci
+          persist-credentials: false
+
+      - name: Check out the source of the tag
+        if: inputs.tag != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          path: src
+          persist-credentials: false
+
+      - name: Build and check the archive
+        run: |
+          if [ -d src ]; then s=src; else s=ci; fi
+          sh ci/pkg/macos/build-tarball.sh "$s" dist
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: freeunit-macos-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+      || (github.event_name == 'workflow_dispatch'
+          && inputs.publish && inputs.tag != '')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    permissions:
+      contents: write   # required to upload assets to the release
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        with:
+          pattern: freeunit-macos-*
+          path: dist
+          merge-multiple: true
+
+      - name: List the archives
+        run: ls -l dist && cat dist/*.sha256
+
+      # build-deb.yml creates the release of a tag, with its notes, once its
+      # packages pass.  This job only adds files: it waits for the release,
+      # and never creates it or touches its name, notes or draft state.  A
+      # file that the release already has stays as it is, so a re-run
+      # publishes nothing twice; delete the file first to replace it.
+      - name: Attach the archives to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          i=0
+          until gh release view "$TAG" --json assets \
+                  --jq '.assets[].name' > assets 2> gh.err; do
+            if ! grep -q 'release not found' gh.err; then
+              cat gh.err >&2
+              exit 1
+            fi
+            i=$((i + 1))
+            if [ $i -gt 80 ]; then
+              echo "::error::release $TAG does not exist after 80 minutes"
+              exit 1
+            fi
+            sleep 60
+          done
+          for f in dist/*.tar.gz dist/*.sha256; do
+            if grep -qxF "${f#dist/}" assets; then
+              echo "::notice::$TAG already has ${f#dist/}; it stays"
+            else
+              gh release upload "$TAG" "$f"
+            fi
+          done
