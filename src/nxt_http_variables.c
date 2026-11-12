@@ -439,10 +439,6 @@ nxt_http_log_date(u_char *buf, nxt_realtime_t *now, struct tm *tm,
     u_char  sign;
     time_t  gmtoff;
 
-    static const char * const  month[] = { "Jan", "Feb", "Mar", "Apr", "May",
-                                           "Jun", "Jul", "Aug", "Sep", "Oct",
-                                           "Nov", "Dec" };
-
     gmtoff = nxt_timezone(tm) / 60;
 
     if (gmtoff < 0) {
@@ -454,7 +450,8 @@ nxt_http_log_date(u_char *buf, nxt_realtime_t *now, struct tm *tm,
     }
 
     return nxt_sprintf(buf, buf + size, format,
-                       tm->tm_mday, month[tm->tm_mon], tm->tm_year + 1900,
+                       tm->tm_mday, nxt_month_abbr[tm->tm_mon],
+                       tm->tm_year + 1900,
                        tm->tm_hour, tm->tm_min, tm->tm_sec,
                        sign, gmtoff / 60, gmtoff % 60);
 }

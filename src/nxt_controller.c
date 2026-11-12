@@ -3568,15 +3568,8 @@ static u_char *
 nxt_controller_date(u_char *buf, nxt_realtime_t *now, struct tm *tm,
     size_t size, const char *format)
 {
-    static const char * const  week[] = { "Sun", "Mon", "Tue", "Wed", "Thu",
-                                          "Fri", "Sat" };
-
-    static const char * const  month[] = { "Jan", "Feb", "Mar", "Apr", "May",
-                                           "Jun", "Jul", "Aug", "Sep", "Oct",
-                                           "Nov", "Dec" };
-
     return nxt_sprintf(buf, buf + size, format,
-                       week[tm->tm_wday], tm->tm_mday,
-                       month[tm->tm_mon], tm->tm_year + 1900,
+                       nxt_wday_abbr[tm->tm_wday], tm->tm_mday,
+                       nxt_month_abbr[tm->tm_mon], tm->tm_year + 1900,
                        tm->tm_hour, tm->tm_min, tm->tm_sec);
 }
