@@ -1450,6 +1450,11 @@ jobs:
       fail-fast: false
       matrix:
         sanitizer: [none, address]
+        # A pull request runs the address leg only: it builds and runs the
+        # same JIT cases, under ASan.  The plain leg runs on the master push
+        # and in the weekly run.
+        exclude:
+          - sanitizer: ${{ github.event_name == 'pull_request' && 'none' || 'no-such-leg' }}
 
     steps:
       - uses: actions/checkout@v7
@@ -1581,6 +1586,11 @@ jobs:
       fail-fast: false
       matrix:
         cc: [clang, gcc]
+        # A pull request runs the clang leg only, c-tests-jit (address)
+        # builds with gcc and ASan.  The gcc leg runs on the master push and
+        # in the weekly run.
+        exclude:
+          - cc: ${{ github.event_name == 'pull_request' && 'gcc' || 'no-such-cc' }}
 
     steps:
       - uses: actions/checkout@v7
