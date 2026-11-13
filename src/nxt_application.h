@@ -225,6 +225,12 @@ NXT_EXPORT nxt_int_t nxt_unit_default_init(nxt_task_t *task,
 
 NXT_EXPORT nxt_int_t nxt_app_set_logs(void);
 
+/* The context of an application; see nxt_proto_setup(). */
+nxt_int_t nxt_app_context_environment(nxt_task_t *task,
+    nxt_common_app_conf_t *app_conf);
+nxt_int_t nxt_app_context_root(nxt_task_t *task, nxt_process_t *process,
+    nxt_common_app_conf_t *app_conf);
+
 /* Reports a reaped child of the prototype; see nxt_proto_sigchld_handler(). */
 void nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process);
 
