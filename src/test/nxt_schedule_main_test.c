@@ -527,6 +527,78 @@ done:
 }
 
 
+/* A deadline that comes due after main stopped a run is not a timeout. */
+
+static nxt_int_t
+nxt_schedule_main_test_stopped(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_event_engine_t *engine)
+{
+    int                          fd, status;
+    nxt_int_t                    ret;
+    nxt_pid_t                    pid;
+    nxt_uint_t                   timed_out;
+    const nxt_str_t              *name;
+    const nxt_schedule_status_t  *st;
+
+    name = &nxt_schedule_main_test_a;
+
+    ret = NXT_ERROR;
+    fd = -1;
+
+    pid = nxt_schedule_main_test_fork(thr, 0, -1, &fd);
+    if (pid == -1) {
+        return NXT_ERROR;
+    }
+
+    if (!nxt_schedule_main_test_start(task, name, 2, pid)) {
+        goto done;
+    }
+
+    st = nxt_schedule_main_test_status(name);
+    timed_out = (st != NULL) ? st->timed_out : 0;
+
+    /* Main exits: the run is killed, and its deadline is still armed. */
+
+    nxt_schedule_main_stop(task);
+
+    /* The deadline comes due before main reaps the run. */
+
+    nxt_schedule_main_test_tick(task, engine, 2000);
+
+    if (nxt_schedule_main_test_wait(thr, pid, &status) != NXT_OK) {
+        goto done;
+    }
+
+    if (!nxt_schedule_main_killed(pid, status)
+        || !nxt_schedule_main_exited(task, pid, status))
+    {
+        nxt_log_alert(thr->log, "schedule main test: a run stopped before "
+                      "its deadline was not taken as stopped");
+        goto done;
+    }
+
+    pid = -1;
+
+    st = nxt_schedule_main_test_status(name);
+
+    if (st == NULL || st->timed_out != timed_out) {
+        nxt_log_alert(thr->log, "schedule main test: a deadline after a stop "
+                      "was counted as a timeout");
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    nxt_schedule_main_test_set_stopping(0);
+
+    nxt_schedule_main_test_cleanup(task, pid, fd);
+
+    return ret;
+}
+
+
 /* A schedule that leaves the configuration while its run is not reaped. */
 
 static nxt_int_t
@@ -660,6 +732,10 @@ nxt_schedule_main_test(nxt_thread_t *thr)
 
     if (ret == NXT_OK) {
         ret = nxt_schedule_main_test_not_main(thr, task, &engine, &rt);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_schedule_main_test_stopped(thr, task, &engine);
     }
 
     if (ret == NXT_OK) {

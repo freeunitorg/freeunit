@@ -663,6 +663,14 @@ nxt_schedule_main_deadline(nxt_task_t *task, void *obj, void *data)
         return;
     }
 
+    /*
+     * Main has stopped the run, and its kill is on the way.  The run ends as
+     * "stopped", not as a timeout, whether the deadline comes first or not.
+     */
+    if (job->stopped) {
+        return;
+    }
+
     job->timed_out = 1;
 
     nxt_log(task, NXT_LOG_WARN, "schedule \"%V\": run timed out after %uD s, "
