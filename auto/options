@@ -33,6 +33,7 @@ NXT_BROTLI=NO
 NXT_NJS=NO
 NXT_OTEL=NO
 NXT_USDT=NO
+NXT_SCHEDULER=NO
 
 NXT_TEST_BUILD_EPOLL=NO
 NXT_TEST_BUILD_EVENTPORT=NO
@@ -124,6 +125,7 @@ do
         --njs)                           NXT_NJS=YES                         ;;
         --otel)                          NXT_OTEL=YES                        ;;
         --usdt)                          NXT_USDT=YES                        ;;
+        --scheduler)                     NXT_SCHEDULER=YES                   ;;
 
         --test-build-epoll)              NXT_TEST_BUILD_EPOLL=YES            ;;
         --test-build-eventport)          NXT_TEST_BUILD_EVENTPORT=YES        ;;

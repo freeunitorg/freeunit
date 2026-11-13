@@ -368,6 +368,20 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_root_members[] = {
         .validator  = nxt_conf_vldt_access_log,
     },
 
+#if !(NXT_HAVE_SCHEDULER)
+    /*
+     * A configuration with "schedules" is refused with the reason, not as
+     * an unknown parameter: the same configuration is valid in a build
+     * with "./configure --scheduler".
+     */
+    {
+        .name       = nxt_string("schedules"),
+        .type       = NXT_CONF_VLDT_ANY_TYPE,
+        .validator  = nxt_conf_vldt_unsupported,
+        .u.string   = "schedules",
+    },
+#endif
+
     NXT_CONF_VLDT_END
 };
 
