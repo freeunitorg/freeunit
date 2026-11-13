@@ -248,7 +248,7 @@ RUN set -ex \
     && apt-get install --no-install-recommends --no-install-suggests -y \
          ca-certificates git build-essential libssl-dev openssl libpcre2-dev \
          zlib1g-dev libzstd-dev libbrotli-dev curl wget pkg-config pkgconf \
-         libclang-dev cmake python3-pytest python3-openssl sudo procps \
+         libclang-dev cmake python3-pytest python3-openssl python3-pip sudo procps \
     && export RUST_VERSION=1.95.0 \
     && export RUSTUP_HOME=/usr/src/unit/rustup \
     && export CARGO_HOME=/usr/src/unit/cargo \
@@ -266,6 +266,7 @@ RUN set -ex \
     && ./rustup-init -y --no-modify-path --profile minimal --default-toolchain $RUST_VERSION --default-host ${rustArch} \
     && rm rustup-init \
     && rustup --version && cargo --version && rustc --version \
+    && /usr/bin/python3 -m pip install --break-system-packages --quiet zstandard \
     && goArch="$(dpkg --print-architecture)" \
     && goVer="$(curl -fsSL 'https://go.dev/dl/?mode=json' \
                 | grep -oE '"version": *"go[0-9.]+"' | head -n1 \
@@ -310,6 +311,7 @@ ENTRYPOINT ["bash", "-c", "\
         --modulesdir=/usr/lib/unit/debug-modules \
         --debug && \
     make -j $NCPU unitd && \
+    make -j $NCPU tests && \
     ./configure python --config=/usr/local/bin/python3-config && \
     printf 'NXT_INCS += -I%s/pkg/contrib/njs/src -I%s/pkg/contrib/njs/build\\n' \
         $(pwd) $(pwd) >> build/Makefile && \
