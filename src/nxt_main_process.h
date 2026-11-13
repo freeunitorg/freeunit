@@ -59,6 +59,13 @@ nxt_main_store_job_t *nxt_main_store_job_create(nxt_main_store_op_t op,
 void nxt_main_store_job_free(nxt_main_store_job_t *job);
 void nxt_main_store_submit(nxt_task_t *task, nxt_main_store_job_t *job);
 
+/*
+ * Closes the descriptors from 3 upwards, in a child of main that is not a
+ * unitd process any more: the state store child, and a run of a schedule
+ * before it executes its command.
+ */
+void nxt_main_store_close_fds(void);
+
 
 NXT_EXPORT extern nxt_uint_t                nxt_conf_ver;
 NXT_EXPORT extern const nxt_process_init_t  nxt_discovery_process;

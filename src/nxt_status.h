@@ -18,6 +18,19 @@ typedef struct {
 } nxt_status_app_t;
 
 
+#if (NXT_HAVE_SCHEDULER)
+
+#include <nxt_schedule.h>
+
+/* One schedule: the state that main keeps, as the router last got it. */
+typedef struct {
+    nxt_str_t              name;
+    nxt_schedule_status_t  status;
+} nxt_status_schedule_t;
+
+#endif
+
+
 typedef struct {
     uint64_t          accepted_conns;
     uint64_t          idle_conns;
@@ -48,12 +61,28 @@ typedef struct {
     nxt_str_t         access_log_path;
     uint8_t           access_log_configured;
 
+#if (NXT_HAVE_SCHEDULER)
+    /* The entries come after apps[]; see nxt_status_report_schedules(). */
+    size_t            schedules_count;
+#endif
+
     size_t            apps_count;
     nxt_status_app_t  apps[];
 } nxt_status_report_t;
 
 
 nxt_conf_value_t *nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp);
+
+
+#if (NXT_HAVE_SCHEDULER)
+
+nxt_inline nxt_status_schedule_t *
+nxt_status_report_schedules(nxt_status_report_t *report)
+{
+    return (nxt_status_schedule_t *) (report->apps + report->apps_count);
+}
+
+#endif
 
 
 #endif /* _NXT_STATUS_H_INCLUDED_ */

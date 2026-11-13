@@ -83,6 +83,17 @@ struct nxt_port_handlers_s {
 
     /* The controller asks main to store an njs module.  Appended. */
     nxt_port_handler_t  script_store;
+
+#if (NXT_HAVE_SCHEDULER)
+    /*
+     * The router gives main the names of the schedules, or asks for a run;
+     * main gives the router the state of a schedule.  Appended.  Only the
+     * router and main exchange them, so a language module never sees these
+     * numbers, in a build with the scheduler or without it.
+     */
+    nxt_port_handler_t  schedule;
+    nxt_port_handler_t  schedule_status;
+#endif
 };
 
 
@@ -148,6 +159,11 @@ typedef enum {
     _NXT_PORT_MSG_CERT_STORE      = nxt_port_handler_idx(cert_store),
     _NXT_PORT_MSG_SCRIPT_STORE    = nxt_port_handler_idx(script_store),
 
+#if (NXT_HAVE_SCHEDULER)
+    _NXT_PORT_MSG_SCHEDULE        = nxt_port_handler_idx(schedule),
+    _NXT_PORT_MSG_SCHEDULE_STATUS = nxt_port_handler_idx(schedule_status),
+#endif
+
     NXT_PORT_MSG_MAX              = sizeof(nxt_port_handlers_t)
                                     / sizeof(nxt_port_handler_t),
 
@@ -197,6 +213,11 @@ typedef enum {
                               = nxt_msg_last(_NXT_PORT_MSG_REMOVE_CHILD_PID),
     NXT_PORT_MSG_CERT_STORE       = nxt_msg_last(_NXT_PORT_MSG_CERT_STORE),
     NXT_PORT_MSG_SCRIPT_STORE     = nxt_msg_last(_NXT_PORT_MSG_SCRIPT_STORE),
+#if (NXT_HAVE_SCHEDULER)
+    NXT_PORT_MSG_SCHEDULE         = nxt_msg_last(_NXT_PORT_MSG_SCHEDULE),
+    NXT_PORT_MSG_SCHEDULE_STATUS
+                              = nxt_msg_last(_NXT_PORT_MSG_SCHEDULE_STATUS),
+#endif
 } nxt_port_msg_type_t;
 
 
@@ -208,6 +229,12 @@ typedef enum {
  */
 nxt_static_assert(_NXT_PORT_MSG_SCRIPT_STORE == 37,
                   "a port message slot was inserted, not appended");
+
+#if (NXT_HAVE_SCHEDULER)
+/* The slots of the scheduler come after the pinned one, in every build. */
+nxt_static_assert(_NXT_PORT_MSG_SCHEDULE_STATUS == 39,
+                  "a port message slot was inserted, not appended");
+#endif
 
 
 /*
