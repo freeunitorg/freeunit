@@ -18,7 +18,7 @@ static nxt_int_t nxt_http_response_content_length(void *ctx,
     nxt_http_field_t *field, uintptr_t offset);
 
 
-nxt_lvlhsh_t  nxt_response_fields_hash;
+nxt_http_fields_hash_t  nxt_response_fields_hash;
 
 static nxt_http_field_proc_t   nxt_response_fields[] = {
     { nxt_string("Status"),         &nxt_http_response_status, 0 },

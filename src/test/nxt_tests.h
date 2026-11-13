@@ -69,6 +69,8 @@ nxt_int_t nxt_strverscmp_test(nxt_thread_t *thr);
 nxt_int_t nxt_base64_test(nxt_thread_t *thr);
 nxt_int_t nxt_var_escape_test(nxt_thread_t *thr);
 nxt_int_t nxt_string_test(nxt_thread_t *thr);
+nxt_int_t nxt_memcase_eq_test(nxt_thread_t *thr);
+nxt_int_t nxt_http_fields_table_test(nxt_thread_t *thr);
 nxt_int_t nxt_buf_test(nxt_thread_t *thr);
 nxt_int_t nxt_h1proto_conn_test(nxt_thread_t *thr);
 nxt_int_t nxt_h1proto_fields_test(nxt_thread_t *thr);
@@ -158,6 +160,13 @@ nxt_int_t nxt_isolation_mount_dst_test(nxt_thread_t *thr);
 nxt_bool_t nxt_test_fd_is_open(nxt_fd_t fd);
 int nxt_test_in_child(nxt_thread_t *thr, const char *name, int (*fn)(void *),
     void *data);
+
+/* The names of the parse bench in nxt_http_parse_test.c, and their handler. */
+extern nxt_http_field_proc_t  nxt_http_test_bench_fields[];
+extern const nxt_uint_t       nxt_http_test_bench_nfields;
+
+nxt_int_t nxt_http_test_header_return(void *ctx, nxt_http_field_t *field,
+    uintptr_t data);
 
 
 #define NXT_TEST_CHECK(log, cond, ...)                                        \

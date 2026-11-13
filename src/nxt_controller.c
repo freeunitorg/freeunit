@@ -174,7 +174,7 @@ static nxt_http_field_proc_t  nxt_controller_request_fields[] = {
       &nxt_controller_request_content_length, 0 },
 };
 
-static nxt_lvlhsh_t            nxt_controller_fields_hash;
+static nxt_http_fields_hash_t  nxt_controller_fields_hash;
 
 static nxt_uint_t              nxt_controller_listening;
 static nxt_uint_t              nxt_controller_router_ready;
