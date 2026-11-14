@@ -63,6 +63,15 @@ static nxt_int_t nxt_regex_jit_test(nxt_thread_t *thr);
 static nxt_int_t nxt_regex_warn_test(nxt_thread_t *thr);
 static nxt_int_t nxt_regex_ascii_test(nxt_thread_t *thr);
 static int nxt_regex_ascii_test_child(void *data);
+static nxt_int_t nxt_regex_utf_test(nxt_thread_t *thr);
+#if (NXT_HAVE_PCRE2)
+static nxt_int_t nxt_regex_utf_test_mode(nxt_thread_t *thr, nxt_uint_t mode);
+static nxt_int_t nxt_regex_utf_test_set(nxt_thread_t *thr,
+    nxt_regex_match_t *match, nxt_regex_t **set, nxt_uint_t n,
+    const char *subject, size_t length, nxt_uint_t valid, const char *name);
+static nxt_int_t nxt_regex_utf_test_misuse(nxt_thread_t *thr, nxt_mp_t *mp,
+    nxt_regex_match_t *match, nxt_regex_t *re);
+#endif
 
 /* Compile the pattern.  A failure is logged and returns NULL. */
 
@@ -173,7 +182,7 @@ nxt_regex_test_run(nxt_thread_t *thr, nxt_mp_t *mp, const char *pattern,
         return NXT_ERROR;
     }
 
-    *result = nxt_regex_match(re, subject, length, match);
+    *result = nxt_regex_match(re, subject, length, match, NULL);
 
     return NXT_OK;
 }
@@ -505,6 +514,11 @@ nxt_regex_test(nxt_thread_t *thr)
         return ret;
     }
 
+    ret = nxt_regex_utf_test(thr);
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
     ret = nxt_regex_reuse_test(thr);
     if (ret != NXT_OK) {
         return ret;
@@ -569,9 +583,9 @@ nxt_regex_reuse_test(nxt_thread_t *thr)
     subject[0] = '/';
     nxt_memset(subject + 1, '/', 2000);
 
-    limited = nxt_regex_match(slow, subject, 2001, match);
-    matched = nxt_regex_match(simple, (u_char *) "/foo", 4, match);
-    missed = nxt_regex_match(simple, (u_char *) "/baz", 4, match);
+    limited = nxt_regex_match(slow, subject, 2001, match, NULL);
+    matched = nxt_regex_match(simple, (u_char *) "/foo", 4, match, NULL);
+    missed = nxt_regex_match(simple, (u_char *) "/baz", 4, match, NULL);
 
     nxt_mp_destroy(mp);
 
@@ -931,10 +945,10 @@ nxt_regex_warn_test(nxt_thread_t *thr)
 
     warnings = nxt_regex_test_warnings;
 
-    limit1 = nxt_regex_match(re, subject, sizeof(subject), match);
-    limit2 = nxt_regex_match(re, subject, sizeof(subject), match);
-    utf1 = nxt_regex_match(re, (u_char *) "\xff", 1, match);
-    utf2 = nxt_regex_match(re, (u_char *) "\xff", 1, match);
+    limit1 = nxt_regex_match(re, subject, sizeof(subject), match, NULL);
+    limit2 = nxt_regex_match(re, subject, sizeof(subject), match, NULL);
+    utf1 = nxt_regex_match(re, (u_char *) "\xff", 1, match, NULL);
+    utf2 = nxt_regex_match(re, (u_char *) "\xff", 1, match, NULL);
 
     warnings = nxt_regex_test_warnings - warnings;
 
@@ -996,7 +1010,7 @@ nxt_regex_ascii_test(nxt_thread_t *thr)
     }
 
     checks = nxt_regex_test_no_utf_check;
-    (void) nxt_regex_match(utf, (u_char *) "/abc", 4, match);
+    (void) nxt_regex_match(utf, (u_char *) "/abc", 4, match, NULL);
     checks = nxt_regex_test_no_utf_check - checks;
 
     NXT_TEST_CHECK(thr->log, checks == 1, "regex ASCII test: an ASCII "
@@ -1004,8 +1018,8 @@ nxt_regex_ascii_test(nxt_thread_t *thr)
                    checks);
 
     checks = nxt_regex_test_no_utf_check;
-    (void) nxt_regex_match(utf, (u_char *) "/a\xd0\xbf", 4, match);
-    (void) nxt_regex_match(bytes, (u_char *) "/abc", 4, match);
+    (void) nxt_regex_match(utf, (u_char *) "/a\xd0\xbf", 4, match, NULL);
+    (void) nxt_regex_match(bytes, (u_char *) "/abc", 4, match, NULL);
     checks = nxt_regex_test_no_utf_check - checks;
 
     nxt_mp_destroy(mp);
@@ -1063,13 +1077,435 @@ nxt_regex_ascii_test_child(void *data)
 
     for (length = 0; length <= 33; length++) {
         nxt_memset(end - length, 'a', length);
-        (void) nxt_regex_match(re, end - length, length, match);
+        (void) nxt_regex_match(re, end - length, length, match, NULL);
 
         if (length != 0) {
             end[-1] = 0xff;
-            (void) nxt_regex_match(re, end - length, length, match);
+            (void) nxt_regex_match(re, end - length, length, match, NULL);
         }
     }
 
     return 0;
 }
+
+
+/*
+ * A caller can keep the UTF-8 check result of a subject in nxt_regex_utf_t
+ * and give it to each match of the subject.  For each subject and each set
+ * of two or three patterns: the results are the same as with no kept
+ * result, PCRE2 checks the subject once (an ASCII subject not at all), and
+ * the kept result says valid or invalid.  The sets cover patterns with and
+ * without a byte-mode twin, and a pattern without a twin first.  This runs
+ * with the interpreter and, if the build and the library have it, with the
+ * JIT.
+ */
+
+typedef struct {
+    const char  *name;
+    const char  *subject;
+    size_t      length;
+    nxt_uint_t  valid;  /* 2: ASCII, 1: valid UTF-8, 0: invalid. */
+} nxt_regex_utf_test_case_t;
+
+
+#define nxt_regex_utf_case(name, subject, valid)                              \
+    { name, subject, sizeof(subject) - 1, valid }
+
+static const nxt_regex_utf_test_case_t  nxt_regex_utf_test_cases[] = {
+    nxt_regex_utf_case("ASCII", "/a", 2),
+    nxt_regex_utf_case("empty", "", 2),
+    nxt_regex_utf_case("2-byte", "/\xd0\xbf", 1),
+    nxt_regex_utf_case("3-byte", "/\xe2\x82\xac", 1),
+    nxt_regex_utf_case("4-byte", "/\xf0\x9f\x98\x80", 1),
+    nxt_regex_utf_case("U+10FFFF", "/\xf4\x8f\xbf\xbf", 1),
+    nxt_regex_utf_case("first byte 0x80", "\x80/a", 0),
+    nxt_regex_utf_case("lone 0x80", "/a\x80", 0),
+    nxt_regex_utf_case("truncated", "/a\xd0", 0),
+    nxt_regex_utf_case("overlong", "/\xc0\xaf", 0),
+    nxt_regex_utf_case("surrogate", "/\xed\xa0\x80", 0),
+    nxt_regex_utf_case("above U+10FFFF", "/\xf4\x90\x80\x80", 0),
+    nxt_regex_utf_case("5-byte form", "/\xf8\x88\x80\x80\x80", 0),
+    nxt_regex_utf_case("byte 0xFF", "/\xff", 0),
+};
+
+
+/*
+ * "^/.$" and "^/..$" give a different result in UTF mode and in byte mode
+ * on a 2-byte character.  "\x{43f}" is valid only in UTF mode, so the
+ * pattern that has it has no byte-mode twin.
+ */
+
+static const char  *nxt_regex_utf_test_patterns[] = {
+    "^/.$",
+    "^/..$",
+    "z",
+    "^/(?:\\x{43f}|a)",
+};
+
+#define NXT_REGEX_UTF_TEST_PATTERNS  4
+#define NXT_REGEX_UTF_TEST_NOTWIN    3
+
+
+static nxt_int_t
+nxt_regex_utf_test(nxt_thread_t *thr)
+{
+#if (NXT_HAVE_PCRE2)
+    nxt_int_t  ret;
+
+    if (!nxt_regex_test_utf()) {
+        return NXT_OK;
+    }
+
+    /* Mode 1 compiles without the JIT. */
+
+    ret = nxt_regex_utf_test_mode(thr, 1);
+
+    nxt_regex_jit_test_mode(0);
+
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+#if (NXT_REGEX_JIT)
+    if (nxt_regex_jit_test_available()) {
+        ret = nxt_regex_utf_test_mode(thr, 0);
+        if (ret != NXT_OK) {
+            return ret;
+        }
+    }
+#endif
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "regex UTF-8 result test passed: one check per subject");
+#endif
+
+    return NXT_OK;
+}
+
+
+#if (NXT_HAVE_PCRE2)
+
+static nxt_int_t
+nxt_regex_utf_test_mode(nxt_thread_t *thr, nxt_uint_t mode)
+{
+    size_t                           i;
+    nxt_mp_t                         *mp;
+    nxt_int_t                        ret;
+    nxt_uint_t                       n, k;
+    nxt_regex_t                      *re[NXT_REGEX_UTF_TEST_PATTERNS];
+    nxt_regex_t                      *set[3];
+    nxt_regex_match_t                *match;
+    const nxt_regex_utf_test_case_t  *tc;
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return NXT_ERROR;
+    }
+
+    nxt_regex_jit_test_mode(mode);
+
+    match = nxt_regex_match_create(mp, 1);
+    ret = (match != NULL) ? NXT_OK : NXT_ERROR;
+
+    for (k = 0; ret == NXT_OK && k < NXT_REGEX_UTF_TEST_PATTERNS; k++) {
+        re[k] = nxt_regex_test_compile(thr, mp, nxt_regex_utf_test_patterns[k]);
+        if (re[k] == NULL) {
+            ret = NXT_ERROR;
+        }
+    }
+
+    if (ret != NXT_OK) {
+        nxt_mp_destroy(mp);
+        return NXT_ERROR;
+    }
+
+#if (NXT_REGEX_JIT)
+    for (k = 0; k < NXT_REGEX_UTF_TEST_PATTERNS; k++) {
+        if (nxt_regex_jit_compiled(re[k]) != (mode == 0)) {
+            nxt_mp_destroy(mp);
+            NXT_TEST_CHECK(thr->log, 0, "regex UTF-8 result test: pattern "
+                           "%ui is %s JIT code in mode %ui", k,
+                           (mode == 0) ? "not" : "still", mode);
+        }
+    }
+#endif
+
+    for (i = 0; i < nxt_nitems(nxt_regex_utf_test_cases); i++) {
+        tc = &nxt_regex_utf_test_cases[i];
+
+        for (n = 2; n <= 3; n++) {
+
+            /* Three patterns with a twin. */
+
+            set[0] = re[0];
+            set[1] = re[1];
+            set[2] = re[2];
+
+            ret = nxt_regex_utf_test_set(thr, match, set, n, tc->subject,
+                                         tc->length, tc->valid, tc->name);
+            if (ret != NXT_OK) {
+                goto fail;
+            }
+
+            /* A pattern without a twin after one with a twin. */
+
+            set[1] = re[NXT_REGEX_UTF_TEST_NOTWIN];
+
+            ret = nxt_regex_utf_test_set(thr, match, set, n, tc->subject,
+                                         tc->length, tc->valid, tc->name);
+            if (ret != NXT_OK) {
+                goto fail;
+            }
+
+            /* A pattern without a twin first. */
+
+            set[0] = re[NXT_REGEX_UTF_TEST_NOTWIN];
+            set[1] = re[0];
+
+            ret = nxt_regex_utf_test_set(thr, match, set, n, tc->subject,
+                                         tc->length, tc->valid, tc->name);
+            if (ret != NXT_OK) {
+                goto fail;
+            }
+        }
+    }
+
+    ret = nxt_regex_utf_test_misuse(thr, mp, match, re[0]);
+
+fail:
+
+    nxt_mp_destroy(mp);
+
+    if (ret == NXT_OK) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log, "regex UTF-8 result test: "
+                      "%s passed", (mode == 0) ? "JIT" : "interpreter");
+    }
+
+    return ret;
+}
+
+
+/*
+ * Match the subject with each pattern of the set twice: with no kept
+ * result, and with one result kept across the set.
+ */
+
+static nxt_int_t
+nxt_regex_utf_test_set(nxt_thread_t *thr, nxt_regex_match_t *match,
+    nxt_regex_t **set, nxt_uint_t n, const char *subject, size_t length,
+    nxt_uint_t valid, const char *name)
+{
+    u_char                 *p;
+    nxt_int_t              expected[3], got[3];
+    nxt_uint_t             k, checks, expected_checks;
+    nxt_regex_utf_t        utf;
+    nxt_regex_utf_state_t  expected_state;
+
+    p = (u_char *) subject;
+
+    for (k = 0; k < n; k++) {
+        expected[k] = nxt_regex_match(set[k], p, length, match, NULL);
+    }
+
+    nxt_regex_utf_init(&utf);
+
+    checks = nxt_regex_test_utf_checks;
+
+    for (k = 0; k < n; k++) {
+        got[k] = nxt_regex_match(set[k], p, length, match, &utf);
+    }
+
+    checks = nxt_regex_test_utf_checks - checks;
+
+    for (k = 0; k < n; k++) {
+        NXT_TEST_CHECK(thr->log, got[k] == expected[k], "regex UTF-8 "
+                       "result test: %s subject, pattern %ui of %ui returned "
+                       "%i with a kept result, %i without", name, k + 1, n,
+                       got[k], expected[k]);
+    }
+
+    expected_checks = (valid == 2) ? 0 : 1;
+
+    NXT_TEST_CHECK(thr->log, checks == expected_checks, "regex UTF-8 result "
+                   "test: %s subject, %ui patterns checked the subject %ui "
+                   "times, expected %ui", name, n, checks, expected_checks);
+
+    expected_state = (valid != 0) ? NXT_REGEX_UTF_VALID
+                                  : NXT_REGEX_UTF_INVALID;
+
+    NXT_TEST_CHECK(thr->log, utf.state == expected_state
+                   && utf.start == p && utf.length == length,
+                   "regex UTF-8 result test: %s subject, kept result %d, "
+                   "expected %d", name, (int) utf.state, (int) expected_state);
+
+    return NXT_OK;
+}
+
+
+/*
+ * The kept result is for its own bytes only.  A result that a caller gives
+ * by mistake with another subject is not used: with another start or
+ * another length the subject is checked again.  A result also does not
+ * come from a match that stopped at a limit, or from a pattern that
+ * matches bytes.  The caller must reset the result when it changes the
+ * bytes at the same place: nxt_regex_match() cannot see that.
+ */
+
+static nxt_int_t
+nxt_regex_utf_test_misuse(nxt_thread_t *thr, nxt_mp_t *mp,
+    nxt_regex_match_t *match, nxt_regex_t *re)
+{
+    u_char           buf[8], slow_subject[40];
+    nxt_int_t        ret, expected;
+    nxt_uint_t       checks;
+    nxt_regex_t      *slow, *bytes;
+    nxt_regex_utf_t  utf;
+
+    /* A valid result of "/п" given with "/\xff" at another place. */
+
+    nxt_regex_utf_init(&utf);
+
+    ret = nxt_regex_match(re, (u_char *) "/\xd0\xbf", 3, match, &utf);
+
+    NXT_TEST_CHECK(thr->log, ret == 1 && utf.state == NXT_REGEX_UTF_VALID,
+                   "regex UTF-8 misuse test: \"/\\xd0\\xbf\" returned %i, "
+                   "kept result %d", ret, (int) utf.state);
+
+    nxt_memcpy(buf, "/\xff\xff", 3);
+
+    expected = nxt_regex_match(re, buf, 3, match, NULL);
+
+    checks = nxt_regex_test_utf_checks;
+    ret = nxt_regex_match(re, buf, 3, match, &utf);
+    checks = nxt_regex_test_utf_checks - checks;
+
+    NXT_TEST_CHECK(thr->log, ret == expected && checks == 1
+                   && utf.state == NXT_REGEX_UTF_INVALID && utf.start == buf,
+                   "regex UTF-8 misuse test: a valid result of another "
+                   "subject gave %i (expected %i), %ui checks, kept result %d",
+                   ret, expected, checks, (int) utf.state);
+
+    /* An invalid result given with a valid subject at another place. */
+
+    checks = nxt_regex_test_utf_checks;
+    ret = nxt_regex_match(re, (u_char *) "/\xd0\xbf", 3, match, &utf);
+    checks = nxt_regex_test_utf_checks - checks;
+
+    NXT_TEST_CHECK(thr->log, ret == 1 && checks == 1
+                   && utf.state == NXT_REGEX_UTF_VALID,
+                   "regex UTF-8 misuse test: an invalid result of another "
+                   "subject gave %i (expected 1), %ui checks", ret, checks);
+
+    /* The same start with another length: "/п" is valid, "/п\xff" is not. */
+
+    nxt_memcpy(buf, "/\xd0\xbf\xff", 4);
+    nxt_regex_utf_init(&utf);
+
+    ret = nxt_regex_match(re, buf, 3, match, &utf);
+
+    NXT_TEST_CHECK(thr->log, ret == 1 && utf.state == NXT_REGEX_UTF_VALID,
+                   "regex UTF-8 misuse test: 3 bytes returned %i, kept "
+                   "result %d", ret, (int) utf.state);
+
+    expected = nxt_regex_match(re, buf, 4, match, NULL);
+
+    checks = nxt_regex_test_utf_checks;
+    ret = nxt_regex_match(re, buf, 4, match, &utf);
+    checks = nxt_regex_test_utf_checks - checks;
+
+    NXT_TEST_CHECK(thr->log, ret == expected && checks == 1
+                   && utf.state == NXT_REGEX_UTF_INVALID && utf.length == 4,
+                   "regex UTF-8 misuse test: a result for 3 bytes given "
+                   "with 4 gave %i (expected %i), %ui checks, kept result %d",
+                   ret, expected, checks, (int) utf.state);
+
+    /* After a reset, the same place with new bytes is checked again. */
+
+    buf[3] = 'a';
+    nxt_regex_utf_init(&utf);
+
+    checks = nxt_regex_test_utf_checks;
+    ret = nxt_regex_match(re, buf, 4, match, &utf);
+    checks = nxt_regex_test_utf_checks - checks;
+
+    NXT_TEST_CHECK(thr->log, ret == 0 && checks == 1
+                   && utf.state == NXT_REGEX_UTF_VALID,
+                   "regex UTF-8 misuse test: new bytes after a reset gave "
+                   "%i (expected 0), %ui checks, kept result %d", ret, checks,
+                   (int) utf.state);
+
+    /*
+     * A match that stops at the limit keeps no result.  The subject is
+     * "п" and 32 "a" bytes.
+     */
+
+    slow = nxt_regex_test_compile(thr, mp, "^\xd0\xbf?(a+)+[bc]");
+    bytes = (slow != NULL) ? nxt_regex_test_compile(thr, mp, "^/a\xff$")
+                           : NULL;
+    if (bytes == NULL) {
+        return NXT_ERROR;
+    }
+
+    nxt_memcpy(slow_subject, "\xd0\xbf", 2);
+    nxt_memset(slow_subject + 2, 'a', 32);
+
+    nxt_regex_utf_init(&utf);
+
+    ret = nxt_regex_match(slow, slow_subject, 34, match, &utf);
+
+    NXT_TEST_CHECK(thr->log, ret == NXT_ERROR
+                   && utf.state == NXT_REGEX_UTF_UNKNOWN,
+                   "regex UTF-8 misuse test: a limit returned %i, kept "
+                   "result %d, expected %i and %d", ret, (int) utf.state,
+                   (nxt_int_t) NXT_ERROR, (int) NXT_REGEX_UTF_UNKNOWN);
+
+    /* A pattern that matches bytes does not check, so it keeps nothing. */
+
+    checks = nxt_regex_test_utf_checks;
+    ret = nxt_regex_match(bytes, (u_char *) "/a\xff", 3, match, &utf);
+    checks = nxt_regex_test_utf_checks - checks;
+
+    NXT_TEST_CHECK(thr->log, ret == 1 && checks == 0
+                   && utf.state == NXT_REGEX_UTF_UNKNOWN,
+                   "regex UTF-8 misuse test: a byte-mode pattern returned %i, "
+                   "%ui checks, kept result %d", ret, checks, (int) utf.state);
+
+    /*
+     * A pattern that matches bytes after a kept invalid result: it has no
+     * twin, and it does not use the result.
+     */
+
+    nxt_memcpy(buf, "/a\xff", 3);
+    nxt_regex_utf_init(&utf);
+
+    ret = nxt_regex_match(re, buf, 3, match, &utf);
+
+    NXT_TEST_CHECK(thr->log, ret == 0 && utf.state == NXT_REGEX_UTF_INVALID,
+                   "regex UTF-8 misuse test: \"/a\\xff\" returned %i, kept "
+                   "result %d", ret, (int) utf.state);
+
+    checks = nxt_regex_test_utf_checks;
+    ret = nxt_regex_match(bytes, buf, 3, match, &utf);
+    checks = nxt_regex_test_utf_checks - checks;
+
+    NXT_TEST_CHECK(thr->log, ret == 1 && checks == 0
+                   && utf.state == NXT_REGEX_UTF_INVALID,
+                   "regex UTF-8 misuse test: a byte-mode pattern after a kept "
+                   "invalid result returned %i (expected 1), %ui checks, kept "
+                   "result %d", ret, checks, (int) utf.state);
+
+    /* With no kept result, each match checks, as before. */
+
+    checks = nxt_regex_test_utf_checks;
+    (void) nxt_regex_match(re, (u_char *) "/\xd0\xbf", 3, match, NULL);
+    (void) nxt_regex_match(re, (u_char *) "/\xd0\xbf", 3, match, NULL);
+    checks = nxt_regex_test_utf_checks - checks;
+
+    NXT_TEST_CHECK(thr->log, checks == 2, "regex UTF-8 misuse test: two "
+                   "matches with no kept result checked %ui times, expected 2",
+                   checks);
+
+    return NXT_OK;
+}
+
+#endif
