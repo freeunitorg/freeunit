@@ -77,6 +77,9 @@ nxt_http_rewrite(nxt_task_t *task, nxt_http_request_t *r)
 
     *r->path = rp.path;
 
+    /* The UTF-8 check result was for the old path. */
+    nxt_regex_utf_init(&r->path_utf);
+
     r->uri_changed = 1;
 
     if (nxt_slow_path(r->log_route)) {

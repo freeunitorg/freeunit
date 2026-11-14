@@ -569,6 +569,141 @@ def test_routes_match_regex_negative_invalid_utf8(require):
     assert client.get(url='/admin/%FF')['status'] == 403, 'invalid byte'
 
 
+def raw_status(request):
+    return client.http(request, raw=True, encoding='latin-1')['status']
+
+
+def test_routes_match_regex_utf8_many_routes(require):
+    require({'modules': {'regex': True}})
+
+    if not regex_utf():
+        pytest.skip('PCRE 1 or PCRE2 without Unicode support matches bytes')
+
+    # The UTF-8 check of a path, a host or a query runs once per request.
+    # The other routes use its result.  "." matches one character of a
+    # valid subject, and one byte of an invalid subject, so a wrong result
+    # changes the status.
+    misses = [
+        "~^/x",
+        "~\\.php$",
+        "~^/api/",
+        "~(?i)^/static/",
+        "~/[0-9]+$",
+        "~^/admin",
+        "~\\.(css|js)$",
+        "~^/[a-z]+/$",
+    ]
+
+    assert 'success' in client.conf(
+        [{"match": {"uri": m}, "action": {"return": 410}} for m in misses]
+        + [
+            {"match": {"uri": "~^/[^/]+/.$"}, "action": {"return": 200}},
+            {"action": {"return": 204}},
+        ],
+        'routes',
+    )
+
+    p6 = '%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82'
+
+    assert client.get(url=f'/{p6}/%D0%BF')['status'] == 200, 'Cyrillic'
+    assert client.get(url=f'/{p6}/%FF')['status'] == 200, 'invalid byte'
+    assert client.get(url=f'/{p6}/%D0%BF%D0%BF')['status'] == 204, 'two'
+    assert client.get(url='/abc/d')['status'] == 200, 'ASCII'
+
+    assert 'success' in client.conf(
+        [{"match": {"query": m}, "action": {"return": 410}} for m in misses]
+        + [
+            {"match": {"query": "~^.=.$"}, "action": {"return": 200}},
+            {"action": {"return": 204}},
+        ],
+        'routes',
+    )
+
+    assert client.get(url='/?%D0%BF=%D0%BF')['status'] == 200, 'query'
+    assert client.get(url='/?%FF=%FF')['status'] == 200, 'query invalid'
+    assert client.get(url='/?%D0%BF%D0%BF=a')['status'] == 204, 'query two'
+
+    assert 'success' in client.conf(
+        [{"match": {"host": m}, "action": {"return": 410}} for m in misses]
+        + [
+            {"match": {"host": "~^.\\.x$"}, "action": {"return": 200}},
+            {"action": {"return": 204}},
+        ],
+        'routes',
+    )
+
+    req = b'GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n'
+
+    assert raw_status(req % b'\xd0\xbf.x') == 200, 'host'
+    assert raw_status(req % b'\xff.x') == 200, 'host invalid'
+    assert raw_status(req % b'\xd0\xbf\xd0\xbf.x') == 204, 'host two'
+
+
+def test_routes_match_regex_utf8_byte_only(require):
+    require({'modules': {'regex': True}})
+
+    if not regex_utf():
+        pytest.skip('PCRE 1 or PCRE2 without Unicode support matches bytes')
+
+    # "\C" in a lookbehind is an error in UTF mode, so the second pattern
+    # matches bytes.  It must not use the result that the first pattern
+    # kept for the path.
+    assert 'success' in client.conf(
+        [
+            {"match": {"uri": "~^/x"}, "action": {"return": 410}},
+            {"match": {"uri": "~(?<=\\C)b$"}, "action": {"return": 200}},
+            {"action": {"return": 204}},
+        ],
+        'routes',
+    )
+
+    assert client.get(url='/%FFb')['status'] == 200, 'invalid byte'
+    assert client.get(url='/%D0%BFb')['status'] == 200, 'UTF-8'
+    assert client.get(url='/%FFc')['status'] == 204, 'no match'
+
+
+def test_routes_match_regex_utf8_rewrite(require):
+    require({'modules': {'regex': True}})
+
+    if not regex_utf():
+        pytest.skip('PCRE 1 or PCRE2 without Unicode support matches bytes')
+
+    # A regex tests the path before and after a rewrite.  The UTF-8 check
+    # result of the old path must not be used for the new path.
+    def rewrite(src, dst):
+        return {
+            "match": {"uri": src},
+            "action": {"rewrite": dst, "pass": "routes/second"},
+        }
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "routes/main"}},
+            "routes": {
+                "main": [
+                    {"match": {"uri": "~^/x"}, "action": {"return": 410}},
+                    rewrite("/a1", "/%D0%BF"),
+                    rewrite("/a2", "/%FF"),
+                    rewrite("/%D0%BF%D0%BF", "/%FF"),
+                    rewrite("/%FF%FF", "/%D0%BF"),
+                    {"action": {"return": 404}},
+                ],
+                "second": [
+                    {"match": {"uri": "~^/x"}, "action": {"return": 410}},
+                    {"match": {"uri": "~^/.$"}, "action": {"return": 200}},
+                    {"action": {"return": 204}},
+                ],
+            },
+            "applications": {},
+        }
+    ), 'rewrite configure'
+
+    assert client.get(url='/a1')['status'] == 200, 'ASCII to UTF-8'
+    assert client.get(url='/a2')['status'] == 200, 'ASCII to invalid'
+    assert client.get(url='/%D0%BF%D0%BF')['status'] == 200, 'UTF-8 to invalid'
+    assert client.get(url='/%FF%FF')['status'] == 200, 'invalid to UTF-8'
+
+
 def test_routes_pass_encode():
     python_dir = f'{option.test_dir}/python'
 
