@@ -100,6 +100,8 @@ Overrides the directory path for Unit's language modules
 .Pc files .
 .It Fl Fl pid Ar file
 Overrides the pathname for the PID file of Unit's main process.
+.Cm none
+writes no PID file.
 .It Fl Fl statedir Ar directory
 Overrides the directory path for Unit's state storage.
 .El
