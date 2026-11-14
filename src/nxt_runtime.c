@@ -712,7 +712,7 @@ nxt_runtime_exit(nxt_task_t *task, void *obj, void *data)
 
             sa = rt->controller_listen;
 
-            if (sa->u.sockaddr.sa_family == AF_UNIX) {
+            if (sa != NULL && sa->u.sockaddr.sa_family == AF_UNIX) {
                 name = (nxt_file_name_t *) sa->u.sockaddr_un.sun_path;
                 (void) nxt_file_delete(name);
             }
@@ -1052,6 +1052,10 @@ nxt_runtime_conf_init(nxt_task_t *task, nxt_runtime_t *rt)
                   "mkdir(%s) failed %E", file_name.start, nxt_errno);
     }
 
+    if (rt->control == NULL) {
+        return NXT_OK;
+    }
+
     control.length = nxt_strlen(rt->control);
     control.start = (u_char *) rt->control;
 
@@ -1118,6 +1122,7 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
         "\n"
         "  --control ADDRESS    set address of control API socket\n"
         "                       default: \"" NXT_CONTROL_SOCK "\"\n"
+        "                       \"none\" disables the control API\n"
         "\n"
         "  --control-mode MODE  set mode of the control API socket\n"
         "                       default: 0600\n"
@@ -1169,7 +1174,7 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
 
             p = *argv++;
 
-            rt->control = p;
+            rt->control = (nxt_strcmp(p, "none") == 0) ? NULL : p;
 
             continue;
         }

@@ -63,6 +63,8 @@ Runs Unit in non-daemon mode.
 .It Fl Fl control Ar socket
 Overrides the control API's socket address in IPv4, IPv6,
 or UNIX-domain format.
+.Cm none
+disables the control API.
 .It Fl Fl control-mode Ar mode
 Sets the permission of the UNIX-domain control socket.
 .It Fl Fl control-user Ar user

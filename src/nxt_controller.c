@@ -80,6 +80,7 @@ static nxt_int_t nxt_controller_file_read(nxt_task_t *task, const char *name,
     nxt_str_t *str, nxt_mp_t *mp);
 static nxt_int_t nxt_controller_start(nxt_task_t *task,
     nxt_process_data_t *data);
+static void nxt_controller_listen(nxt_task_t *task);
 static void nxt_controller_process_new_port_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_controller_send_current_conf(nxt_task_t *task);
@@ -525,7 +526,6 @@ static void
 nxt_controller_send_current_conf(nxt_task_t *task)
 {
     nxt_int_t         rc;
-    nxt_runtime_t     *rt;
     nxt_conf_value_t  *conf;
 
     conf = nxt_controller_conf.root;
@@ -551,15 +551,29 @@ nxt_controller_send_current_conf(nxt_task_t *task)
         nxt_abort();
     }
 
+    nxt_controller_listen(task);
+
+    nxt_controller_flush_requests(task);
+}
+
+
+/* With "--control none" there is no socket to listen on. */
+
+static void
+nxt_controller_listen(nxt_task_t *task)
+{
+    nxt_runtime_t  *rt;
+
     rt = task->thread->runtime;
 
-    if (nxt_slow_path(nxt_listen_event(task, rt->controller_socket) == NULL)) {
+    if (rt->controller_socket != NULL
+        && nxt_slow_path(nxt_listen_event(task, rt->controller_socket)
+                         == NULL))
+    {
         nxt_abort();
     }
 
     nxt_controller_listening = 1;
-
-    nxt_controller_flush_requests(task);
 }
 
 
@@ -639,7 +653,6 @@ static void
 nxt_controller_conf_init_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
-    nxt_runtime_t                *rt;
 #if (NXT_TLS)
     nxt_controller_cert_store_t  *store;
 #endif
@@ -657,15 +670,7 @@ nxt_controller_conf_init_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     if (nxt_controller_listening == 0) {
-        rt = task->thread->runtime;
-
-        if (nxt_slow_path(nxt_listen_event(task, rt->controller_socket)
-                          == NULL))
-        {
-            nxt_abort();
-        }
-
-        nxt_controller_listening = 1;
+        nxt_controller_listen(task);
     }
 
 #if (NXT_TLS)
