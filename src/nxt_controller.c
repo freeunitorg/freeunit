@@ -80,6 +80,8 @@ static nxt_int_t nxt_controller_file_read(nxt_task_t *task, const char *name,
     nxt_str_t *str, nxt_mp_t *mp);
 static nxt_int_t nxt_controller_start(nxt_task_t *task,
     nxt_process_data_t *data);
+static nxt_int_t nxt_controller_config_file_start(nxt_task_t *task,
+    nxt_str_t *json);
 static void nxt_controller_listen(nxt_task_t *task);
 static void nxt_controller_process_new_port_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
@@ -178,6 +180,7 @@ static nxt_http_field_proc_t  nxt_controller_request_fields[] = {
 static nxt_lvlhsh_t            nxt_controller_fields_hash;
 
 static nxt_uint_t              nxt_controller_listening;
+static nxt_uint_t              nxt_controller_conf_rejected;
 static nxt_uint_t              nxt_controller_router_ready;
 static nxt_controller_conf_t   nxt_controller_conf;
 static nxt_queue_t             nxt_controller_waiting_requests;
@@ -241,6 +244,21 @@ nxt_controller_prefork(nxt_task_t *task, nxt_process_t *process, nxt_mp_t *mp)
     rt = task->thread->runtime;
 
     nxt_memzero(&ctrl_init, sizeof(nxt_controller_init_t));
+
+    /*
+     * nxt_controller_config_load() has read the "--config" file; no state
+     * is loaded, so a certificate or a JavaScript module it names does not
+     * validate.
+     */
+
+    if (rt->config_file != NULL) {
+        nxt_conf_ver = NXT_VERNUM;
+
+        ctrl_init.conf = rt->config_text;
+        process->data.controller = ctrl_init;
+
+        return NXT_OK;
+    }
 
     /*
      * Since configuration version has only been introduced in 1.26,
@@ -407,6 +425,10 @@ nxt_controller_start(nxt_task_t *task, nxt_process_data_t *data)
 
     json = &init->conf;
 
+    if (task->thread->runtime->config_file != NULL) {
+        return nxt_controller_config_file_start(task, json);
+    }
+
     if (json->start == NULL) {
         return NXT_OK;
     }
@@ -495,6 +517,142 @@ nxt_controller_start(nxt_task_t *task, nxt_process_data_t *data)
 }
 
 
+/*
+ * Validates the "--config" file as the control API validates a PUT, with
+ * none of the allowances made for a stored conf.json.  A file that does not
+ * validate is not a reason to restart the controller, which would read the
+ * same file: the controller exits with NXT_CONTROLLER_EXIT_CONFIG once the
+ * router is ready, and main ends unitd.
+ */
+
+static nxt_int_t
+nxt_controller_config_file_start(nxt_task_t *task, nxt_str_t *json)
+{
+    nxt_mp_t               *mp;
+    nxt_int_t              ret;
+    nxt_runtime_t          *rt;
+    nxt_conf_value_t       *conf;
+    nxt_conf_validation_t  vldt;
+
+    rt = task->thread->runtime;
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (nxt_slow_path(mp == NULL)) {
+        return NXT_ERROR;
+    }
+
+    conf = nxt_conf_json_parse_str(mp, json);
+    if (nxt_slow_path(conf == NULL)) {
+        nxt_mp_destroy(mp);
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(&vldt, sizeof(nxt_conf_validation_t));
+
+    vldt.pool = nxt_mp_create(1024, 128, 256, 32);
+    if (nxt_slow_path(vldt.pool == NULL)) {
+        nxt_mp_destroy(mp);
+        return NXT_ERROR;
+    }
+
+    vldt.conf = conf;
+    vldt.conf_pool = mp;
+    vldt.ver = NXT_VERNUM;
+
+    ret = nxt_conf_validate_encoding(&vldt);
+
+    if (ret == NXT_OK) {
+        ret = nxt_conf_validate(&vldt);
+    }
+
+    nxt_mp_destroy(vldt.pool);
+
+    if (ret == NXT_OK) {
+        nxt_controller_conf.root = conf;
+        nxt_controller_conf.pool = mp;
+
+        return NXT_OK;
+    }
+
+    nxt_mp_destroy(mp);
+
+    if (ret == NXT_DECLINED) {
+        nxt_alert(task, "the configuration file \"%s\" is invalid at \"%V\": "
+                  "%V", rt->config_file, &vldt.pointer, &vldt.error);
+
+        nxt_controller_conf_rejected = 1;
+
+        return NXT_OK;
+    }
+
+    return NXT_ERROR;
+}
+
+
+/*
+ * Reads the "--config" file into rt->config_text and checks that it is JSON.
+ * It runs before unitd becomes a daemon, so an unreadable file or a syntax
+ * error ends even a daemon with status 1; the rest of the validation needs
+ * the modules that discovery finds later, and runs in the controller.
+ */
+
+nxt_int_t
+nxt_controller_config_load(nxt_task_t *task, nxt_runtime_t *rt)
+{
+    u_char                 *start;
+    nxt_mp_t               *mp;
+    nxt_int_t              ret;
+    nxt_str_t              text;
+    nxt_uint_t             line, column;
+    nxt_conf_value_t       *conf;
+    nxt_conf_json_error_t  error;
+
+    ret = nxt_controller_file_read(task, rt->config_file, &text, rt->mem_pool);
+    if (ret != NXT_OK) {
+        nxt_alert(task, "cannot read the configuration file \"%s\"",
+                  rt->config_file);
+        return NXT_ERROR;
+    }
+
+    /* Skip UTF-8 BOM, as the control API does. */
+    if (text.length >= 3 && memcmp(text.start, "\xEF\xBB\xBF", 3) == 0) {
+        text.start += 3;
+        text.length -= 3;
+    }
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (nxt_slow_path(mp == NULL)) {
+        return NXT_ERROR;
+    }
+
+    start = text.start;
+
+    nxt_memzero(&error, sizeof(nxt_conf_json_error_t));
+
+    conf = nxt_conf_json_parse(mp, start, start + text.length, &error);
+
+    nxt_mp_destroy(mp);
+
+    if (conf == NULL) {
+        if (error.pos == NULL) {
+            return NXT_ERROR;
+        }
+
+        nxt_conf_json_position(start, error.pos, &line, &column);
+
+        nxt_alert(task, "the configuration file \"%s\" is not valid JSON at "
+                  "line %ui, column %ui: %s",
+                  rt->config_file, line, column, error.detail);
+
+        return NXT_ERROR;
+    }
+
+    rt->config_text = text;
+
+    return NXT_OK;
+}
+
+
 static void
 nxt_controller_process_new_port_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg)
@@ -527,6 +685,11 @@ nxt_controller_send_current_conf(nxt_task_t *task)
 {
     nxt_int_t         rc;
     nxt_conf_value_t  *conf;
+
+    if (nxt_controller_conf_rejected) {
+        nxt_process_quit(task, NXT_CONTROLLER_EXIT_CONFIG);
+        return;
+    }
 
     conf = nxt_controller_conf.root;
 
@@ -653,6 +816,7 @@ static void
 nxt_controller_conf_init_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     void *data)
 {
+    nxt_runtime_t                *rt;
 #if (NXT_TLS)
     nxt_controller_cert_store_t  *store;
 #endif
@@ -660,6 +824,18 @@ nxt_controller_conf_init_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     nxt_controller_waiting_init_conf = 0;
 
     if (msg->port_msg.type != NXT_PORT_MSG_RPC_READY) {
+        rt = task->thread->runtime;
+
+        /* The read-only API could not correct it, so unitd ends. */
+
+        if (rt->config_file != NULL) {
+            nxt_alert(task, "failed to apply the configuration file \"%s\"",
+                      rt->config_file);
+
+            nxt_process_quit(task, NXT_CONTROLLER_EXIT_CONFIG);
+            return;
+        }
+
         nxt_alert(task, "failed to apply previous configuration");
 
         nxt_mp_destroy(nxt_controller_conf.pool);
@@ -1441,6 +1617,26 @@ nxt_controller_process_request(nxt_task_t *task, nxt_controller_request_t *req)
     c = req->conn;
     path = req->parser.path;
 
+    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
+
+    /*
+     * The "--config" file is the configuration: a change made through the
+     * API would be lost on restart, so only reads are served.
+     */
+
+    if (task->thread->runtime->config_file != NULL
+        && !nxt_str_eq(&req->parser.method, "GET", 3))
+    {
+        resp.status = 405;
+        resp.title = (u_char *) "The configuration is read-only.";
+        nxt_str_set(&resp.detail, "unitd runs with \"--config\"; change the "
+                    "file and restart unitd.");
+        resp.offset = -1;
+
+        nxt_controller_response(task, req, &resp);
+        return;
+    }
+
     if (path.length > 1 && path.start[path.length - 1] == '/') {
         path.length--;
     }
@@ -1459,8 +1655,6 @@ nxt_controller_process_request(nxt_task_t *task, nxt_controller_request_t *req)
         nxt_controller_process_config(task, req, &path);
         return;
     }
-
-    nxt_memzero(&resp, sizeof(nxt_controller_response_t));
 
     if (nxt_str_start(&path, "/status", 7)
         && (path.length == 7 || path.start[7] == '/'))

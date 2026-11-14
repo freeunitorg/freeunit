@@ -1020,6 +1020,19 @@ nxt_runtime_conf_init(nxt_task_t *task, nxt_runtime_t *rt)
 
     rt->conf_tmp = (char *) file_name.start;
 
+    /*
+     * With "--config" nothing is read from or written to the state
+     * directory, so it is not created and may be read-only or absent.
+     */
+
+    if (rt->config_file != NULL) {
+        if (nxt_controller_config_load(task, rt) != NXT_OK) {
+            return NXT_ERROR;
+        }
+
+        goto state_done;
+    }
+
     ret = nxt_file_name_create(rt->mem_pool, &file_name, "%s%scerts/%Z",
                                rt->state, slash);
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -1051,6 +1064,8 @@ nxt_runtime_conf_init(nxt_task_t *task, nxt_runtime_t *rt)
         nxt_alert(task, "Unable to create scripts storage directory: "
                   "mkdir(%s) failed %E", file_name.start, nxt_errno);
     }
+
+state_done:
 
     if (rt->control == NULL) {
         return NXT_OK;
@@ -1089,6 +1104,8 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
 
     static const char  no_control[] =
                        "option \"--control\" requires socket address\n";
+    static const char  no_config[] =
+                       "option \"--config\" requires filename\n";
     static const char  no_control_mode[] =
                         "option \"--control-mode\" requires a mode\n";
     static const char  no_control_user[] =
@@ -1130,6 +1147,10 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
         "  --control-user USER    set the owner of the control API socket\n"
         "\n"
         "  --control-group GROUP  set the group of the control API socket\n"
+        "\n"
+        "  --config FILE        load the configuration from FILE; unitd\n"
+        "                       exits if it does not run, and the control\n"
+        "                       API is read-only\n"
         "\n"
         "  --pid FILE           set pid filename; \"none\" writes no pid file\n"
         "                       default: \"" NXT_PID "\"\n"
@@ -1175,6 +1196,19 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
             p = *argv++;
 
             rt->control = (nxt_strcmp(p, "none") == 0) ? NULL : p;
+
+            continue;
+        }
+
+        if (nxt_strcmp(p, "--config") == 0) {
+            if (*argv == NULL) {
+                write(STDERR_FILENO, no_config, nxt_length(no_config));
+                return NXT_ERROR;
+            }
+
+            p = *argv++;
+
+            rt->config_file = p;
 
             continue;
         }

@@ -34,6 +34,7 @@
 .Op Fl Fl control-mode Ar mode
 .Op Fl Fl control-user Ar user
 .Op Fl Fl control-group Ar group
+.Op Fl Fl config Ar file
 .Op Fl Fl group Ar name
 .Op Fl Fl user Ar name
 .Op Fl Fl log Ar file
@@ -92,6 +93,17 @@ permissions act as defense-in-depth rather than the sole access control.
 Where peer credentials are unavailable, or for an IP-based control
 socket, those socket permissions (or network reachability) remain the
 boundary.
+.It Fl Fl config Ar file
+Loads the configuration from
+.Ar file
+instead of the state directory, which is then neither read nor written.
+A file that cannot be read, is not JSON, does not validate, or cannot be
+applied ends the daemon with exit status 1; with
+.Fl Fl no-daemon
+the status reaches the caller in all of these cases.
+The control API only answers GET requests; a change needs an edited file
+and a restart.
+Certificates and JavaScript modules are not loaded in this mode.
 .It Fl Fl group Ar name , Fl Fl user Ar name
 Override group name and user name used to run Unit's non-privileged processes.
 .It Fl Fl log Ar file
