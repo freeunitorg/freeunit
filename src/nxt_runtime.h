@@ -73,7 +73,9 @@ struct nxt_runtime_s {
     const char             *conf;
     const char             *conf_tmp;
     const char             *tmp;
-    const char             *control;
+    const char             *control;           /* NULL with "--control none" */
+    const char             *config_file;       /* "--config", or NULL */
+    nxt_str_t              config_text;        /* its JSON, read at start */
 
     mode_t                 control_mode;
     const char             *control_user;
@@ -140,6 +142,15 @@ NXT_EXPORT nxt_port_t *nxt_runtime_port_find(nxt_runtime_t *rt, nxt_pid_t pid,
 
 /* STUB */
 nxt_int_t nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt);
+nxt_int_t nxt_controller_config_load(nxt_task_t *task, nxt_runtime_t *rt);
+
+/*
+ * The exit status of a controller that cannot run the "--config" file.
+ * Main ends unitd on it instead of restarting the controller, which would
+ * read the same file.
+ */
+#define NXT_CONTROLLER_EXIT_CONFIG  2
+
 nxt_bool_t nxt_controller_peer_allowed(nxt_uid_t uid, nxt_gid_t gid,
     const nxt_gid_t *groups, nxt_uint_t ngroups, nxt_uid_t euid,
     nxt_uid_t ctl_uid, nxt_gid_t ctl_gid);

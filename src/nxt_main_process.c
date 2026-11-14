@@ -1999,6 +1999,16 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
 
                 nxt_process_close_ports(task, process);
 
+                if (init.type == NXT_PROCESS_CONTROLLER
+                    && rt->config_file != NULL
+                    && WIFEXITED(status)
+                    && WEXITSTATUS(status) == NXT_CONTROLLER_EXIT_CONFIG)
+                {
+                    nxt_main_start_exit(task);
+                    nxt_runtime_quit(task, 1);
+                    continue;
+                }
+
                 if (init.restart) {
                     if (init.type == NXT_PROCESS_CONTROLLER
                         && nxt_main_store.pid != 0)
