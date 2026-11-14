@@ -426,9 +426,11 @@ nxt_runtime_initial_start(nxt_task_t *task, nxt_uint_t status)
         }
     }
 
-    ret = nxt_runtime_pid_file_create(task, rt->pid_file);
-    if (ret != NXT_OK) {
-        goto fail;
+    if (rt->pid_file != NULL) {
+        ret = nxt_runtime_pid_file_create(task, rt->pid_file);
+        if (ret != NXT_OK) {
+            goto fail;
+        }
     }
 
     if (nxt_runtime_event_engine_change(task, rt) != NXT_OK) {
@@ -949,12 +951,14 @@ nxt_runtime_conf_init(nxt_task_t *task, nxt_runtime_t *rt)
 
     rt->engine = interface->name;
 
-    ret = nxt_file_name_create(rt->mem_pool, &file_name, "%s%Z", rt->pid);
-    if (nxt_slow_path(ret != NXT_OK)) {
-        return NXT_ERROR;
-    }
+    if (rt->pid != NULL) {
+        ret = nxt_file_name_create(rt->mem_pool, &file_name, "%s%Z", rt->pid);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_ERROR;
+        }
 
-    rt->pid_file = file_name.start;
+        rt->pid_file = file_name.start;
+    }
 
     ret = nxt_file_name_create(rt->mem_pool, &file_name, "%s%Z", rt->log);
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -1122,7 +1126,7 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
         "\n"
         "  --control-group GROUP  set the group of the control API socket\n"
         "\n"
-        "  --pid FILE           set pid filename\n"
+        "  --pid FILE           set pid filename; \"none\" writes no pid file\n"
         "                       default: \"" NXT_PID "\"\n"
         "\n"
         "  --log FILE           set log filename\n"
@@ -1246,7 +1250,7 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
 
             p = *argv++;
 
-            rt->pid = p;
+            rt->pid = (nxt_strcmp(p, "none") == 0) ? NULL : p;
 
             continue;
         }
