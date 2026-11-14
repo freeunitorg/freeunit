@@ -126,7 +126,13 @@ nxt_listen_socket_create(nxt_task_t *task, nxt_mp_t *mp,
 
 #if (NXT_HAVE_UNIX_DOMAIN)
 
-    if (family == AF_UNIX) {
+    /*
+     * An abstract socket has no file: there is nothing to chmod, to chown
+     * or to unlink.  The peer credential check in the controller is all
+     * that guards it, see nxt_runtime_controller_socket().
+     */
+
+    if (family == AF_UNIX && sa->u.sockaddr_un.sun_path[0] != '\0') {
         nxt_runtime_t  *rt = thr->runtime;
 
         name = (nxt_file_name_t *) sa->u.sockaddr_un.sun_path;
@@ -201,7 +207,7 @@ listen_fail:
 
 #if (NXT_HAVE_UNIX_DOMAIN)
 
-    if (family == AF_UNIX) {
+    if (family == AF_UNIX && sa->u.sockaddr_un.sun_path[0] != '\0') {
         name = (nxt_file_name_t *) sa->u.sockaddr_un.sun_path;
 
         (void) nxt_file_delete(name);

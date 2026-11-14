@@ -70,6 +70,27 @@ than 8.1.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+unitd did not exit when it could not create the pid file.  The reason was not
+logged, and the main process stayed, with the control socket bound and no
+other process started.  A container with a read-only root file system, or a
+unitd started by an unprivileged user, with the pid file at a path that it
+could not write was "running" and served nothing.  The failure is now logged
+at alert level, and unitd exits with status 1.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+with an abstract UNIX socket as the control socket, "--control unix:@name",
+unitd failed to start with 'chmod("") failed'.  It starts now, on Linux.  Such
+a socket has no file permissions: the peer credential check of the controller
+is its access control, and "--control-user" and "--control-group" only add to
+the peers that it accepts.
+</para>
+</change>
+
 </changes>
 
 
