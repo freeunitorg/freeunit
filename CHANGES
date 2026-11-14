@@ -9,6 +9,21 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        Percent-encoded spaces and control characters in paths and arguments
        remain supported.
 
+    *) Change: when an application process exits before it answers anything,
+       the router starts the next process of the application after a delay.
+       Before, it started the next process at once. The delay is 100 ms
+       after the first such exit, doubles after each further one, and is at
+       most 5 s. It applies to every start of a process of the application,
+       also to a start for a waiting request. Processes that run keep
+       serving requests. An application with one process has no other
+       process to answer, so each such exit can delay its requests by up to
+       5 s plus the start time. An answer from any process of the
+       application, a restart through /control/applications/<name>/restart,
+       and a changed application configuration end the delay. Unit logs an
+       alert at the first delayed start and a notice when the delay ends. No
+       option changes the delay. See
+       https://github.com/freeunitorg/freeunit/issues/596.
+
     *) Change: with a PCRE2 library built with Unicode support, route
        regexes match in UTF-8 mode: "." and a character class match one
        whole UTF-8 character, not one byte, and "\xHH" is a code point, so

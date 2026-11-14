@@ -19,6 +19,9 @@ def application(environ, start_response):
 
     time.sleep(float(environ.get('HTTP_X_DELAY', 0)))
 
+    if environ.get('HTTP_X_FAIL'):
+        raise RuntimeError('failed on request')
+
     content_length = int(environ.get('CONTENT_LENGTH') or 0)
     environ['wsgi.input'].read(content_length)
 
