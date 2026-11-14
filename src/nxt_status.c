@@ -23,6 +23,10 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
     nxt_status_app_t       *app;
     nxt_conf_value_t       *status, *obj, *mods, *apps, *app_obj, *mod_obj;
     nxt_app_lang_module_t  *modules;
+#if (NXT_HAVE_SCHEDULER)
+    nxt_conf_value_t       *schedules;
+    nxt_status_schedule_t  *sched;
+#endif
 
     static const nxt_str_t  modules_str = nxt_string("modules");
     static const nxt_str_t  version_str = nxt_string("version");
@@ -47,6 +51,17 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
     static const nxt_str_t  start_str = nxt_string("starting");
     static const nxt_str_t  unacc_str = nxt_string("unaccounted");
     static const nxt_str_t  detached_str = nxt_string("detached");
+#if (NXT_HAVE_SCHEDULER)
+    static const nxt_str_t  schedules_str = nxt_string("schedules");
+    static const nxt_str_t  runs_str = nxt_string("runs");
+    static const nxt_str_t  skipped_str = nxt_string("skipped");
+    static const nxt_str_t  timed_out_str = nxt_string("timed_out");
+    static const nxt_str_t  pid_str = nxt_string("pid");
+    static const nxt_str_t  last_start_str = nxt_string("last_start");
+    static const nxt_str_t  last_exit_str = nxt_string("last_exit");
+    static const nxt_str_t  last_signal_str = nxt_string("last_signal");
+    static const nxt_str_t  last_duration_str = nxt_string("last_duration_ms");
+#endif
 
     /*
      * modules, connections, requests, applications -- plus "telemetry" when
@@ -57,7 +72,12 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
      */
     status = nxt_conf_create_object(mp, 4
                                     + (report->otel_configured != 0)
-                                    + (report->access_log_configured != 0));
+                                    + (report->access_log_configured != 0)
+#if (NXT_HAVE_SCHEDULER)
+                                    /* As above: only with a schedule. */
+                                    + (report->schedules_count != 0)
+#endif
+                                    );
     if (nxt_slow_path(status == NULL)) {
         return NULL;
     }
@@ -277,6 +297,55 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
 
         nxt_conf_set_member_integer(obj, &active_str, app->active_requests, 0);
     }
+
+#if (NXT_HAVE_SCHEDULER)
+    if (report->schedules_count != 0) {
+        schedules = nxt_conf_create_object(mp, report->schedules_count);
+        if (nxt_slow_path(schedules == NULL)) {
+            return NULL;
+        }
+
+        nxt_conf_set_member(status, &schedules_str, schedules, idx++);
+
+        sched = nxt_status_report_schedules(report);
+
+        for (i = 0; i < report->schedules_count; i++) {
+            obj = nxt_conf_create_object(mp, 10);
+            if (nxt_slow_path(obj == NULL)) {
+                return NULL;
+            }
+
+            name.length = sched->name.length;
+            name.start = nxt_pointer_to(report, (uintptr_t) sched->name.start);
+
+            ret = nxt_conf_set_member_dup(schedules, mp, &name, obj, i);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                return NULL;
+            }
+
+            nxt_conf_set_member_integer(obj, &runs_str, sched->status.runs, 0);
+            nxt_conf_set_member_integer(obj, &skipped_str,
+                                        sched->status.skipped, 1);
+            nxt_conf_set_member_integer(obj, &failed_str,
+                                        sched->status.failed, 2);
+            nxt_conf_set_member_integer(obj, &timed_out_str,
+                                        sched->status.timed_out, 3);
+            nxt_conf_set_member_integer(obj, &run_str,
+                                        sched->status.running, 4);
+            nxt_conf_set_member_integer(obj, &pid_str, sched->status.pid, 5);
+            nxt_conf_set_member_integer(obj, &last_start_str,
+                                        sched->status.last_start, 6);
+            nxt_conf_set_member_integer(obj, &last_exit_str,
+                                        sched->status.last_exit, 7);
+            nxt_conf_set_member_integer(obj, &last_signal_str,
+                                        sched->status.last_signal, 8);
+            nxt_conf_set_member_integer(obj, &last_duration_str,
+                                        sched->status.last_duration, 9);
+
+            sched++;
+        }
+    }
+#endif
 
     return status;
 }

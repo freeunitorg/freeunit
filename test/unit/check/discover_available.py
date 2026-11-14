@@ -9,6 +9,7 @@ from unit.check.isolation import check_isolation
 from unit.check.njs import check_njs
 from unit.check.node import check_node
 from unit.check.regex import check_regex
+from unit.check.scheduler import check_scheduler
 from unit.check.tls import check_openssl
 from unit.check.unix_abstract import check_unix_abstract
 from unit.log import Log
@@ -50,4 +51,5 @@ def discover_available(unit):
     option.available['features']['chroot'] = check_chroot()
     option.available['features']['clang_wasm'] = check_clang_wasm()
     option.available['features']['isolation'] = check_isolation()
+    option.available['features']['scheduler'] = check_scheduler(output_version)
     option.available['features']['unix_abstract'] = check_unix_abstract()

@@ -192,6 +192,10 @@ struct nxt_app_module_s {
 nxt_app_lang_module_t *nxt_app_lang_module(nxt_runtime_t *rt, nxt_str_t *name);
 nxt_app_type_t nxt_app_parse_type(u_char *p, size_t length);
 
+/* Maps an application object to its configuration, in the main process. */
+nxt_int_t nxt_main_app_conf_map(nxt_task_t *task, nxt_mp_t *mp,
+    nxt_conf_value_t *conf, nxt_common_app_conf_t *app_conf);
+
 #if (NXT_TESTS)
 /*
  * Invokes the static nxt_proto_start_process_handler() with a synthesised
@@ -220,6 +224,12 @@ NXT_EXPORT nxt_int_t nxt_unit_default_init(nxt_task_t *task,
     nxt_unit_init_t *init, nxt_common_app_conf_t *conf);
 
 NXT_EXPORT nxt_int_t nxt_app_set_logs(void);
+
+/* The context of an application; see nxt_proto_setup(). */
+nxt_int_t nxt_app_context_environment(nxt_task_t *task,
+    nxt_common_app_conf_t *app_conf);
+nxt_int_t nxt_app_context_root(nxt_task_t *task, nxt_process_t *process,
+    nxt_common_app_conf_t *app_conf);
 
 /* Reports a reaped child of the prototype; see nxt_proto_sigchld_handler(). */
 void nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process);

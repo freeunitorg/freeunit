@@ -150,6 +150,10 @@ nxt_int_t nxt_cgroup_test(nxt_thread_t *thr);
 nxt_int_t nxt_controller_peer_test(nxt_thread_t *thr);
 nxt_int_t nxt_cpu_limit_test(nxt_thread_t *thr);
 nxt_int_t nxt_process_nofile_test(nxt_thread_t *thr);
+#if (NXT_HAVE_SCHEDULER)
+nxt_int_t nxt_schedule_slot_test(nxt_thread_t *thr);
+nxt_int_t nxt_schedule_main_test(nxt_thread_t *thr);
+#endif
 nxt_int_t nxt_clone_creds_test(nxt_thread_t *thr);
 #if (NXT_HAVE_ISOLATION_ROOTFS)
 nxt_int_t nxt_isolation_mount_dst_test(nxt_thread_t *thr);

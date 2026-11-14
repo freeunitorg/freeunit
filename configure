@@ -150,6 +150,10 @@ fi
 . auto/capability
 . auto/sched
 
+if [ $NXT_SCHEDULER = YES ]; then
+    nxt_have=NXT_HAVE_SCHEDULER . auto/have
+fi
+
 
 case "$NXT_SYSTEM_PLATFORM" in
     i386 | amd64 | x86_64)
