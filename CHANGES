@@ -139,6 +139,14 @@ Changes with FreeUnit 1.37.3                                     12 Nov 2026
        read past the end of a constant string. Now the byte is sent as
        "%00".
 
+    *) Security: update rustix to 1.1.6 for RUSTSEC-2026-0486 in unitctl and
+       in the WebAssembly component module. unitctl reaches the affected
+       functions through the xattr crate.
+
+       The vendored Wasmtime 48.0.8 C API source lock keeps rustix 1.1.4.
+       This exact version has a documented audit exception; the C API does
+       not reach the affected functions.
+
 
 Changes with FreeUnit 1.37.2                                     09 Nov 2026
 
