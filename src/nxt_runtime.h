@@ -73,7 +73,7 @@ struct nxt_runtime_s {
     const char             *conf;
     const char             *conf_tmp;
     const char             *tmp;
-    const char             *control;
+    const char             *control;           /* NULL with "--control none" */
 
     mode_t                 control_mode;
     const char             *control_user;

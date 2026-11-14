@@ -63,6 +63,8 @@ Runs Unit in non-daemon mode.
 .It Fl Fl control Ar socket
 Overrides the control API's socket address in IPv4, IPv6,
 or UNIX-domain format.
+.Cm none
+disables the control API.
 .It Fl Fl control-mode Ar mode
 Sets the permission of the UNIX-domain control socket.
 .It Fl Fl control-user Ar user
@@ -100,6 +102,8 @@ Overrides the directory path for Unit's language modules
 .Pc files .
 .It Fl Fl pid Ar file
 Overrides the pathname for the PID file of Unit's main process.
+.Cm none
+writes no PID file.
 .It Fl Fl statedir Ar directory
 Overrides the directory path for Unit's state storage.
 .El
