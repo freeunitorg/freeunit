@@ -14,7 +14,9 @@ CI runs it as the last step of `.github/workflows/security-seccomp.yml`,
 against the image that workflow has already built from the in-repo Dockerfile.
 That workflow also triggers on `src/nxt_capability.*`, `src/nxt_credential.*`,
 `src/nxt_isolation.*`, `src/nxt_process.*` and `src/nxt_runtime.*`, since
-those are the files that decide what the table below says.
+those are the files that decide what the table below says, and on
+`src/nxt_controller.*` and `src/nxt_listen_socket.*` for the control socket
+of the read-only cells.
 
 The platform is pinned to `linux/amd64` -- what CI runs, and so that a
 multi-arch tag cannot resolve to something else by ambient default.  On an
@@ -30,13 +32,21 @@ arm64 host set `UNIT_HARDENING_PLATFORM=linux/arm64`.
 | `--user 1000:1000` + writable tmpfs on state/run/tmp | serves 200 |
 | `--user 1000:1000 --cap-drop=ALL` + tmpfs | serves 200 |
 | `--user 1000:1000 --cap-drop=ALL --security-opt no-new-privileges` + tmpfs | serves 200 |
+| `--read-only`, configuration in `/docker-entrypoint.d/` | refused: `bind(...control.unit.sock.tmp) failed (30: Read-only file system)` |
+| `--read-only --tmpfs /var/run`, configuration in `/docker-entrypoint.d/` | refused: the PUT of the entrypoint answers 500, `the configuration was not stored` |
+| `--read-only`, configuration in the state, socket/pid/tmp in `/dev/shm` | serves 200 |
+| `--read-only --user 1000:1000 --cap-drop=ALL --security-opt no-new-privileges`, the same | serves 200 |
+| `--read-only`, socket in `/dev/shm`, pid file left in `/var/run` | exits with status 1: `unable to create the pid file` |
 
 Every cell runs under Docker's **default seccomp profile**, unchanged.
 
-Cells assert a cause, not just an outcome.  The refusal cell greps the
-container log for `setgid(999) failed`, because a wholly broken image would
-satisfy "no 200" too.  The five serving cells check two things, both anchored to end of line so that
-`gid=999` cannot be satisfied by `gid=9990`:
+Cells assert a cause, not just an outcome.  Each cell that does not serve
+greps the container log for the cause it names, because a wholly broken image
+would satisfy "no 200" too: `setgid(999) failed` for `--cap-drop=ALL`, the
+failed `bind()` and the 500 of the entrypoint for the two read-only refusals,
+the pid file alert and `exit: status=1` for the cell that exits.  The serving
+cells check two things, both anchored to end of line so that `gid=999` cannot
+be satisfied by `gid=9990`:
 
 - what the canary reports about **itself** -- `uid`, `gid` *and*
   `os.getgroups()`, since a process that drops its primary gid while keeping
@@ -63,9 +73,12 @@ The wait is two-phase for the same reason.  `docker-entrypoint.sh` runs a
 temporary daemon to apply the initial configuration, which activates the
 listener, and only then execs the real one; polling immediately can take a
 200 from the throwaway and pass while production startup is broken.  Each
-cell waits for the entrypoint's "ready for start up" line first.
+cell waits for the entrypoint's "ready for start up" line first.  The cells
+with the configuration in the state have no temporary daemon; they wait for
+"skipping initial configuration", the line the entrypoint prints before it
+execs the only one.
 
-Three things worth taking away:
+Things worth taking away:
 
 - **`--cap-drop=ALL` and root do not mix.**  The daemon's first act is to drop
   the router and applications to the unprivileged `unit` user, and that needs
@@ -81,6 +94,20 @@ Three things worth taking away:
 - **`--user 1000` is not `--user 1000:1000`.**  Uid 1000 has no passwd entry
   in this image, so a bare uid resolves its primary group to GID 0 and the
   container keeps root-group access.  Spell out the group.
+- **`--read-only` needs the configuration in the state, and no mount.**
+  Docker keeps `/dev` and `/dev/shm` writable under `--read-only` and nothing
+  else.  `/docker-entrypoint.d/` cannot work there: the entrypoint applies it
+  through a temporary daemon that has to store the result, and with a
+  read-only state the PUT answers 500.  With the configuration mounted as
+  `/var/lib/unit/conf.json` the entrypoint execs `unitd` at once, and
+  `--control`, `--pid` and `--tmpdir` name `/dev/shm`.  It is world-writable
+  with the sticky bit, so the non-root cell needs none of the chowned tmpfs
+  mounts above.  `pkg/docker/README.md` has the recipe as a Dockerfile.
+- **A start that fails has to end.**  The last cell moves the control socket
+  and leaves the pid file at its read-only default.  It expects `exits`, not
+  `refused`: the container must stop by itself, with status 1 and the reason
+  in the log.  `unitd` once logged nothing there and stayed "running" with no
+  process behind the control socket, which `refused` would have passed.
 
 ## What it does not establish
 
