@@ -176,7 +176,10 @@ fi
 # Tmp copy — isolate source from live tree, avoid live-source mutation
 # ---------------------------------------------------------------------------
 prepare_tmp() {
-    TMP_DIR="$(mktemp -d /tmp/freeunit-test.XXXXXX)"
+    # Suffix outside the quotes: macOS /bin/sh (bash 3.2) fails to parse
+    # "$(mktemp -d "${TMPDIR:-/tmp}/freeunit-test.XXXXXX)" — nested quotes
+    # with text after the expansion inside a double-quoted comsub.
+    TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/freeunit-test.XXXXXX)"
     if $DRY_RUN; then
         info "Dry-run: would copy project → $TMP_DIR (skipping)"
         return 0
