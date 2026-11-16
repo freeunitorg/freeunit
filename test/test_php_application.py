@@ -799,6 +799,70 @@ def test_php_application_ini_set_admin():
     ), 'ini set admin'
 
 
+def test_php_application_ini_admin_hardening():
+    client.load('ini_admin')
+
+    headers = client.get()['headers']
+
+    if headers['X-Session'] != '1':
+        pytest.skip('session extension is not loaded')
+
+    # The defaults depend on the PHP version (8.3.37, 8.4.28, 8.5.13 and
+    # 8.6.0 turn upload progress off; 8.6.0 turns strict mode and httponly
+    # on), and a hardened php.ini can set them too.  So set the opposite
+    # baseline here; then the admin values below must change something.
+    assert 'success' in client.conf(
+        {
+            "admin": {
+                "session.upload_progress.enabled": "1",
+                "session.use_strict_mode": "0",
+                "session.cookie_httponly": "0",
+            },
+            "user": {"session.cookie_samesite": ""},
+        },
+        'applications/ini_admin/options',
+    )
+
+    headers = client.get()['headers']
+
+    assert headers['X-Upload-Progress'] == '1', 'upload progress baseline'
+    assert headers['X-Strict-Mode'] == '0', 'strict mode baseline'
+    assert headers['X-Cookie-Httponly'] == '0', 'httponly baseline'
+    assert headers['X-Cookie-Samesite'] == '', 'samesite baseline'
+
+    admin = {
+        "session.upload_progress.enabled": "0",
+        "max_file_uploads": "5",
+        "max_input_vars": "500",
+        "post_max_size": "2M",
+        "memory_limit": "64M",
+        "session.use_strict_mode": "1",
+        "session.cookie_httponly": "1",
+    }
+
+    if headers['X-Max-Multipart'] != 'false':
+        admin["max_multipart_body_parts"] = "100"
+
+    assert 'success' in client.conf(
+        {"admin": admin, "user": {"session.cookie_samesite": "Lax"}},
+        'applications/ini_admin/options',
+    )
+
+    headers = client.get(url='/?memory_limit=512M')['headers']
+
+    assert headers['X-Upload-Progress'] == '0', 'upload progress admin'
+    assert headers['X-Max-File-Uploads'] == '5', 'max_file_uploads admin'
+    assert headers['X-Max-Input-Vars'] == '500', 'max_input_vars admin'
+    assert headers['X-Post-Max-Size'] == '2M', 'post_max_size admin'
+    assert headers['X-Memory-Limit'] == '64M', 'ini_set cannot raise admin'
+    assert headers['X-Strict-Mode'] == '1', 'strict mode admin'
+    assert headers['X-Cookie-Httponly'] == '1', 'httponly admin'
+    assert headers['X-Cookie-Samesite'] == 'Lax', 'samesite user'
+
+    if "max_multipart_body_parts" in admin:
+        assert headers['X-Max-Multipart'] == "'100'", 'multipart parts admin'
+
+
 def test_php_application_ini_set_user():
     client.load('ini_precision')
 
