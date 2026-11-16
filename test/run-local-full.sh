@@ -58,7 +58,9 @@ fi
 # Tmp copy — isolate source from live tree
 # ---------------------------------------------------------------------------
 prepare_tmp() {
-    TMP_DIR="$(mktemp -d /tmp/freeunit-test-full.XXXXXX)"
+    # Suffix outside the quotes for macOS /bin/sh (bash 3.2); see the
+    # longer comment in run-local.sh.
+    TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}"/freeunit-test-full.XXXXXX)"
     if $DRY_RUN; then
         info "Dry-run: would copy project → $TMP_DIR (skipping)"
         return 0
