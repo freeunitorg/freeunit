@@ -20,8 +20,14 @@ buffers.  Six runs on one machine gave 0, -32, 0 and 0 kB with the buffers
 freed, and +9012 and +9012 kB with them kept.
 
 An AddressSanitizer build holds freed memory, so there the test skips.
+
+With the musl C library the resident memory is not a stable measure.  With
+the buffers freed, twelve runs on one host gave a growth between -7992 and
++8124 kB, which is about one round of buffers.  So the test runs with glibc
+only.
 """
 
+import platform
 import select
 import socket
 import sys
@@ -167,6 +173,9 @@ def rss(pid):
 def test_proxy_header_timeout_releases_buffer():
     if option.configure_flag['asan']:
         pytest.skip('AddressSanitizer holds freed memory, so the RSS grows')
+
+    if platform.libc_ver()[0] != 'glibc':
+        pytest.skip('the RSS is a stable measure with glibc only')
 
     router = pid_by_name('unit: router')
     assert router is not None, 'router pid'
