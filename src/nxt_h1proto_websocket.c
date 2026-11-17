@@ -444,6 +444,11 @@ nxt_h1p_conn_ws_frame_header_read(nxt_task_t *task, void *obj, void *data)
     } else {
         nxt_buf_t *b = nxt_buf_mem_alloc(c->mem_pool, frame_size - size, 0);
 
+        if (nxt_slow_path(b == NULL)) {
+            hxt_h1p_send_ws_error(task, r, &nxt_ws_err_out_of_memory);
+            return;
+        }
+
         c->read->next = b;
         c->read = b;
     }
