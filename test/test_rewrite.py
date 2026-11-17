@@ -45,7 +45,7 @@ def test_rewrite(findall, wait_for_record):
     assert len(findall(r'\[notice\].*URI rewritten')) == 1
 
     set_rewrite("", "")
-    assert client.get()['status'] == 200
+    assert client.get()['status'] == 500, 'empty result'
 
 
 def test_rewrite_variable():
@@ -107,6 +107,60 @@ def test_rewrite_njs(require):
 
     set_rewrite("`/${host}`", "/localhost")
     assert client.get()['status'] == 200
+
+
+def set_rewrite_any(rewrite):
+    assert 'success' in client.conf(
+        [
+            {
+                "match": {"uri": "/"},
+                "action": {"rewrite": rewrite, "pass": "routes"},
+            },
+            {"action": {"return": 200}},
+        ],
+        'routes',
+    )
+
+
+def test_rewrite_no_leading_slash(findall, wait_for_record):
+    set_rewrite_any("$arg_path")
+
+    assert client.get(url='/?path=/new')['status'] == 200
+    assert len(findall(r'URI rewritten to "/new"')) == 1
+
+    for path in ['new', 'new/', '.', '..', '../new', '?a']:
+        assert client.get(url=f'/?path={path}')['status'] == 500, path
+
+    assert client.get(url='/?path=')['status'] == 500, 'empty value'
+    assert client.get()['status'] == 500, 'no argument'
+
+    assert len(findall(r'URI rewritten')) == 1, 'no other rewrite'
+    assert (
+        wait_for_record(
+            r'\[error\].*"rewrite" result "new" does not start with "/"'
+        )
+        is not None
+    )
+
+
+def test_rewrite_no_leading_slash_constant():
+    for rewrite in ['new', 'new/', '..']:
+        set_rewrite_any(rewrite)
+        assert client.get()['status'] == 500, rewrite
+
+    # The literal text is an encoded URI, so "%2F" is a "/".
+    set_rewrite_any("%2Fnew")
+    assert client.get()['status'] == 200
+
+
+def test_rewrite_no_leading_slash_njs(require):
+    require({'modules': {'njs': 'any'}})
+
+    set_rewrite_any("`${args.path}`")
+
+    assert client.get(url='/?path=/new')['status'] == 200
+    assert client.get(url='/?path=new')['status'] == 500
+    assert client.get()['status'] == 500, 'no argument'
 
 
 def test_rewrite_location():

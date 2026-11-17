@@ -76,6 +76,18 @@ nxt_http_rewrite(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_ERROR;
     }
 
+    /*
+     * The parser resolves "." and ".." segments only after a "/".  The
+     * route rules and the actions expect a path that starts with "/".  So a
+     * result that does not start with "/" is an error.
+     */
+
+    if (nxt_slow_path(rp.path.length == 0 || rp.path.start[0] != '/')) {
+        nxt_log(task, NXT_LOG_ERR, "\"rewrite\" result \"%V\" does not start "
+                "with \"/\"", &str);
+        return NXT_ERROR;
+    }
+
     r->path = nxt_mp_alloc(r->mem_pool, sizeof(nxt_str_t));
     if (nxt_slow_path(r->path == NULL)) {
         return NXT_ERROR;
