@@ -7,7 +7,7 @@
 
 <changes apply="unit"
          ver="1.37.3" rev="1"
-         date="2026-11-12" time="00:00:00 +0000"
+         date="2026-11-17" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change type="security">
@@ -39,6 +39,17 @@ target that 1.37.2 fixed.
 <para>
 The result of an njs "rewrite" or "pass" template was decoded in the same
 way.  It is now kept as data too.
+</para>
+</change>
+
+<change type="security">
+<para>
+a "rewrite" result that did not start with "/" kept a leading ".." segment.
+So a "share" that joins a directory and "$uri" could serve a file one level
+above that directory, and a later route rule on "uri" could fail to match.
+This needed a "rewrite" whose result can start with a value from the client,
+such as an argument or a header.  Now a "rewrite" result that is empty or
+does not start with "/" gives status 500.
 </para>
 </change>
 
@@ -79,6 +90,15 @@ is at most 2048 + 4 * 8192 = 34816 bytes for each open WebSocket connection.
 For this defect only, turning off the access log on an earlier version
 stopped the crash and the wrong record in tests.  It does not stop the loss
 of the buffers.
+</para>
+</change>
+
+<change type="security">
+<para>
+the router process could crash on a TLS listener when the buffer for the
+rest of a WebSocket frame could not be allocated.  This was possible with a
+"max_frame_size" of about 4 GiB or more.  Now the router closes the WebSocket
+with status 1011.
 </para>
 </change>
 
@@ -197,6 +217,33 @@ constant string.  Now the byte is sent as "%00".
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+a "Content-Length" header field of a "proxy" upstream response that did
+not parse was sent to the client as it was, without other framing of the
+body.  The field is no longer sent: the response is chunked for an
+HTTP/1.1 client and ends with the close of the connection for an HTTP/1.0
+client.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the "headers" object of an njs template found a request header field only
+when the template wrote its name in the same letter case as the client.
+Otherwise the value was undefined.  Now the name matches in any letter case,
+as for the "$header_*" variables.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+the prototype process of an application with "rootfs" isolation could
+crash when the mount table had 256 or more entries, and the application
+did not start.
+</para>
+</change>
+
 <change type="security">
 <para>
 update rustix to 1.1.6 for RUSTSEC-2026-0486 in unitctl and in the
@@ -224,7 +271,7 @@ the affected functions.
                 unit-jsc19 unit-jsc20 unit-jsc21
                 unit-wasm"
          ver="1.37.3" rev="1"
-         date="2026-11-12" time="00:00:00 +0000"
+         date="2026-11-17" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change>

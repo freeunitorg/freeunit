@@ -1,5 +1,5 @@
 
-Changes with FreeUnit 1.37.3                                     12 Nov 2026
+Changes with FreeUnit 1.37.3                                     17 Nov 2026
 
     *) Security: the router process could crash when a WebSocket connection
        ended while messages of the application were still unsent, or when
@@ -25,6 +25,14 @@ Changes with FreeUnit 1.37.3                                     12 Nov 2026
 
        The result of an njs "rewrite" or "pass" template was decoded in the
        same way. It is now kept as data too.
+
+    *) Security: a "rewrite" result that did not start with "/" kept a
+       leading ".." segment. So a "share" that joins a directory and "$uri"
+       could serve a file one level above that directory, and a later route
+       rule on "uri" could fail to match. This needed a "rewrite" whose
+       result can start with a value from the client, such as an argument or
+       a header. Now a "rewrite" result that is empty or does not start with
+       "/" gives status 500.
 
     *) Security: a request target that contains an unencoded space, a
        control character such as HTAB, or DEL now gets a 400 response.
@@ -55,6 +63,11 @@ Changes with FreeUnit 1.37.3                                     12 Nov 2026
        connection. For this defect only, turning off the access log on an
        earlier version stopped the crash and the wrong record in tests. It
        does not stop the loss of the buffers.
+
+    *) Security: the router process could crash on a TLS listener when the
+       buffer for the rest of a WebSocket frame could not be allocated. This
+       was possible with a "max_frame_size" of about 4 GiB or more. Now the
+       router closes the WebSocket with status 1011.
 
     *) Security: the timer code could run the handler of a timer that had
        expired and was armed again before its handler ran, while the timer
@@ -138,6 +151,21 @@ Changes with FreeUnit 1.37.3                                     12 Nov 2026
        action was sent raw in the "Location" header field, and the encoder
        read past the end of a constant string. Now the byte is sent as
        "%00".
+
+    *) Bugfix: a "Content-Length" header field of a "proxy" upstream
+       response that did not parse was sent to the client as it was, without
+       other framing of the body. The field is no longer sent: the response
+       is chunked for an HTTP/1.1 client and ends with the close of the
+       connection for an HTTP/1.0 client.
+
+    *) Bugfix: the "headers" object of an njs template found a request
+       header field only when the template wrote its name in the same letter
+       case as the client. Otherwise the value was undefined. Now the name
+       matches in any letter case, as for the "$header_*" variables.
+
+    *) Bugfix: the prototype process of an application with "rootfs"
+       isolation could crash when the mount table had 256 or more entries,
+       and the application did not start.
 
     *) Security: update rustix to 1.1.6 for RUSTSEC-2026-0486 in unitctl and
        in the WebAssembly component module. unitctl reaches the affected
