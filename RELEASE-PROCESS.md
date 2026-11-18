@@ -130,8 +130,11 @@ After a while the new release should show up at
 # Tarball
 
 Pushing the tag `X.Y.Z` runs .github/workflows/release-source.yml.  It
-runs `make -C pkg dist` and attaches `unit-X.Y.Z.tar.gz` and
-`unit-X.Y.Z.tar.gz.sha512` to the published GitHub release for the tag.
+runs `make -C pkg dist` and attaches `unit-X.Y.Z.tar.gz`,
+`unit-X.Y.Z.tar.gz.sha512` and `unit-X.Y.Z.tar.gz.sha256` to the
+published GitHub release for the tag.  Then it makes a build provenance
+attestation for the tarball.  build-deb.yml does the same for each
+`.deb` it attaches.
 If no release exists yet, the job creates a published release with a
 one-line body, and build-deb.yml adds its package section later.  The
 job fails if the version file at the tag does not name `X.Y.Z`, or if
@@ -144,6 +147,15 @@ To verify the published files:
     $ curl -fLO $base/unit-X.Y.Z.tar.gz.sha512
     $ sha512sum -c unit-X.Y.Z.tar.gz.sha512
 
+The checksums show that the file is intact, not where it came from.
+The attestation shows that this repository's release workflow built it,
+from which tag and commit.  To check it (GitHub CLI 2.49 or newer):
+
+    $ gh attestation verify unit-X.Y.Z.tar.gz --repo freeunitorg/freeunit
+
+The same command checks a `.deb` from the release.  Releases from
+before this change have no attestation, so the command fails for them.
+
 The tar stream is reproducible: the file times are the commit time.
 The .tar.gz is not always the same.  Since git 2.38, `git archive`
 compresses .tar.gz inside git with the zlib that git is linked to, and
@@ -153,10 +165,10 @@ Ubuntu runner.  A git linked to zlib-ng (Fedora, Arch), an older git, or
 a `tar.tar.gz.command` setting gives other bytes with the same content.
 
 The job never replaces a published file.  When the release already has
-`unit-X.Y.Z.tar.gz` or its `.sha512`, the job compares the sha512.  If
-it is equal, the job does not upload the file again.  If it differs, the
-job fails and prints both sums.  Packagers pin this checksum, so do not
-replace a published tarball.
+`unit-X.Y.Z.tar.gz` or one of its checksum files, the job compares the
+digest.  If it is equal, the job does not upload the file again.  If it
+differs, the job fails, prints both sums and makes no attestation.
+Packagers pin this checksum, so do not replace a published tarball.
 
 If the job failed, re-run it from the default branch: on the Actions tab
 pick "Release source tarball", "Run workflow", the default branch, and
@@ -169,12 +181,14 @@ them with the rebuilt ones:
 
     $ git checkout X.Y.Z
     $ make -C pkg dist
+    $ (cd pkg && sha256sum unit-X.Y.Z.tar.gz > unit-X.Y.Z.tar.gz.sha256)
     $ rm -rf old
     $ gh release download X.Y.Z -D old -p 'unit-X.Y.Z.tar.gz*'
     $ cmp old/unit-X.Y.Z.tar.gz pkg/unit-X.Y.Z.tar.gz
     $ cmp old/unit-X.Y.Z.tar.gz.sha512 pkg/unit-X.Y.Z.tar.gz.sha512
+    $ cmp old/unit-X.Y.Z.tar.gz.sha256 pkg/unit-X.Y.Z.tar.gz.sha256
 
-`gh release download` fails when the release has neither file, and
+`gh release download` fails when the release has none of the files, and
 `cmp` reports a missing file for each file that is not on the release.
 If `cmp` reports that a file differs, stop and upload nothing, as the
 job does.  Otherwise upload only the files that are missing.  Without
@@ -183,6 +197,16 @@ already on the release, so give each file its own command:
 
     $ gh release upload X.Y.Z pkg/unit-X.Y.Z.tar.gz
     $ gh release upload X.Y.Z pkg/unit-X.Y.Z.tar.gz.sha512
+    $ gh release upload X.Y.Z pkg/unit-X.Y.Z.tar.gz.sha256
+
+The attestation names the ref and commit of the run that made it, so
+the job attests only in a run on the tag itself.  A run from the default
+branch uploads the files but makes no attestation, and a hand upload
+makes none either.  To add it, run the workflow from the tag: on the
+Actions tab pick "Release source tarball", "Run workflow", choose the
+tag `X.Y.Z` under "Use workflow from" and enter the same tag.  That run
+uses the workflow file at the tag, finds the same files, uploads
+nothing, and attests the tarball.
 
 
 # Docs
