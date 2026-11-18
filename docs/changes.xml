@@ -57,6 +57,16 @@ bytes.
 
 <change type="feature">
 <para>
+the source tarball and the Debian packages attached to a release have a build
+provenance attestation, which names the workflow, the tag and the commit that
+built each file; "gh attestation verify FILE --repo freeunitorg/freeunit"
+checks it.  The source tarball also has a .sha256 checksum file next to its
+.sha512.
+</para>
+</change>
+
+<change type="feature">
+<para>
 PHP exposes the decoded, normalized request path, without the query, in
 $_SERVER['UNIT_REWRITTEN_PATH'] when it differs from the target's path in
 REQUEST_URI, or after a route "rewrite" action.  It is absent for a request

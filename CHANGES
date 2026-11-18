@@ -37,6 +37,12 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        mode does not accept matches bytes, and a notice is logged. PCRE 1
        and PCRE2 without Unicode support still match bytes.
 
+    *) Feature: the source tarball and the Debian packages attached to a
+       release have a build provenance attestation, which names the
+       workflow, the tag and the commit that built each file; "gh
+       attestation verify FILE --repo freeunitorg/freeunit" checks it. The
+       source tarball also has a .sha256 checksum file next to its .sha512.
+
     *) Feature: PHP exposes the decoded, normalized request path, without
        the query, in $_SERVER['UNIT_REWRITTEN_PATH'] when it differs from
        the target's path in REQUEST_URI, or after a route "rewrite" action.
