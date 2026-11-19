@@ -86,6 +86,27 @@ def test_static_fallback_nested():
     assert resp['body'] == '', 'fallback nested'
 
 
+def test_static_fallback_shares_many():
+    # Each share that has no file used one more nested call, so 50000 such
+    # shares overflowed the stack of the router thread.
+    shares = ['/blah'] * 50000
+
+    action_update({"share": shares})
+    assert client.get()['status'] == 404, 'many shares status'
+
+    action_update({"share": shares, "fallback": {"return": 200}})
+    assert client.get()['status'] == 200, 'many shares fallback status'
+
+
+def test_static_fallback_cycle():
+    # Each fallback used one more nested call.  The pass limit stops the
+    # cycle, but on musl the 128 KiB thread stack overflowed first.
+    action_update({"share": "/blah", "fallback": {"pass": "routes"}})
+
+    assert client.get()['status'] == 500, 'fallback cycle status'
+    assert client.get()['status'] == 500, 'fallback cycle status again'
+
+
 def test_static_fallback_share(temp_dir):
     action_update(
         {
