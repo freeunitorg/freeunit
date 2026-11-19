@@ -1,6 +1,15 @@
 
 Changes with FreeUnit 1.38.0                                     09 Nov 2026
 
+    *) Feature: the Docker images of the latest release are rebuilt without
+       a new FreeUnit release when a base image changes: every 6 hours for a
+       new runtime patch release, such as PHP 8.5.13, and once a week for OS
+       updates of the base. The Perl images are rebuilt once a week only,
+       because the Perl base images do not name their Perl release. The
+       images also get a tag with the runtime version, such as
+       "1.37.2-php-8.5.13". A rebuild uses the Dockerfiles of the release
+       tag.
+
     *) Security: update Wasmtime, wasmtime-wasi and wasmtime-wasi-http to
        48.0.9 for RUSTSEC-2026-0566 through RUSTSEC-2026-0573. Cranelift
        moves to 0.135.9 with Wasmtime. The contrib C API pin is 48.0.9 too.

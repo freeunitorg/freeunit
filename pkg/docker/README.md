@@ -331,11 +331,41 @@ build and smoke job has a read-only token; a separate publish job holds
 `push=true`, never on `pull_request` or a dispatch of another branch. These images
 are not for production.
 
-### Rebuilding individual variants without a new FreeUnit release
+### Rebuilding images when a base image changes
 
-When an upstream runtime base image (for example `php:8.5-cli-trixie` or
-`python:3.14-slim`) publishes a patch release or Debian security update, trigger
-`Release Docker Images` via `workflow_dispatch` with:
+`.github/workflows/docker-refresh.yml` does this without a new FreeUnit release.
+Every 6 hours it compares, for each variant in `pkg/eol.json`, the base image of
+the latest release (from `pkg/docker` at the release tag) with the labels of the
+published image `<version>-<variant>`
+(`.github/scripts/docker-refresh-plan.sh`):
+
+| Change | Rebuild |
+|--------|---------|
+| a new runtime patch release in the base (PHP 8.5.12 to 8.5.13) | at once |
+| no published image for the variant | at once |
+| a new base digest with the same runtime (an OS update) | the runs of the Monday schedule (UTC) |
+| a base runtime below its floor (`min_patch` in `pkg/eol.json`) | never; the run shows a warning |
+
+The plan reads the runtime release from the Env of the base image
+(`PHP_VERSION`, `RUBY_VERSION` and so on).  The Perl base images have no
+`PERL_VERSION`, so for the perl variants a new Perl release is only a new base
+digest: they are rebuilt with the weekly OS updates, not within 6 hours.
+
+The rebuild is a dispatch of `Release Docker Images` with the release tag and
+the list of variants.  It is skipped while that workflow is running; the next
+plan retries.  A manual dispatch of `Refresh Docker Images` has `dry_run` (on by
+default: only write the plan to the run summary) and `include_base` (also
+rebuild the OS-only changes now).
+
+`Release Docker Images` builds from `pkg/docker` of the release tag, so a
+rebuild keeps the build recipe of the release, and builds only the variants that
+are both in the current `pkg/eol.json` and in the tag.  The runtime floor check
+and the image checks come from the current branch.
+
+### Rebuilding individual variants by hand
+
+To rebuild without waiting for the plan, trigger `Release Docker Images` via
+`workflow_dispatch` with:
 
 - `tag`: the FreeUnit release tag to rebuild (e.g. `1.37.1`)
 - `variants` *(optional)*: comma-separated list of exact variant names or language
@@ -348,6 +378,10 @@ When an upstream runtime base image (for example `php:8.5-cli-trixie` or
   `latest-<lang><ver>` aliases on GHCR): overwritten on rebuild so deployments
   pinning `1.37.1-php-8.5` automatically receive patched upstream runtimes while
   keeping FreeUnit core pinned to `1.37.1`.
+- **Runtime version tag** (`<version>-<runtime>-<runtime version>[-slim]`, e.g.
+  `1.37.2-php-8.5.13` or `1.37.2-python-3.13.9-slim`): FreeUnit and the exact
+  runtime patch release.  A rebuild with the same runtime (an OS update of the
+  base) moves it.  `minimal`, `wasm` and the perl variants have none.
 - **Immutable build-date tag** (`<version>-<variant>-<YYYYMMDD>`, e.g.
   `1.37.1-php-8.5-20261028`): published alongside the floating tags so users who
   require an immutable tag reference can pin a specific rebuild date (or pin by

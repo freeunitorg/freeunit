@@ -5,6 +5,7 @@
 # Usage:
 #   verify-runtime-floor.sh IMAGE VARIANT [EOL_JSON]
 #   verify-runtime-floor.sh --check-eol [EOL_JSON]
+#   verify-runtime-floor.sh --check-version VARIANT VERSION [EOL_JSON]
 #   verify-runtime-floor.sh --self-test
 #
 # The floor is the "min_patch" field of the runtime version in pkg/eol.json:
@@ -24,8 +25,12 @@
 # "python-3.13-slim".
 #
 # --check-eol checks the file only: every "min_patch" is a release version
-# (digits and dots) of its own branch.  --self-test checks the parsing, the
-# comparison and the image check with a docker stub.  Neither needs docker.
+# (digits and dots) of its own branch.  --check-version checks a version
+# that the caller already has, for example from the Env of a base image,
+# and exits 1 when it is below the floor or not on the branch.  It prints
+# SKIP and exits 0 when the variant has no floor.  --self-test checks the
+# parsing, the comparison and the image check with a docker stub.  None of
+# the three needs docker.
 
 set -eu
 
@@ -35,6 +40,7 @@ default_eol="$here/../eol.json"
 usage() {
 	echo "usage: $0 IMAGE VARIANT [EOL_JSON]" >&2
 	echo "       $0 --check-eol [EOL_JSON]" >&2
+	echo "       $0 --check-version VARIANT VERSION [EOL_JSON]" >&2
 	echo "       $0 --self-test" >&2
 	exit 2
 }
@@ -157,6 +163,26 @@ compare() {
 		echo "FAIL runtime floor: $1 ships $runtime $2, below the floor $3; rebuild on a base with $runtime $3 or later"
 		return 1
 	fi
+}
+
+# check_version VARIANT VERSION EOL_JSON: the verdict on a version that the
+# caller read itself.  A variant that pkg/eol.json does not have fails, as
+# in check_image.
+check_version() {
+	lookup "$3" "$1"
+
+	case "$min" in
+	'')
+		echo "FAIL runtime floor: $1 is not a variant in pkg/eol.json"
+		return 1
+		;;
+	image|none)
+		echo "SKIP runtime floor: $1 has no min_patch in pkg/eol.json"
+		return 0
+		;;
+	esac
+
+	compare "$1" "$2" "$min"
 }
 
 # check_image IMAGE VARIANT EOL_JSON: prints the verdict, returns 1 when the
@@ -402,6 +428,23 @@ EOF
 	t "image misspelt"   "$(img ruby3.4 3.4.13)" "1 FAIL"
 	t "image not listed" "$(img wasm '')" "1 FAIL"
 
+	# ver VARIANT VERSION: as img, for check_version.
+	ver() {
+		if res=$(check_version "$1" "$2" "$dir/eol.json"); then
+			rc=0
+		else
+			rc=1
+		fi
+		printf '%s %s\n' "$rc" \
+			"$(printf '%s\n' "$res" | cut -d ' ' -f 1 | paste -s -d ' ' -)"
+	}
+
+	t "version equal"    "$(ver ruby-3.4 3.4.13)" "0 PASS"
+	t "version below"    "$(ver ruby-3.4 3.4.12)" "1 FAIL"
+	t "version branch"   "$(ver ruby-3.4 4.0.10)" "1 FAIL"
+	t "version no floor" "$(ver ruby-4.0 4.0.1)" "0 SKIP"
+	t "version unknown"  "$(ver ruby3.4 3.4.13)" "1 FAIL"
+
 	if [ "$fail" -ne 0 ]; then
 		exit 1
 	fi
@@ -410,6 +453,13 @@ EOF
 }
 
 case "${1:-}" in
+--check-version)
+	[ $# -ge 3 ] && [ $# -le 4 ] || usage
+	if check_version "$2" "$3" "${4:-$default_eol}"; then
+		exit 0
+	fi
+	exit 1
+	;;
 --self-test)
 	[ $# -eq 1 ] || usage
 	self_test
