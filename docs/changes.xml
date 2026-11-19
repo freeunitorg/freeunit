@@ -10,6 +10,14 @@
          date="2026-11-09" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="security">
+<para>
+update Wasmtime, wasmtime-wasi and wasmtime-wasi-http to 48.0.9 for
+RUSTSEC-2026-0566 through RUSTSEC-2026-0573.  Cranelift moves to 0.135.9 with
+Wasmtime.  The contrib C API pin is 48.0.9 too.
+</para>
+</change>
+
 <change type="change">
 <para>
 a request target that contains an unencoded space, a control character such
