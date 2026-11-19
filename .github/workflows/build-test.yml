@@ -14,6 +14,7 @@ on:
       - '.github/scripts/check-test-hooks.sh'
       - '.github/scripts/test-matrix.sh'
       - 'pkg/docker/verify-runtime-floor.sh'
+      - '.github/scripts/docker-refresh-plan.sh'
   push:
     branches: master
     paths:
@@ -28,6 +29,7 @@ on:
       - '.github/scripts/check-test-hooks.sh'
       - '.github/scripts/test-matrix.sh'
       - 'pkg/docker/verify-runtime-floor.sh'
+      - '.github/scripts/docker-refresh-plan.sh'
   # The weekly run tests every Python version.  A pull request and a master
   # push test the oldest and the newest one; see .github/scripts/test-matrix.sh.
   # The path filters above do not apply to this event.
@@ -118,6 +120,7 @@ jobs:
         run: |
           pkg/docker/verify-runtime-floor.sh --self-test
           pkg/docker/verify-runtime-floor.sh --check-eol
+          .github/scripts/docker-refresh-plan.sh --self-test
 
       - name: Derive build list from pkg/eol.json
         id: list

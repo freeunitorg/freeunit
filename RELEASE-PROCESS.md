@@ -68,7 +68,10 @@ release-docker.yml pushes each image by digest, without a tag, and runs
 pkg/docker/verify-runtime-floor.sh in it.  An image below its floor gets no
 tag, and its variant is not published.  The base tag must carry the fixed release before the images can be
 published; until then the release publishes the other variants and leaves
-the previous image of that variant in place.  To check one image by hand:
+the previous image of that variant in place.  Between releases,
+.github/workflows/docker-refresh.yml rebuilds the images of the latest
+release when a base image gets a new runtime patch release, and once a
+week for OS updates; see pkg/docker/README.md.  To check one image by hand:
 
     $ pkg/docker/verify-runtime-floor.sh ruby:3.4-trixie ruby-3.4
     PASS runtime floor: ruby-3.4 ships ruby 3.4.13, at least 3.4.13

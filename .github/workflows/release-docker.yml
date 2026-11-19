@@ -125,6 +125,21 @@ jobs:
             end
           ] | flatten' pkg/eol.json)
 
+          # The images are built from the Dockerfiles of the release tag
+          # (see the build job), so a variant that the tag has no
+          # Dockerfile for is left out: a rebuild of an older release does
+          # not get the variants added since.  A variant that pkg/eol.json
+          # dropped is not built either, even when the tag still has it.
+          at_tag=$(git ls-tree --name-only "refs/tags/${VERSION}" pkg/docker/ \
+            | sed -n 's|^pkg/docker/Dockerfile\.||p' | jq -R . | jq -cs .)
+          skipped=$(jq -cn --argjson all "${all_variants}" --argjson tag "${at_tag}" \
+            '$all - $tag')
+          if [ "${skipped}" != "[]" ]; then
+            echo "::notice::not in ${VERSION}, not built: ${skipped}"
+          fi
+          all_variants=$(jq -cn --argjson all "${all_variants}" --argjson tag "${at_tag}" \
+            '[ $all[] | select(IN($tag[])) ]')
+
           if [ -n "${INPUT_VARIANTS}" ]; then
             variants=$(jq -cn \
               --argjson all "${all_variants}" \
@@ -226,13 +241,31 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # The workflow and its checks come from the checkout, but the image
+      # is built from pkg/docker of the release tag.  A rebuild of an older
+      # release then keeps the build recipe it was released with, and a
+      # change of the Dockerfiles on master cannot break it.
+      - name: Use the Docker build files of the release
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          git fetch --depth=1 origin "refs/tags/${VERSION}:refs/tags/${VERSION}"
+          # Not "git archive": .gitattributes marks pkg/** export-ignore.
+          # A separate index leaves the checkout alone and keeps the file
+          # modes (docker-entrypoint.sh is executable).
+          idx="${RUNNER_TEMP}/release-index"
+          rm -rf .release-src "${idx}"
+          GIT_INDEX_FILE="${idx}" git read-tree "refs/tags/${VERSION}"
+          GIT_INDEX_FILE="${idx}" git ls-files -z pkg/docker \
+            | GIT_INDEX_FILE="${idx}" git checkout-index -z --stdin --prefix=.release-src/
+
       - name: Resolve base image and runtime metadata
         id: base
         env:
           VARIANT: ${{ matrix.variant }}
           PLATFORM: ${{ matrix.arch.platform }}
         run: |
-          base_ref=$(awk '/^FROM /{print $2; exit}' "pkg/docker/Dockerfile.${VARIANT}")
+          base_ref=$(awk '/^FROM /{print $2; exit}' ".release-src/pkg/docker/Dockerfile.${VARIANT}")
           case "${base_ref}" in
             */*) base_name="docker.io/${base_ref}" ;;
             *)   base_name="docker.io/library/${base_ref}" ;;
@@ -264,8 +297,8 @@ jobs:
         id: build
         uses: docker/build-push-action@v7
         with:
-          context: pkg/docker
-          file: pkg/docker/Dockerfile.${{ matrix.variant }}
+          context: .release-src/pkg/docker
+          file: .release-src/pkg/docker/Dockerfile.${{ matrix.variant }}
           platforms: ${{ matrix.arch.platform }}
           pull: true
           provenance: mode=max
@@ -481,6 +514,30 @@ jobs:
             EXTRA_ANNOTATIONS+=(--annotation "index:org.freeunit.runtime.version=${RUNTIME_VER}")
           fi
 
+          # <version>-<runtime>-<runtime version>[-slim], for example
+          # 1.37.2-php-8.5.13: FreeUnit and the exact runtime patch release.
+          # A later rebuild with the same runtime (an OS update of the base)
+          # moves it; the build-date tag is the one that never moves.
+          # Both architectures must carry the same runtime release: the
+          # floating base tag can move between the two builds.
+          RUNTIME_TAG=
+          raw_arm=$(docker buildx imagetools inspect --raw "${GHCR_REPO}@${DIGEST_ARM64}")
+          RUNTIME_VER_ARM=$(jq -r '(.annotations["org.freeunit.runtime.version"] // .manifests[0].annotations["org.freeunit.runtime.version"]) // empty' <<< "${raw_arm}")
+          rt_ver=$(printf '%s\n' "${RUNTIME_VER}" | sed 's/^[^0-9]*//; s/[+_ ].*//')
+          rt_ver_arm=$(printf '%s\n' "${RUNTIME_VER_ARM}" | sed 's/^[^0-9]*//; s/[+_ ].*//')
+          if [ "${rt_ver}" != "${rt_ver_arm}" ]; then
+            echo "::warning::${VARIANT}: amd64 has runtime '${rt_ver}', arm64 '${rt_ver_arm}'; no runtime version tag"
+            rt_ver=
+          fi
+          rt=${VARIANT%%-*}
+          branch=${VARIANT#*-}
+          branch=${branch%-slim}
+          slim=
+          case "${VARIANT}" in *-slim) slim=-slim ;; esac
+          if [ "${rt}" != "${VARIANT}" ] && [ "${rt_ver#"${branch}".}" != "${rt_ver}" ]; then
+            RUNTIME_TAG="${VERSION}-${rt}-${rt_ver}${slim}"
+          fi
+
           # Per-arch images live in both registries; build a manifest in each.
           for REPO in \
             "${GHCR_REPO}" \
@@ -489,6 +546,9 @@ jobs:
             EXTRA_TAGS=()
             if [ "${REPO}" = "${GHCR_REPO}" ] && [ -n "${LEGACY}" ]; then
               EXTRA_TAGS=(--tag "${REPO}:${LEGACY}")
+            fi
+            if [ -n "${RUNTIME_TAG}" ]; then
+              EXTRA_TAGS+=(--tag "${REPO}:${RUNTIME_TAG}")
             fi
             docker buildx imagetools create \
               --tag "${REPO}:${VERSION}-${VARIANT}" \

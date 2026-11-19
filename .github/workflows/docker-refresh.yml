@@ -1,0 +1,174 @@
+# Rebuild the Docker images of the latest FreeUnit release when their base
+# images change, without a new FreeUnit release.
+#
+# Every 6 hours the plan job compares, for each variant in pkg/eol.json, the
+# base image now (for example php:8.5-cli-trixie) with the labels of the
+# published image <version>-<variant>
+# (.github/scripts/docker-refresh-plan.sh):
+#
+#   runtime  the runtime of the base has a new patch release (PHP 8.5.12 to
+#            8.5.13): rebuilt at once.  The Perl base images do not name
+#            their Perl release, so a new Perl release is a "base" change.
+#   base     only the base digest changed (an OS update): rebuilt by the
+#            runs of the Monday schedule (UTC), so OS updates are batched
+#            weekly.
+#   missing  no published image of the variant: rebuilt at once.
+#   blocked  the runtime of the base is below its floor (min_patch in
+#            pkg/eol.json): not rebuilt, the run shows a warning.
+#
+# The rebuild is a workflow_dispatch of release-docker.yml with the tag of
+# the latest release and the list of variants.  That workflow builds from
+# pkg/docker of the tag, checks every image against its runtime floor, and
+# publishes each variant on its own.
+#
+# A dispatch with dry_run=true only writes the plan to the run summary.
+# A dispatch with include_base=true also rebuilds the "base" variants now.
+
+name: Refresh Docker Images
+
+on:
+  # The same four slots a day, in two entries.  The runs of the Monday
+  # entry also rebuild the "base" variants.  The plan reads the entry of
+  # the run (github.event.schedule), not the clock: scheduled runs start
+  # hours late, and a Monday 18:41 run that starts on Tuesday must still
+  # count as a Monday run.
+  schedule:
+    - cron: '41 */6 * * 0,2-6'
+    - cron: '41 */6 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only write the plan; do not start a rebuild'
+        type: boolean
+        default: true
+      include_base:
+        description: 'Also rebuild the variants whose base changed without a new runtime'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Two plans at the same time would start the same rebuild twice.
+concurrency:
+  group: docker-refresh
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: write   # gh workflow run release-docker.yml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Check the plan rules
+        run: |
+          .github/scripts/docker-refresh-plan.sh --self-test
+          pkg/docker/verify-runtime-floor.sh --self-test
+
+      - name: Find the latest release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The highest X.Y.Z of the published releases.  "releases/latest"
+          # is not used: the unitctl/X.Y.Z release of the same tag push is
+          # published a few minutes later and can take the "latest" mark.
+          tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=50" \
+            --jq '.[] | select(.draft | not) | select(.prerelease | not) | .tag_name' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          if [ -z "${tag}" ]; then
+            echo "::error::no published X.Y.Z release"
+            exit 1
+          fi
+          git fetch --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}"
+          # Not "git archive": .gitattributes marks pkg/** export-ignore.
+          idx="${RUNNER_TEMP}/release-index"
+          rm -rf "${RUNNER_TEMP}/release-src" "${idx}"
+          GIT_INDEX_FILE="${idx}" git read-tree "refs/tags/${tag}"
+          GIT_INDEX_FILE="${idx}" git ls-files -z pkg/docker \
+            | GIT_INDEX_FILE="${idx}" git checkout-index -z --stdin \
+                --prefix="${RUNNER_TEMP}/release-src/"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Latest release: ${tag}"
+
+      - name: Plan
+        id: plan
+        env:
+          VERSION: ${{ steps.release.outputs.tag }}
+          REPO: docker.io/freeunitorg/freeunit
+          INCLUDE_BASE: ${{ inputs.include_base && '1' || '0' }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          # OS-only updates are rebuilt by the four runs of the Monday
+          # entry (00:41, 06:41, 12:41 and 18:41 UTC, whenever they start).
+          # Each of them may start them, so a run that finds Release Docker
+          # Images busy leaves them to the next one.  Once they are rebuilt,
+          # their base digest matches and the plan has none.
+          if [ "${GITHUB_EVENT_NAME}" = schedule ]; then
+            case "${SCHEDULE}" in
+              '41 */6 * * 1') INCLUDE_BASE=1 ;;
+              '41 */6 * * 0,2-6') ;;
+              *)
+                echo "::error::unknown schedule '${SCHEDULE}'; update the Monday gate"
+                exit 1
+                ;;
+            esac
+          fi
+          export INCLUDE_BASE
+          echo "include_base=${INCLUDE_BASE}" | tee -a "$GITHUB_OUTPUT"
+          .github/scripts/docker-refresh-plan.sh "${VERSION}" "${RUNNER_TEMP}/release-src/pkg/docker"
+
+      - name: Start the rebuild
+        if: steps.plan.outputs.rebuild != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.tag }}
+          VARIANTS: ${{ steps.plan.outputs.rebuild }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          INCLUDE_BASE: ${{ steps.plan.outputs.include_base }}
+        run: |
+          if [ "${DRY_RUN}" = true ]; then
+            echo "Dry run: would rebuild ${VARIANTS} of ${VERSION}" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # A release or a rebuild that is still running builds from the
+          # same bases; the next plan sees what it published.
+          busy=$(gh run list --workflow release-docker.yml --limit 20 \
+            --json status --jq '[.[] | select(.status != "completed")] | length')
+          if [ "${busy}" -gt 0 ]; then
+            echo "Release Docker Images is running; the next plan retries" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            # A skip of the 18:41 run of the Monday entry leaves the OS
+            # updates to the next week, so the skip is a warning.
+            if [ "${INCLUDE_BASE}" = 1 ]; then
+              echo "::warning::OS-only rebuilds skipped; the next run of the Monday schedule retries them (next week after the 18:41 run)"
+            fi
+            exit 0
+          fi
+
+          gh workflow run release-docker.yml --ref "${GITHUB_REF_NAME}" \
+            -f tag="${VERSION}" -f variants="${VARIANTS}"
+          echo "Started Release Docker Images for ${VERSION}: ${VARIANTS}" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # A variant that could not be read is neither rebuilt nor reported as
+      # current; the red run makes the registry or network error visible.
+      - name: Fail on unread images
+        if: steps.plan.outputs.errors != ''
+        env:
+          ERRORS: ${{ steps.plan.outputs.errors }}
+        run: |
+          echo "::error::could not read the images of: ${ERRORS}"
+          exit 1

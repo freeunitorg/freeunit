@@ -10,6 +10,17 @@
          date="2026-11-09" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
+<change type="feature">
+<para>
+the Docker images of the latest release are rebuilt without a new FreeUnit
+release when a base image changes: every 6 hours for a new runtime patch
+release, such as PHP 8.5.13, and once a week for OS updates of the base.  The
+Perl images are rebuilt once a week only, because the Perl base images do not
+name their Perl release.  The images also get a tag with the runtime version,
+such as "1.37.2-php-8.5.13".  A rebuild uses the Dockerfiles of the release tag.
+</para>
+</change>
+
 <change type="security">
 <para>
 update Wasmtime, wasmtime-wasi and wasmtime-wasi-http to 48.0.9 for
