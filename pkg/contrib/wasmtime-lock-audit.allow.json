@@ -111,7 +111,7 @@
       "id": "RUSTSEC-2026-0542",
       "package": "humantime",
       "version": "2.1.0",
-      "reason": "Linked by the Wasmtime 48.0.9 C API through env_logger 0.11.5: the c-api 'logging' feature is on by default (crates/c-api/cmake/features.cmake), and wasm_engine_new() calls env_logger::try_init() (crates/c-api/src/engine.rs). env_logger uses humantime only to format RFC 3339 log timestamps (format_rfc3339_*, vendor/env_logger/src/fmt/humantime.rs), and logs only when WASMTIME_LOG is set. RUSTSEC-2026-0542 is informational (unmaintained, no patched version), not a vulnerability. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck at the next pin bump."
+      "reason": "Linked by the Wasmtime 48.0.9 C API through env_logger 0.11.5: the c-api 'logging' feature is on by default (crates/c-api/cmake/features.cmake), and wasm_engine_new() calls env_logger::try_init() (crates/c-api/src/engine.rs). env_logger uses humantime only to format RFC 3339 log timestamps (format_rfc3339_*, vendor/env_logger/src/fmt/humantime.rs). env_logger reads RUST_LOG, not WASMTIME_LOG; with RUST_LOG unset it still writes records of level error. RUSTSEC-2026-0542 is informational (unmaintained, no patched version), not a vulnerability. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck at the next pin bump."
     }
   ]
 }
