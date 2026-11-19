@@ -282,6 +282,16 @@ nxt_http_conn_init(nxt_task_t *task, void *obj, void *data)
      */
     if (skcf->proxy_protocol != NXT_PROXY_PROTOCOL_OFF) {
         c->read_state = &nxt_h1p_proxy_protocol_state;
+
+        /*
+         * The trusted list is checked in the read handler.  It runs at
+         * once, not on the first byte, so that a silent untrusted peer is
+         * dropped now and not by the header timeout.  For a trusted peer
+         * the peek returns EAGAIN and the read waits as usual.
+         */
+        if (skcf->proxy_trusted != NULL) {
+            c->socket.read_ready = 1;
+        }
     }
 
     nxt_conn_read(engine, c);
@@ -478,6 +488,12 @@ nxt_http_conn_tls_conf_release(nxt_task_t *task, void *obj, void *data)
  * timer is not reset by a partial header.
  */
 
+static nxt_log_moderation_t  nxt_h1p_proxy_untrusted_log_moderation = {
+    NXT_LOG_INFO, 10, "PROXY protocol: untrusted peers were dropped",
+    NXT_LOG_MODERATION
+};
+
+
 static const nxt_conn_state_t  nxt_h1p_proxy_protocol_state
     nxt_aligned(64) =
 {
@@ -517,6 +533,34 @@ nxt_h1p_proxy_protocol_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
         }
 
         c->read_state = &nxt_h1p_idle_close_state;
+        return 0;
+    }
+
+    /*
+     * The trusted list is checked on the real peer address, before any
+     * byte of the header is read.  c->remote is still the accepted peer
+     * here: the announced address replaces it only after the header is
+     * parsed.  The connection is closed whether or not the peer sends a
+     * header, and the log line has no byte of the header.
+     */
+    if (joint->socket_conf->proxy_trusted != NULL
+        && !nxt_http_route_addr_rule(NULL, joint->socket_conf->proxy_trusted,
+                                     c->remote))
+    {
+        /*
+         * Any peer that can connect adds this line, so it is moderated:
+         * a flood of untrusted connections cannot flood the log.
+         */
+        nxt_log_moderate(&nxt_h1p_proxy_untrusted_log_moderation,
+                         NXT_LOG_INFO, task->log, "PROXY protocol: the peer "
+                         "%*s is not in \"trusted\", the connection is "
+                         "dropped", (size_t) c->remote->length,
+                         nxt_sockaddr_start(c->remote));
+
+        /*
+         * Nothing is read.  A result of 0 is handled as EOF: the close
+         * handler of this state frees c->read, if any, and closes.
+         */
         return 0;
     }
 
