@@ -353,8 +353,9 @@ When an upstream runtime base image (for example `php:8.5-cli-trixie` or
   require an immutable tag reference can pin a specific rebuild date (or pin by
   `@sha256:<digest>`).
 - **Temporary per-arch tags** (`<version>-<variant>-amd64`,
-  `<version>-<variant>-arm64`): merged into the multi-arch index and deleted in the
-  `cleanup` job.
+  `<version>-<variant>-arm64`): set only after the image passes its checks (the
+  build pushes it by digest, without a tag), merged into the multi-arch index and
+  deleted in the `cleanup` job.
 - **OCI annotations and labels**:
   - `org.opencontainers.image.version` — FreeUnit core release version (`1.37.1`)
   - `org.opencontainers.image.revision` — exact git commit SHA of the FreeUnit tag

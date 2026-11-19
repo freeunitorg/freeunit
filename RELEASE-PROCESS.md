@@ -49,6 +49,34 @@ previous line EOL, or `✅ LTS` if it becomes a long-term line; one row
 says Active.  A patch release of a line that is already Active or LTS
 needs no change.
 
+## Runtime security floors
+
+The Docker images carry third-party runtimes from floating base tags, such
+as `ruby:3.4-trixie` and `eclipse-temurin:21-jdk-resolute`.  Before the
+tag, read the security announcements of the runtimes that have images:
+
+- Ruby: https://www.ruby-lang.org/en/security/
+- Java: the Oracle Critical Patch Updates, and the Eclipse Temurin
+  (Adoptium) release notes, because the Java images use Temurin.
+- PHP: pkg/community/PHP.CVE.md lists the PHP floors; they are checked by
+  pkg/docker/verify-php-cve.sh.
+- Python, Node.js, Perl and Go: their security release announcements.
+
+When a runtime has a security release, set `min_patch` of that version in
+pkg/eol.json to the first patch release that has the fix.
+release-docker.yml pushes each image by digest, without a tag, and runs
+pkg/docker/verify-runtime-floor.sh in it.  An image below its floor gets no
+tag, and its variant is not published.  The base tag must carry the fixed release before the images can be
+published; until then the release publishes the other variants and leaves
+the previous image of that variant in place.  To check one image by hand:
+
+    $ pkg/docker/verify-runtime-floor.sh ruby:3.4-trixie ruby-3.4
+    PASS runtime floor: ruby-3.4 ships ruby 3.4.13, at least 3.4.13
+
+A version that has no fixed release on its branch cannot pass a floor.
+Remove it from pkg/eol.json, as for an end of life, and say so in
+docs/changes.xml.
+
 ## changes.xml
 
 Create a commit that updates the docs/changes.xml for this release.
