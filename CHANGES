@@ -40,6 +40,20 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        mode does not accept matches bytes, and a notice is logged. PCRE 1
        and PCRE2 without Unicode support still match bytes.
 
+    *) Bugfix: with a thread-safe (ZTS) PHP, the working directory of a
+       script followed a replaced symlink only after "realpath_cache_ttl"
+       seconds, 120 by default: a deploy that renamed a new symlink over the
+       old one kept the requests in the old directory. The directory is now
+       resolved on every request, as with a non-thread-safe PHP.
+
+    *) Feature: Docker images for PHP 8.6: "php-8.6" with the
+       non-thread-safe build (NTS), like the images of PHP 8.3 to 8.5, and
+       "php-8.6-zts" with the thread-safe build (ZTS). The official PHP
+       images are ZTS only from PHP 8.6, so the NTS base is built from the
+       official recipe without the ZTS options and published as
+       ghcr.io/freeunitorg/php-nts. The image check and the tests fail when
+       an image or a test leg has the other build.
+
     *) Feature: the source tarball and the Debian packages attached to a
        release have a build provenance attestation, which names the
        workflow, the tag and the commit that built each file; "gh

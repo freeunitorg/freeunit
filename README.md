@@ -53,6 +53,8 @@ and are available for `linux/amd64` and `linux/arm64`.
 | Variant | Image |
 |---------|-------|
 | minimal | `ghcr.io/freeunitorg/freeunit:latest-minimal` |
+| PHP 8.6 | `ghcr.io/freeunitorg/freeunit:latest-php-8.6` |
+| PHP 8.6, thread-safe (ZTS) | `ghcr.io/freeunitorg/freeunit:latest-php-8.6-zts` |
 | PHP 8.5 | `ghcr.io/freeunitorg/freeunit:latest-php-8.5` |
 | PHP 8.4 | `ghcr.io/freeunitorg/freeunit:latest-php-8.4` |
 | PHP 8.3 | `ghcr.io/freeunitorg/freeunit:latest-php-8.3` |

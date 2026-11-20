@@ -450,6 +450,13 @@ jobs:
             IFS='-' read -r module version <<< "${{ matrix.build }}"
           fi
 
+          # A "-zts" suffix (php-8.6-zts) selects the thread-safe build of
+          # the version; see .github/scripts/test-matrix.sh.
+          variant=
+          case "${version}" in
+          *-zts) variant=zts; version=${version%-zts} ;;
+          esac
+
           # test_app_lifecycle.py is runtime-agnostic: it is parametrized over
           # every runtime and self-skips the ones this leg did not build, so
           # each language leg must be told about it explicitly -- the
@@ -624,6 +631,7 @@ jobs:
 
           echo "module=${module}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "variant=${variant}" >> "$GITHUB_OUTPUT"
           echo "testpath=${testpath}" >> "$GITHUB_OUTPUT"
 
           NJS_VERSION=$(sed -n "s/NJS_VERSION := \(.*\)/\1/p" pkg/contrib/src/njs/version)
@@ -814,12 +822,40 @@ jobs:
       ## PHP
       ##
 
+      # A php-<version>-zts leg tests the thread-safe build, every other PHP
+      # leg the non-thread-safe one, as the Docker images ship them: php-8.6
+      # is NTS, php-8.6-zts is ZTS ("zts_variant" in pkg/eol.json).
+      - name: Select the php thread safety
+        id: phpts
+        run: |
+          if [ "${{ steps.metadata.outputs.variant }}" = zts ]; then
+            echo "phpts=ts" >> "$GITHUB_OUTPUT"
+          else
+            echo "phpts=nts" >> "$GITHUB_OUTPUT"
+          fi
+        if: steps.metadata.outputs.module == 'php'
+
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '${{ steps.metadata.outputs.version }}'
           extensions: none
         env:
           update: true
+          phpts: ${{ steps.phpts.outputs.phpts }}
+        if: steps.metadata.outputs.module == 'php'
+
+      # The module works only with the libphp it was built with, so a
+      # test leg that got the other kind of PHP would test the wrong build.
+      - name: Check the php thread safety
+        env:
+          WANT: ${{ steps.phpts.outputs.phpts }}
+        run: |
+          have=$(php -r 'echo PHP_ZTS ? "ts" : "nts";')
+          php -i | grep 'Thread Safety'
+          if [ "${have}" != "${WANT}" ]; then
+            echo "::error::php ${{ steps.metadata.outputs.version }} is ${have}, the ${{ matrix.build }} leg needs ${WANT}"
+            exit 1
+          fi
         if: steps.metadata.outputs.module == 'php'
 
       # Informational.  A package built --with-system-tzdata reports

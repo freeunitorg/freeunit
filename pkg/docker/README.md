@@ -28,7 +28,8 @@ docker run --rm --entrypoint sh ghcr.io/freeunitorg/freeunit:latest-php-8.5 \
 ```
 
 The target `make -C pkg/docker verify IMAGE=<tag>` checks a built image. It runs
-the script `verify-php-cve.sh`. The script reads the PHP version, the ini
+the script `verify-php-cve.sh`. The script reads the PHP version, the PHP
+thread safety, the libraries of the PHP module, the ini
 setting `session.upload_progress.enabled`, the `libbrotli1` version and the
 daemon version. The target expects the daemon version of the `version` file.
 Pass `VERSION=<version>` to check another version. The release workflow runs
@@ -39,6 +40,57 @@ tags are not created.
 ```bash
 make -C pkg/docker verify IMAGE=ghcr.io/freeunitorg/freeunit:latest-php-8.5
 ```
+
+## PHP thread safety (ZTS and NTS)
+
+From PHP 8.6 the official `php:<version>-cli-trixie` images have only the
+thread-safe build (ZTS). FreeUnit keeps the non-thread-safe build (NTS) as the
+default, as for PHP 8.3, 8.4 and 8.5, and offers ZTS as a separate image that
+you choose explicitly:
+
+| Image | PHP build | Base image |
+|-------|-----------|------------|
+| `php-8.3`, `php-8.4`, `php-8.5` | NTS | `php:<version>-cli-trixie` |
+| `php-8.6` | NTS | `ghcr.io/freeunitorg/php-nts:8.6-cli-trixie` |
+| `php-8.6-zts` | ZTS | `php:8.6-cli-trixie` |
+
+The NTS base of PHP 8.6 is the docker-library recipe of the official image
+with the two ZTS options removed (`pkg/docker/php-nts/`). It has the same
+extensions and the same `docker-php-ext-install`, `docker-php-ext-enable` and
+`pecl` workflow. The workflow `php-nts-base.yml` builds it for amd64 and
+arm64, checks that it is NTS, has the embed SAPI and builds an extension, and
+rebuilds it every week for Debian updates. A new PHP patch release is a new
+recipe from `pkg/docker/php-nts/generate.sh`.
+
+Choose `php-8.6-zts` only when you need ZTS, for example for an extension
+that requires it. ZTS costs some throughput: in a local test of PHP 8.6.0 in
+FreeUnit, a request that includes many files was 7 to 11% slower with ZTS.
+
+What this means for an application:
+
+- The configuration does not change. An application selects PHP by version:
+  `"type": "php 8.6"`, or `"type": "php"` for the newest module.
+- An extension must be built for the same PHP build. In an image made
+  `FROM` a FreeUnit PHP image, `docker-php-ext-install` and `pecl install`
+  do this. An NTS extension binary does not load in the `php-8.6-zts`
+  image, and a ZTS one does not load in `php-8.6`.
+- The FreeUnit PHP module works only with the `libphp` that it was built
+  with. A ZTS `libphp` and an NTS one have different ABIs. Do not replace
+  `libphp.so` in an image.
+
+To see the build of an image:
+
+```bash
+docker run --rm --entrypoint php ghcr.io/freeunitorg/freeunit:latest-php-8.6 \
+    -i | grep 'Thread Safety'
+# Expected: Thread Safety => disabled  (php-8.6-zts: enabled)
+```
+
+`"zts_variant": true` in `pkg/eol.json` adds the `-zts` image of a version,
+and `"nts_base"` names the NTS base of the plain image. The script
+`verify-php-cve.sh` fails a `php-<version>` image that is not NTS and a
+`php-<version>-zts` image that is not ZTS. The test workflow has a
+`php-<version>-zts` leg that tests the module with the ZTS build.
 
 ## Security: CVE-2026-31431 (AF_ALG privilege escalation)
 
@@ -239,6 +291,8 @@ A summary (OK / FAILED) is printed at the end.
 | `php-8.3` | php:8.3-cli |
 | `php-8.4` | php:8.4-cli |
 | `php-8.5` | php:8.5-cli-trixie |
+| `php-8.6` | ghcr.io/freeunitorg/php-nts:8.6-cli-trixie (NTS) |
+| `php-8.6-zts` | php:8.6-cli-trixie (thread-safe, ZTS) |
 | `python-3.12` | python:3.12 |
 | `python-3.12-slim` | python:3.12-slim |
 | `python-3.13` | python:3.13 |
