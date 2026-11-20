@@ -251,9 +251,19 @@ WebAssembly component module.  unitctl reaches the affected functions
 through the xattr crate.
 </para>
 <para>
-The vendored Wasmtime 48.0.8 C API source lock keeps rustix 1.1.4.  This
+The vendored Wasmtime 48.0.10 C API source lock keeps rustix 1.1.4.  This
 exact version has a documented audit exception; the C API does not reach
 the affected functions.
+</para>
+</change>
+
+<change type="security">
+<para>
+update Wasmtime, wasmtime-wasi and wasmtime-wasi-http from 48.0.8 to 48.0.10.
+48.0.9 fixes RUSTSEC-2026-0566 through RUSTSEC-2026-0573.  48.0.10 fixes
+RUSTSEC-2026-0587 (GHSA-f2pq-268w-886c), a WASI filesystem sandbox escape
+that affects Windows hosts only.  Cranelift moves to 0.135.10 with Wasmtime.
+The contrib C API pin is 48.0.10 too.
 </para>
 </change>
 
