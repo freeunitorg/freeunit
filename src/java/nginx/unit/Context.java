@@ -926,6 +926,90 @@ public class Context implements ServletContext, InitParams
         return servlet;
     }
 
+    /*
+        Returns the path that the container maps.  The path is decoded
+        once.  The "." and ".." segments are removed and repeated slashes
+        are merged.  The request URI as the client sent it does not change.
+
+        The path is decoded before it is split, so an encoded slash
+        ("%2F") separates segments as a "/" does.
+
+        Returns null if the target does not start with a slash, if
+        java.net.URI refuses it, or if the path climbs above the root or
+        contains a NUL character.
+     */
+    private static String resolvePath(String target)
+    {
+        if (!target.startsWith("/")) {
+            return null;
+        }
+
+        /*
+            The authority is given, so that a target that starts with "//"
+            is not parsed as an authority.
+         */
+        String path;
+
+        try {
+            path = new URI("http://localhost" + target).getPath();
+
+        } catch (URISyntaxException e) {
+            return null;
+        }
+
+        if (path.indexOf('\0') != -1) {
+            return null;
+        }
+
+        List<String> segments = new ArrayList<>();
+        boolean dir = false;
+
+        for (String s : path.split("/", -1)) {
+            if (s.isEmpty() || s.equals(".")) {
+                dir = true;
+                continue;
+            }
+
+            if (s.equals("..")) {
+                if (segments.isEmpty()) {
+                    return null;
+                }
+
+                segments.remove(segments.size() - 1);
+                dir = true;
+                continue;
+            }
+
+            segments.add(s);
+            dir = false;
+        }
+
+        if (segments.isEmpty()) {
+            return "/";
+        }
+
+        String res = "/" + String.join("/", segments);
+
+        return dir ? res + "/" : res;
+    }
+
+    /*
+        Returns true if the first segment of the path is WEB-INF or
+        META-INF.  The letter case is ignored.
+     */
+    private static boolean isProtectedPath(String path)
+    {
+        if (!path.startsWith("/")) {
+            return false;
+        }
+
+        int end = path.indexOf('/', 1);
+        String first = (end == -1) ? path.substring(1) : path.substring(1, end);
+
+        return first.equalsIgnoreCase("WEB-INF")
+               || first.equalsIgnoreCase("META-INF");
+    }
+
     public void service(Request req, Response resp)
         throws ServletException, IOException
     {
@@ -943,8 +1027,14 @@ public class Context implements ServletContext, InitParams
                 }
             }
 
-            URI uri = new URI(req.getRequestURI());
-            String path = uri.getPath();
+            String path = resolvePath(req.getRequestURI());
+
+            if (path == null) {
+                trace("service: '" + req.getRequestURI() + "' invalid path");
+
+                resp.sendError(HttpServletResponse.SC_BAD_REQUEST);
+                return;
+            }
 
             if (!path.startsWith(context_path_)
                 || (path.length() > context_path_.length()
@@ -967,13 +1057,32 @@ public class Context implements ServletContext, InitParams
 
             path = path.substring(context_path_.length());
 
-            ServletReg servlet = findServlet(path, req);
+            /*
+                10.5 Directory Structure
+                ...
+                No file contained in the WEB-INF directory may be served
+                directly to a client by the container.
 
-            req.setMultipartConfig(servlet.multipart_config_);
+                The check is here and not in the default servlet, so that
+                it also applies to JSP files and to the servlets of the
+                application.  A forward or an include does not come here.
+                The error page of the application for 404 applies.
+             */
+            if (isProtectedPath(path)) {
+                trace("service: '" + path + "' is protected");
 
-            FilterChain fc = new CtxFilterChain(servlet, req.getFilterPath(), DispatcherType.REQUEST);
+                resp.sendError(HttpServletResponse.SC_NOT_FOUND);
 
-            fc.doFilter(req, resp);
+            } else {
+                ServletReg servlet = findServlet(path, req);
+
+                req.setMultipartConfig(servlet.multipart_config_);
+
+                FilterChain fc = new CtxFilterChain(servlet,
+                    req.getFilterPath(), DispatcherType.REQUEST);
+
+                fc.doFilter(req, resp);
+            }
 
             Object code = req.getAttribute(RequestDispatcher.ERROR_STATUS_CODE);
             if (code != null && code instanceof Integer) {

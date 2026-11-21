@@ -1249,3 +1249,273 @@ def test_java_application_jsp_slash_after_file():
 
         assert resp['status'] == 404, url
         assert '<%' not in resp['body'], f'{url} body'
+
+
+def test_java_application_path_resolved_protected(temp_dir):
+    client.load('welcome_files')
+
+    Path(f'{temp_dir}/java/META-INF').mkdir(parents=True, exist_ok=True)
+    Path(f'{temp_dir}/java/META-INF/page.txt').write_text('text\n')
+
+    assert client.get(url='/WEB-INF/web.xml')['status'] == 404, 'direct'
+    assert client.get(url='/META-INF/')['status'] == 404, 'direct dir'
+    assert client.get(url='/META-INF/page.txt')['status'] == 404, 'direct 2'
+
+    for url in [
+        '/./WEB-INF/web.xml',
+        '/%2e/WEB-INF/web.xml',
+        '/%2E/WEB-INF/web.xml',
+        '/.//WEB-INF/web.xml',
+        '//WEB-INF/web.xml',
+        '/dir1/../WEB-INF/web.xml',
+        '/dir1/%2e%2e/WEB-INF/web.xml',
+        '/dir1/./../WEB-INF/web.xml',
+        '/./WEB-INF/',
+        '/./WEB-INF',
+        '/./META-INF/',
+        '/./META-INF/page.txt',
+        '/dir1/../META-INF/page.txt',
+        '/.%2fWEB-INF/web.xml',
+        '/dir1%2f..%2fWEB-INF/web.xml',
+        '/dir1%2F%2E%2E%2FMETA-INF/page.txt',
+    ]:
+        assert client.get(url=url)['status'] == 404, url
+
+
+def test_java_application_path_resolved_mapping():
+    client.load('welcome_files')
+
+    for url in [
+        '/./dir3/index.txt',
+        '/%2e/dir3/index.txt',
+        '/.//dir3/index.txt',
+        '/dir3//index.txt',
+        '/dir1/../dir3/index.txt',
+    ]:
+        resp = client.get(url=url)
+
+        assert resp['status'] == 200, url
+        assert resp['headers'].get('X-App-Servlet') == '1', url
+
+    resp = client.get(url='/./dir1/index.txt')
+
+    assert resp['status'] == 200, 'static file'
+    assert 'This is index.txt.' in resp['body'], 'static file body'
+
+    resp = client.get(url='/./dir1/')
+
+    assert resp['status'] == 200, 'welcome file'
+    assert 'This is index.txt.' in resp['body'], 'welcome file body'
+
+
+def test_java_application_path_resolved_path_info():
+    client.load('url_pattern')
+
+    headers = client.get(url='/foo/./bar/index.html')['headers']
+
+    assert headers['X-Id'] == 'servlet1', 'dot servlet'
+    assert headers['X-Request-URI'] == '/foo/./bar/index.html', 'dot uri'
+    assert headers['X-Servlet-Path'] == '/foo/bar', 'dot servlet path'
+    assert headers['X-Path-Info'] == '/index.html', 'dot path info'
+
+    headers = client.get(url='/foo//bar/index.html')['headers']
+
+    assert headers['X-Id'] == 'servlet1', 'slash servlet'
+    assert headers['X-Request-URI'] == '/foo//bar/index.html', 'slash uri'
+    assert headers['X-Servlet-Path'] == '/foo/bar', 'slash servlet path'
+    assert headers['X-Path-Info'] == '/index.html', 'slash path info'
+
+    headers = client.get(url='/baz/../catalog')['headers']
+
+    assert headers['X-Id'] == 'servlet3', 'dots servlet'
+    assert headers['X-Request-URI'] == '/baz/../catalog', 'dots uri'
+    assert headers['X-Servlet-Path'] == '/catalog', 'dots servlet path'
+    assert headers['X-Path-Info'] == 'null', 'dots path info'
+
+
+def test_java_application_path_resolved_encoded_slash():
+    client.load('welcome_files')
+
+    resp = client.get(url='/dir1%2findex.txt')
+
+    assert resp['status'] == 200, 'encoded slash'
+    assert 'This is index.txt.' in resp['body'], 'encoded slash body'
+
+    resp = client.get(url='/dir1%2f..%2fdir3/index.txt')
+
+    assert resp['status'] == 200, 'mapped path'
+    assert resp['headers'].get('X-App-Servlet') == '1', 'mapped path servlet'
+
+    resp = client.get(url='/dir1/index.txt%2f')
+
+    assert resp['status'] == 404, 'file name, encoded slash'
+    assert 'This is index.txt.' not in resp['body'], 'file name body'
+
+    client.load('url_pattern')
+
+    headers = client.get(url='/foo/bar/a%2fb')['headers']
+
+    assert headers['X-Id'] == 'servlet1', 'path info servlet'
+    assert headers['X-Request-URI'] == '/foo/bar/a%2fb', 'path info uri'
+    assert headers['X-Servlet-Path'] == '/foo/bar', 'path info servlet path'
+    assert headers['X-Path-Info'] == '/a/b', 'path info'
+
+
+def test_java_application_path_resolved_invalid():
+    client.load('welcome_files')
+
+    for url in ['/dir1\\index.txt', '/dir1/index.txt|', '/{dir1}/']:
+        resp = client.get(url=url)
+
+        assert resp['status'] == 400, url
+        assert 'Exception' not in resp['body'], f'{url} body'
+
+
+def test_java_application_path_resolved_filter():
+    client.load('filter_prefix')
+
+    assert client.get(url='/pub/index.txt')['status'] == 200, 'public'
+
+    for url in [
+        '/admin/index.txt',
+        '/./admin/index.txt',
+        '/%2e/admin/index.txt',
+        '/.//admin/index.txt',
+        '//admin/index.txt',
+        '/pub/../admin/index.txt',
+        '/admin/./index.txt',
+        '/admin//index.txt',
+    ]:
+        assert client.get(url=url)['status'] == 403, url
+
+
+def test_java_application_protected_jsp(temp_dir):
+    client.load('jsp')
+
+    for d in ['WEB-INF', 'META-INF', 'web-inf']:
+        Path(f'{temp_dir}/java/{d}').mkdir(parents=True, exist_ok=True)
+        Path(f'{temp_dir}/java/{d}/page.jsp').write_text(
+            '<% response.setHeader("X-Page", "1"); %>page\n'
+        )
+
+    assert client.get(url='/index.jsp')['headers']['X-Unit-JSP'] == 'ok'
+
+    for url in [
+        '/WEB-INF/page.jsp',
+        '/META-INF/page.jsp',
+        '/./WEB-INF/page.jsp',
+        '/web-inf/page.jsp',
+    ]:
+        resp = client.get(url=url)
+
+        assert resp['status'] == 404, url
+        assert 'X-Page' not in resp['headers'], url
+
+
+def test_java_application_protected_case(temp_dir):
+    client.load('welcome_files')
+
+    for d in ['web-inf', 'Meta-Inf']:
+        Path(f'{temp_dir}/java/{d}').mkdir(parents=True, exist_ok=True)
+        Path(f'{temp_dir}/java/{d}/index.txt').write_text('text\n')
+
+        assert client.get(url=f'/{d}/index.txt')['status'] == 404, d
+        assert client.get(url=f'/{d}/')['status'] == 404, f'{d} dir'
+
+
+def test_java_application_protected_dispatch():
+    client.load('forward')
+
+    resp = client.get(url='/WEB-INF/index.html')
+
+    assert resp['status'] == 404, 'servlet below WEB-INF'
+    assert 'X-REQUEST-Id' not in resp['headers'], 'servlet did not run'
+
+    headers = client.get(url='/fwd?uri=/WEB-INF/index.html')['headers']
+
+    assert headers['X-FORWARD-Id'] == 'data', 'forward to servlet'
+    assert (
+        headers['X-FORWARD-Servlet-Path'] == '/WEB-INF/index.html'
+    ), 'forward servlet path'
+
+    resp = client.get(url='/fwd?uri=/WEB-INF/web.xml')
+
+    assert resp['status'] == 200, 'forward to static file'
+    assert 'X-Exception' not in resp['headers'], 'forward no exception'
+
+    client.load('include')
+
+    resp = client.get(url='/WEB-INF/index.html')
+
+    assert resp['status'] == 404, 'include servlet below WEB-INF'
+
+    body = client.get(url='/inc?uri=/WEB-INF/index.html')['body']
+
+    assert (
+        'javax.servlet.include.servlet_path: /WEB-INF/index.html' in body
+    ), 'include of servlet'
+
+
+def test_java_application_path_resolved_dispatch_relative(temp_dir):
+    client.load('dispatch_relative')
+
+    Path(f'{temp_dir}/java/WEB-INF/page.txt').write_text('protected\n')
+
+    for url in ['/', '/WEB-INF/..', '/WEB-INF/%2e%2e', '/?m=include']:
+        resp = client.get(url=url)
+
+        assert resp['status'] == 200, url
+        assert 'This is the root page.txt.' in resp['body'], url
+        assert 'protected' not in resp['body'], f'{url} body'
+
+    resp = client.get(url='/WEB-INF/..?m=include')
+
+    assert 'This is the root page.txt.' in resp['body'], 'include'
+    assert 'protected' not in resp['body'], 'include body'
+
+
+def test_java_application_protected_error_page(temp_dir):
+    client.load('error_page')
+
+    Path(f'{temp_dir}/java/web-inf').mkdir(parents=True, exist_ok=True)
+    Path(f'{temp_dir}/java/web-inf/page.txt').write_text('text\n')
+
+    assert 'This is index.txt.' in client.get(url='/index.txt')['body']
+
+    for url in [
+        '/none.txt',
+        '/WEB-INF/web.xml',
+        '/./WEB-INF/web.xml',
+        '/web-inf/page.txt',
+    ]:
+        resp = client.get(url=url)
+
+        assert resp['status'] == 404, url
+        assert 'This is the error page for 404.' in resp['body'], url
+
+
+def test_java_application_path_resolved_context_path(temp_dir):
+    client.load('welcome_files')
+
+    Path(f'{temp_dir}/outside.txt').write_text('outside\n')
+
+    assert 'success' in client.conf(
+        '["-Dnginx.unit.context.path=/ctx"]',
+        'applications/welcome_files/options',
+    ), 'context path'
+
+    resp = client.get(url='/ctx/dir1/index.txt')
+
+    assert resp['status'] == 200, 'inside'
+    assert 'This is index.txt.' in resp['body'], 'inside body'
+
+    assert client.get(url='/ctx/WEB-INF/web.xml')['status'] == 404, 'direct'
+
+    for url in [
+        '/ctx/../outside.txt',
+        '/ctx/%2e%2e/outside.txt',
+        '/ctx/../',
+        '/ctx/./WEB-INF/web.xml',
+        '/ctx/dir1/../WEB-INF/web.xml',
+    ]:
+        assert client.get(url=url)['status'] == 404, url
