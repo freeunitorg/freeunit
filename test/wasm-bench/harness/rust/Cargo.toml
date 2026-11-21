@@ -1,0 +1,33 @@
+[package]
+name = "wasm-bench-load"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "Apache-2.0"
+publish = false
+
+# Same wasmtime crates, versions and features as src/wasm-wasi-component
+# before #912 (Cargo.lock is a copy of that crate's lock, so wasmtime is
+# 48.0.8).  The module now also enables "parallel-compilation"; it is kept
+# here as an opt-in feature so the baseline "jit" mode stays the one the
+# numbers in RESULTS.md were measured with.
+[dependencies]
+anyhow = "1.0.75"
+hyper = "1.4.1"
+wasmtime = { version = "48.0.5", default-features = false, features = ['anyhow', 'component-model', 'cranelift'] }
+wasmtime-wasi = "48.0.5"
+wasmtime-wasi-http = { version = "48.0.5", default-features = false, features = ['p2'] }
+
+[features]
+# Not on in src/wasm-wasi-component when the numbers were measured; needed
+# only for the "cache" mode.
+cache = ["wasmtime/cache"]
+# Off in src/wasm-wasi-component when the numbers were measured; #912 turned
+# it on there.  Lets Cranelift compile functions on all cores, as the C API
+# build always has.
+parallel = ["wasmtime/parallel-compilation"]
+
+[profile.release]
+panic = 'abort'
+
+[workspace]
