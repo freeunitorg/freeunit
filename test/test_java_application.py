@@ -1217,3 +1217,35 @@ def test_java_cstring_nul():
 
     resp = conf_app({"unit_jars": ""})
     assert 'must not be empty' in resp.get('detail', ''), 'unit_jars empty'
+
+
+def test_java_application_static_slash_after_file():
+    client.load('welcome_files')
+
+    resp = client.get(url='/dir1/index.txt')
+
+    assert resp['status'] == 200, 'file'
+    assert resp['headers']['X-TXT-Filter'] == '1', 'file filter'
+
+    assert client.get(url='/dir1/')['status'] == 200, 'directory'
+    assert client.get(url='/dir3/index.txt')['headers']['X-App-Servlet'] == '1'
+
+    # A slash after a file name names a directory that does not exist.
+    for url in ['/dir1/index.txt/', '/dir3/index.txt/', '/dir1/index.txt//']:
+        resp = client.get(url=url)
+
+        assert resp['status'] == 404, url
+        assert 'This is index.txt.' not in resp['body'], f'{url} body'
+        assert 'never' not in resp['body'], f'{url} mapped body'
+
+
+def test_java_application_jsp_slash_after_file():
+    client.load('jsp')
+
+    assert client.get(url='/index.jsp')['headers']['X-Unit-JSP'] == 'ok'
+
+    for url in ['/index.jsp/', '/index.jsp//']:
+        resp = client.get(url=url)
+
+        assert resp['status'] == 404, url
+        assert '<%' not in resp['body'], f'{url} body'

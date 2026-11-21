@@ -270,7 +270,12 @@ public class Context implements ServletContext, InitParams
             }
 
             File f = new File(webapp_, path);
-            if (!f.exists()) {
+
+            /*
+                java.io.File drops a trailing "/".  A path that ends with
+                "/" names a directory, so a file with this name is not found.
+             */
+            if (!f.exists() || (path.endsWith("/") && !f.isDirectory())) {
                 if (request.getDispatcherType() == DispatcherType.INCLUDE) {
                     /*
                         9.3 The Include Method
