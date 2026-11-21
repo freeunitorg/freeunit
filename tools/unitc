@@ -220,6 +220,10 @@ if [ $REMOTE -eq 0 ]; then
 			echo "${0##*/}: ERROR: cannot detect control socket. Did you start unitd with a relative path? Try starting unitd with --control option." >&2
 			exit 2
 		fi
+		if [ "$CTRL_ADDR" = "none" ]; then
+			echo "${0##*/}: ERROR: unitd runs with --control none, so it has no control API" >&2
+			exit 2
+		fi
 
 		# Prepare for network or Unix socket addressing
 		#
