@@ -53,6 +53,13 @@ static void nxt_h1p_conn_continue_sent(nxt_task_t *task, void *obj,
     void *data);
 static void nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj,
     void *data);
+static void nxt_h1p_request_ready(nxt_task_t *task, nxt_h1proto_t *h1p,
+    nxt_http_request_t *r);
+static ssize_t nxt_h1p_request_wait_io_read_handler(nxt_task_t *task,
+    nxt_conn_t *c);
+static void nxt_h1p_conn_request_wait_close(nxt_task_t *task, void *obj,
+    void *data);
+static nxt_bool_t nxt_h1p_has_unread_data(nxt_h1proto_t *h1p, nxt_conn_t *c);
 static void nxt_h1p_request_local_addr(nxt_task_t *task, nxt_http_request_t *r);
 static void nxt_h1p_request_header_send(nxt_task_t *task,
     nxt_http_request_t *r, nxt_work_handler_t body_handler, void *data);
@@ -135,6 +142,7 @@ static const nxt_conn_state_t  nxt_h1p_idle_state;
 static const nxt_conn_state_t  nxt_h1p_header_parse_state;
 static const nxt_conn_state_t  nxt_h1p_continue_state;
 static const nxt_conn_state_t  nxt_h1p_read_body_state;
+static const nxt_conn_state_t  nxt_h1p_request_wait_state;
 static const nxt_conn_state_t  nxt_h1p_request_send_state;
 static const nxt_conn_state_t  nxt_h1p_timeout_response_state;
 static const nxt_conn_state_t  nxt_h1p_keepalive_state;
@@ -1359,7 +1367,7 @@ nxt_h1p_request_body_read(nxt_task_t *task, nxt_http_request_t *r)
 
 ready:
 
-    r->state->ready_handler(task, r, NULL);
+    nxt_h1p_request_ready(task, h1p, r);
 
     return;
 
@@ -1675,8 +1683,108 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
 
         c->read = NULL;
 
-        r->state->ready_handler(task, r, NULL);
+        nxt_h1p_request_ready(task, h1p, r);
     }
+}
+
+
+static void
+nxt_h1p_request_ready(nxt_task_t *task, nxt_h1proto_t *h1p,
+    nxt_http_request_t *r)
+{
+    nxt_conn_t          *c;
+    nxt_event_engine_t  *engine;
+
+    c = h1p->conn;
+    engine = c->socket.task->thread->engine;
+
+    r->state->ready_handler(task, r, NULL);
+
+    if (h1p->request == r && r->req_rpc_data != NULL && !r->header_sent) {
+        c->read_state = &nxt_h1p_request_wait_state;
+
+        if (c->socket.read_ready) {
+            nxt_conn_read(engine, c);
+
+        } else {
+            c->socket.read_work_queue = &engine->read_work_queue;
+            c->socket.read_handler = c->io->read;
+            c->socket.error_handler = nxt_h1p_conn_request_error;
+
+            if (nxt_fd_event_is_disabled(c->socket.read)) {
+                nxt_fd_event_enable_read(engine, &c->socket);
+            }
+        }
+    }
+}
+
+
+static const nxt_conn_state_t  nxt_h1p_request_wait_state
+    nxt_aligned(64) =
+{
+    .close_handler = nxt_h1p_conn_request_wait_close,
+    .error_handler = nxt_h1p_conn_request_error,
+
+    .io_read_handler = nxt_h1p_request_wait_io_read_handler,
+};
+
+
+static ssize_t
+nxt_h1p_request_wait_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
+{
+    u_char         ch;
+    ssize_t        n;
+    nxt_h1proto_t  *h1p;
+
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL
+                      || h1p->request == NULL
+                      || h1p->request->header_sent))
+    {
+        nxt_fd_event_block_read(task->thread->engine, &c->socket);
+        return NXT_AGAIN;
+    }
+
+    n = nxt_conn_io_recv(c, &ch, 1, MSG_PEEK);
+
+    if (n > 0 || (n == 0 && nxt_h1p_has_unread_data(h1p, c))) {
+        nxt_fd_event_block_read(task->thread->engine, &c->socket);
+        return NXT_AGAIN;
+    }
+
+    return n;
+}
+
+
+static void
+nxt_h1p_conn_request_wait_close(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_conn_t     *c;
+    nxt_h1proto_t  *h1p;
+
+    c = obj;
+    h1p = nxt_h1p_from_conn(c);
+
+    if (nxt_slow_path(h1p == NULL || h1p->request == NULL)) {
+        nxt_h1p_shutdown(task, c);
+        return;
+    }
+
+    h1p->keepalive = 0;
+
+    nxt_fd_event_block_read(task->thread->engine, &c->socket);
+}
+
+
+static nxt_bool_t
+nxt_h1p_has_unread_data(nxt_h1proto_t *h1p, nxt_conn_t *c)
+{
+    nxt_buf_t  *b;
+
+    b = (c->read != NULL) ? c->read : h1p->buffers;
+
+    return (b != NULL && nxt_buf_mem_used_size(&b->mem) != 0);
 }
 
 
@@ -1981,6 +2089,10 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     h1p->sent_before_body += nxt_buf_mem_used_size(&header->mem);
 
     c = h1p->conn;
+
+    if (c->read_state == &nxt_h1p_request_wait_state) {
+        nxt_fd_event_block_read(task->thread->engine, &c->socket);
+    }
 
     c->write = header;
     h1p->conn_write_tail = &header->next;
