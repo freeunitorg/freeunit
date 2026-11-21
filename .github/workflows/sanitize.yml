@@ -165,6 +165,7 @@ jobs:
             # fills that memory, so only this leg makes the test fail.
             tests: >-
               test/test_graceful_reload.py
+              test/test_graceful_quit_drain.py
               test/test_state_store.py
               test/test_listener_drain.py
               test/test_static.py

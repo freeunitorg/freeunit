@@ -131,6 +131,8 @@ nxt_port_t *nxt_runtime_process_port_create(nxt_task_t *task, nxt_runtime_t *rt,
 
 void nxt_runtime_port_remove(nxt_task_t *task, nxt_port_t *port);
 void nxt_runtime_stop_app_processes(nxt_task_t *task, nxt_runtime_t *rt);
+void nxt_runtime_stop_all_processes(nxt_task_t *task, nxt_runtime_t *rt);
+void nxt_runtime_close_idle_connections(nxt_event_engine_t *engine);
 void nxt_runtime_port_send_quit(nxt_task_t *task, nxt_runtime_t *rt,
     nxt_port_t *port);
 
