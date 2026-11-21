@@ -112,7 +112,7 @@ COPY docker-entrypoint.sh /usr/local/bin/
 COPY welcome.* /usr/share/unit/welcome/
 COPY seccomp-no-af-alg.json /usr/share/unit/
 
-STOPSIGNAL SIGTERM
+STOPSIGNAL SIGQUIT
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 EXPOSE 80
