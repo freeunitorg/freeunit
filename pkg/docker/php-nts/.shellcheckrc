@@ -1,0 +1,4 @@
+# The docker-* scripts here are copied unchanged from
+# https://github.com/docker-library/php (see generate.sh).  They keep the
+# upstream form, so the find | xargs warning is not fixed here.
+disable=SC2038

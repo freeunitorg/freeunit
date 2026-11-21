@@ -66,7 +66,8 @@ mapfile -t ALL_VARIANTS < <(jq -r '
     .runtimes | to_entries[] | .key as $rt | .value[] |
     if .version == null then $rt
     else ($rt + "-" + .version),
-         (if .slim then ($rt + "-" + .version + "-slim") else empty end)
+         (if .slim then ($rt + "-" + .version + "-slim") else empty end),
+         (if .zts_variant then ($rt + "-" + .version + "-zts") else empty end)
     end
 ' "${EOL_JSON}")
 
