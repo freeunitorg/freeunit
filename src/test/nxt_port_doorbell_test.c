@@ -157,7 +157,8 @@ nxt_port_doorbell_test(nxt_thread_t *thr)
 
     for (i = 0; i < NXT_PORT_DOORBELL_TEST_ITEMS; i++) {
 
-        if (nxt_app_queue_send_bound(q, msg, sizeof(msg), i, &notify,
+        /* The tracking value stands for a stream, and a stream is never 0. */
+        if (nxt_app_queue_send_bound(q, msg, sizeof(msg), i + 1, &notify,
                                      &cookie, 4)
             != NXT_OK)
         {
