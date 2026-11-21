@@ -368,4 +368,5 @@ sudo dnf install unit-php
 - [REMI.md](REMI.md) — Remi's RPM repository and the `unit-php` module
 - [debian.md](debian.md) — Debian and Ubuntu build guide
 - [PHP.CVE.md](PHP.CVE.md) — PHP and Brotli CVEs of 2026 and the Docker image state
+- [PHP.HARDENING.md](PHP.HARDENING.md) — PHP ini limits, `max_body_size` and `limits.requests`
 - [FreeUnit documentation](https://docs.freeunit.org)
