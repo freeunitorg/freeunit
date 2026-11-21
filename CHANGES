@@ -62,6 +62,13 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        "opcache.restrict_api" is set, when the script is not cached, and on
        PHP older than 8.1.
 
+    *) Bugfix: a command or a value in the "conf_commands" object of a
+       listener that OpenSSL refuses is now a validation error that names
+       the command and gives OpenSSL's reason; before, the control API
+       answered "Failed to apply new configuration." and the reason was only
+       in the log. "MinProtocol" above "MaxProtocol" is refused as well: it
+       was accepted, and the listener then refused every handshake.
+
 
 Changes with FreeUnit 1.37.2                                     09 Nov 2026
 

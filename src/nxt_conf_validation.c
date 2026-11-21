@@ -3749,7 +3749,10 @@ nxt_conf_vldt_object_conf_commands(nxt_conf_validation_t *vldt,
     uint32_t              index;
     nxt_int_t             ret;
     nxt_str_t             name;
+    nxt_thread_t          *thread;
+    nxt_tls_init_t        tls_init;
     nxt_conf_value_t      *member;
+    const nxt_tls_lib_t   *tls;
     nxt_conf_vldt_path_t  seg;
 
     index = 0;
@@ -3781,7 +3784,48 @@ nxt_conf_vldt_object_conf_commands(nxt_conf_validation_t *vldt,
         }
     }
 
-    return NXT_OK;
+    /*
+     * The stored configuration is left to the router: refusing it here at
+     * startup, say after a library upgrade, would drop all of it.
+     */
+    if (vldt->restored) {
+        return NXT_OK;
+    }
+
+    /* Only the library can judge a command: ask it for a dry run. */
+
+    thread = nxt_thread();
+
+    tls = nxt_service_get(thread->runtime->services, "SSL/TLS", "OpenSSL");
+
+    if (tls == NULL || tls->library_init(thread->task) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    nxt_memzero(&tls_init, sizeof(nxt_tls_init_t));
+
+    tls_init.check = 1;
+    tls_init.conf_cmds = value;
+
+    ret = tls->server_init(thread->task, vldt->pool, &tls_init, 0);
+
+    if (ret == NXT_DECLINED && tls_init.check_name.length == 0) {
+        /* The commands together, not one of them, are refused. */
+        ret = nxt_conf_vldt_error(vldt, "The \"conf_commands\" are refused: "
+                                  "%s.", tls_init.check_error);
+
+    } else if (ret == NXT_DECLINED) {
+        seg.prev = vldt->path;
+        seg.seg = tls_init.check_name;
+        vldt->path = &seg;
+
+        ret = nxt_conf_vldt_error(vldt, "The \"%V\" command is refused: %s.",
+                                  &tls_init.check_name, tls_init.check_error);
+
+        vldt->path = seg.prev;
+    }
+
+    return ret;
 }
 
 #endif
