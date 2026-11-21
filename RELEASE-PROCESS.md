@@ -115,10 +115,18 @@ The tag can be pushed just as the branch is. E.g.
 Do not create the `unitctl/X.Y.Z` tag by hand.  Pushing `X.Y.Z` runs
 .github/workflows/unitctl.yml, whose release job creates `unitctl/X.Y.Z`
 and its release itself; a tag that already exists makes that step fail.
-The same push runs build-deb.yml, release-docker.yml and
-release-source.yml.  release-docker.yml logs in to Docker Hub, so the
+The same push runs build-deb.yml, release-macos.yml, release-docker.yml
+and release-source.yml.  release-docker.yml logs in to Docker Hub, so the
 DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets have to be set before the
 tag is pushed.
+
+release-macos.yml attaches freeunit-X.Y.Z-macos-arm64.tar.gz and
+-macos-x86_64.tar.gz with their .sha256 files.  macOS runners are
+sometimes not available; if the job was cancelled for that, run the
+workflow by hand with the tag and "publish" set.  The same run adds the
+archives to a release that was made before the workflow existed.  The
+build is reproducible, and the job never replaces a file that the
+release already has.
 
 
 # A new 'Release'

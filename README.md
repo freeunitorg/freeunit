@@ -100,6 +100,23 @@ $ docker run -d \
       ghcr.io/freeunitorg/freeunit:latest-minimal
 ```
 
+### macOS
+
+From 1.37.2 on, each release has `freeunit-X.Y.Z-macos-arm64.tar.gz` and
+`freeunit-X.Y.Z-macos-x86_64.tar.gz` for macOS 13 or later: unitd with
+OpenSSL and PCRE2 linked in, and libunit with its headers.  There are no
+language modules.  `README.macos` in the archive says how to install and
+run it.
+
+```console
+$ VER=X.Y.Z    # the release
+$ curl -fLO https://github.com/freeunitorg/freeunit/releases/download/$VER/freeunit-$VER-macos-arm64.tar.gz
+$ curl -fLO https://github.com/freeunitorg/freeunit/releases/download/$VER/freeunit-$VER-macos-arm64.tar.gz.sha256
+$ shasum -a 256 -c freeunit-$VER-macos-arm64.tar.gz.sha256
+$ tar -xzOf freeunit-$VER-macos-arm64.tar.gz freeunit-$VER-macos-arm64/README.macos | less
+$ sudo tar -xzf freeunit-$VER-macos-arm64.tar.gz -C /usr/local --strip-components 1 --no-same-owner --exclude README.macos
+```
+
 ### Build from Source
 
 ```console
