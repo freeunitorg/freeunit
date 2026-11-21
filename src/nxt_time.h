@@ -103,4 +103,14 @@ typedef int32_t            nxt_msec_int_t;
     ((int32_t) ((m1) - (m2)))
 
 
+/*
+ * The English abbreviations of the 7 days of the week, from Sunday, and of
+ * the 12 months, from January, as struct tm numbers them.  HTTP dates and
+ * the access log use them.  An array of arrays needs no relocation at load
+ * time, unlike an array of pointers.
+ */
+extern const char  nxt_wday_abbr[7][4];
+extern const char  nxt_month_abbr[12][4];
+
+
 #endif /* _NXT_UNIX_TIME_H_INCLUDED_ */

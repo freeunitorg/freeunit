@@ -284,3 +284,19 @@ nxt_localtime(nxt_time_t s, struct tm *tm)
 }
 
 #endif
+
+
+/*
+ * An extra name, or a name of 5 letters or more, does not compile.  A
+ * missing name would be an empty string, and a name of 4 letters would
+ * lose its NUL; nxt_gmtime_test compares every name with strftime().
+ */
+
+const char  nxt_wday_abbr[7][4] = {
+    "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+};
+
+const char  nxt_month_abbr[12][4] = {
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+};
