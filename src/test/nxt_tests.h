@@ -130,6 +130,7 @@ nxt_int_t nxt_port_doorbell_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_share_test(nxt_thread_t *thr);
 nxt_int_t nxt_cloexec_test(nxt_thread_t *thr);
 nxt_int_t nxt_checked_test(nxt_thread_t *thr);
+nxt_int_t nxt_limit_zone_test(nxt_thread_t *thr);
 nxt_int_t nxt_conn_close_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_response_parse_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_frag_test(nxt_thread_t *thr);
@@ -140,6 +141,7 @@ nxt_int_t nxt_nncq_wrap_test(nxt_thread_t *thr);
 nxt_int_t nxt_app_queue_test(nxt_thread_t *thr);
 nxt_int_t nxt_size_bound_test(nxt_thread_t *thr);
 nxt_int_t nxt_casecmp_test(nxt_thread_t *thr);
+nxt_int_t nxt_http_limit_req_test(nxt_thread_t *thr);
 #if (NXT_HAVE_REGEX)
 nxt_int_t nxt_regex_test(nxt_thread_t *thr);
 #endif

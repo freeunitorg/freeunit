@@ -6,6 +6,7 @@
 
 #include <nxt_router.h>
 #include <nxt_http.h>
+#include <nxt_http_limit_req.h>
 #include <nxt_otel.h>
 #include <nxt_checked.h>
 #include <nxt_usdt.h>
@@ -364,6 +365,16 @@ nxt_http_request_start(nxt_task_t *task, void *obj, void *data)
         }
     }
 
+    /* After "client_ip": the limit key is the address it gives. */
+
+    if (skcf->router_conf->limit_zones != NULL) {
+        ret = nxt_http_limit_req_headers(task, r);
+        if (ret != NXT_OK) {
+            /* The 429 or the 500 is sent. */
+            return;
+        }
+    }
+
     nxt_http_request_read_body(task, r);
 
     return;
@@ -641,6 +652,14 @@ nxt_http_request_action(nxt_task_t *task, nxt_http_request_t *r,
     if (nxt_fast_path(action != NULL)) {
 
         do {
+            if (action->limit_req != NULL) {
+                ret = nxt_http_limit_req_check(task, r, action->limit_req);
+                if (ret != NXT_OK) {
+                    /* The 429 or the 500 is sent. */
+                    return;
+                }
+            }
+
             ret = nxt_http_rewrite(task, r);
             if (nxt_slow_path(ret != NXT_OK)) {
                 break;

@@ -29,7 +29,18 @@ void
 nxt_http_request_error(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_status_t status)
 {
-    nxt_http_field_t  *content_type;
+    nxt_http_request_error_retry_after(task, r, status, 0);
+}
+
+
+/* With retry_after above zero the response carries "Retry-After". */
+
+void
+nxt_http_request_error_retry_after(nxt_task_t *task, nxt_http_request_t *r,
+    nxt_http_status_t status, uint32_t retry_after)
+{
+    u_char            *p;
+    nxt_http_field_t  *content_type, *field;
 
     nxt_debug(task, "http request error: %d", status);
 
@@ -61,6 +72,23 @@ nxt_http_request_error(nxt_task_t *task, nxt_http_request_t *r,
     }
 
     nxt_http_field_set(content_type, "Content-Type", "text/html");
+
+    if (retry_after > 0) {
+        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+        if (nxt_slow_path(field == NULL)) {
+            goto fail;
+        }
+
+        p = nxt_mp_nget(r->mem_pool, NXT_INT32_T_LEN);
+        if (nxt_slow_path(p == NULL)) {
+            goto fail;
+        }
+
+        nxt_http_field_name_set(field, "Retry-After");
+        field->value = p;
+        field->value_length = nxt_sprintf(p, p + NXT_INT32_T_LEN, "%uD",
+                                          retry_after) - p;
+    }
 
     r->resp.content_length = NULL;
     r->resp.content_length_n = NXT_HTTP_ERROR_LEN;
