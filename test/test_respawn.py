@@ -99,6 +99,11 @@ def test_respawn_controller(skip_alert, unit_pid, skip_fds_check):
 
 
 def test_respawn_application(skip_alert, unit_pid):
+    # The worker dies with its prototype.  A worker that has answered a
+    # request is not a failed start, so the router replaces it without the
+    # restart back-off (#596).
+    assert client.get()['status'] == 200
+
     pid = pid_by_name(client.app_name, unit_pid)
 
     kill_pids(pid)

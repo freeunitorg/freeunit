@@ -30,6 +30,12 @@ client = ApplicationPython()
 WAITING = 4
 READ_TIMEOUT = 15
 
+# For test_python_requeue_last_worker_spare: "max" of its application, and
+# how long each warm-up request holds a worker.  Long enough for a worker to
+# fork and boot on a loaded box, so every one of MAX processes takes a request.
+MAX = 4
+WARM_DELAY = 2
+
 
 def _app_pids():
     out = subprocess.check_output(
@@ -177,10 +183,13 @@ def test_python_requeue_last_worker_spare(skip_alert, skip_fds_check):
 
     client.load(
         'requeue_count',
-        processes={"spare": 2, "max": 4, "idle_timeout": 30},
+        processes={"spare": 2, "max": MAX, "idle_timeout": 30},
     )
 
     log = f'{option.temp_dir}/requeue.log'
+
+    def processes():
+        return client.conf_get('/status/applications/requeue_count/processes')
 
     def request(tag, delay, results):
         try:
@@ -202,26 +211,52 @@ def test_python_requeue_last_worker_spare(skip_alert, skip_fds_check):
 
     assert client.get()['status'] == 200
 
-    pids = _wait(lambda: len(_app_pids()) >= 2 and _app_pids())
-    assert pids, 'the spare processes did not start'
-
     results = {}
     threads = []
 
-    for i in range(len(pids)):
-        t = threading.Thread(target=request, args=(f'busy{i}', 30, results))
+    def start(tag, delay=0):
+        t = threading.Thread(target=request, args=(tag, delay, results))
         t.start()
         threads.append(t)
+
+    # Every process answers a request before it is killed.  A worker that
+    # exits before it answered anything is a failed start for the restart
+    # back-off (#596): the router would put off the replacements and log an
+    # alert.  A busy worker makes the router start another one to keep
+    # "spare" idle, up to "max", so the warm-up fills the application: MAX
+    # requests at once, each held until every process has taken one.  All
+    # MAX busy at the same time means each holds exactly one and answers it.
+    for i in range(MAX):
+        start(f'warm{i}', WARM_DELAY)
+
+    def filled():
+        status = processes()
+
+        return status['running'] == MAX and status['idle'] == 0
+
+    assert _wait(filled), (
+        f'the warm-up did not fill the application: {processes()}'
+    )
+
+    for t in threads:
+        t.join(READ_TIMEOUT + 5)
+
+    for i in range(MAX):
+        tag = f'warm{i}'
+
+        assert results[tag] == (200, tag), f'{tag}: {results[tag]}'
+
+    # The MAX processes that answered; "max" allows no other.
+    pids = _app_pids()
+    assert len(pids) == MAX, f'not all {MAX} processes are running: {pids}'
+
+    for i in range(len(pids)):
+        start(f'busy{i}', 30)
 
     assert _wait(
         lambda: sum(tag.startswith('busy') for tag in _lines(log))
         == len(pids)
     ), 'busy requests did not start'
-
-    def start(tag):
-        t = threading.Thread(target=request, args=(tag, 0, results))
-        t.start()
-        threads.append(t)
 
     for i in range(WAITING):
         start(f'w{i}')
@@ -285,6 +320,11 @@ def test_python_requeue_last_worker_unaccounted(skip_alert, skip_fds_check):
         r'app process \d+ exited on signal 9',
         r'did not start within',
         r'start_timeout',
+        # The only running worker is killed in the middle of its first
+        # request, so it never answered: its replacement is put off and the
+        # router says so (#596).  It cannot answer anything earlier, since a
+        # request before the marker could start the second process (below).
+        r"app 'requeue_late': a process exited before it answered anything",
     )
 
     marker = f'{option.temp_dir}/late.marker'
