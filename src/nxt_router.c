@@ -401,6 +401,8 @@ static void nxt_router_app_unlink(nxt_task_t *task, nxt_app_t *app);
 
 static void nxt_router_app_port_release(nxt_task_t *task, nxt_app_t *app,
     nxt_port_t *port, nxt_apr_action_t action);
+static void nxt_router_app_abandon_running(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data);
 static void nxt_router_app_abandoned_settle(nxt_task_t *task,
     nxt_request_rpc_data_t *req_rpc_data);
 static nxt_bool_t nxt_router_app_start_reserve(nxt_app_t *app,
@@ -6607,6 +6609,11 @@ nxt_router_response_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
     }
 
     if (r->error) {
+        /* The client is gone; the worker runs on until its last message. */
+        if (msg->port_msg.last == 0) {
+            nxt_router_app_abandon_running(task, req_rpc_data);
+        }
+
         nxt_request_rpc_data_unlink(task, req_rpc_data);
         return;
     }
@@ -6922,6 +6929,11 @@ fail:
     r->out = NULL;
 
     nxt_sendbuf_drain(task, &task->thread->engine->fast_work_queue, out);
+
+    /* The response was refused; the worker runs on until its last message. */
+    if (msg->port_msg.last == 0) {
+        nxt_router_app_abandon_running(task, req_rpc_data);
+    }
 
     nxt_request_rpc_data_unlink(task, req_rpc_data);
 }
@@ -8103,6 +8115,38 @@ nxt_router_app_abandon(nxt_task_t *task, nxt_app_t *app,
 
 
 /*
+ * The router gives up on a request while a worker can still be running it:
+ * the deadline passed, the client went away, or the response could not be
+ * passed on.  The acknowledgement moved the request's port off the shared
+ * queue and onto the worker; until the worker's last message, which sets
+ * NXT_APR_GOT_RESPONSE, the port has to stay out of the idle economy, so the
+ * request is abandoned before the unlink releases its slot (#996).  An
+ * upgraded WebSocket has given its accounting back already: the upgrade set
+ * NXT_APR_WEBSOCKET_CLOSE beside the websocket state, so it is not abandoned.
+ */
+
+static void
+nxt_router_app_abandon_running(nxt_task_t *task,
+    nxt_request_rpc_data_t *req_rpc_data)
+{
+    nxt_port_t  *port;
+
+    port = req_rpc_data->app_port;
+
+    if (port != NULL
+        && port->id != NXT_SHARED_PORT_ID
+        && req_rpc_data->apr_action == NXT_APR_REQUEST_FAILED
+        && req_rpc_data->abandoned_port == NULL)
+    {
+        /* The request is still linked, so it holds the application. */
+        nxt_assert(req_rpc_data->app != NULL);
+
+        nxt_router_app_abandon(task, req_rpc_data->app, req_rpc_data, port);
+    }
+}
+
+
+/*
  * A worker the router gave up on has answered, or is gone.  Its port rejoins
  * the idle economy if the router's own mark is the only thing holding it out
  * -- an application START edge clears that mark and its FINISH edge is what
@@ -9238,6 +9282,12 @@ nxt_router_http_request_done(nxt_task_t *task, void *obj, void *data)
     nxt_debug(task, "router http request done (rpc_data %p)", r->req_rpc_data);
 
     if (r->req_rpc_data != NULL) {
+        /*
+         * Still linked: the client closed before the worker's last message,
+         * through the discard of nxt_http_request_error_handler().
+         */
+        nxt_router_app_abandon_running(task, r->req_rpc_data);
+
         nxt_request_rpc_data_unlink(task, r->req_rpc_data);
     }
 
@@ -9982,34 +10032,7 @@ nxt_router_app_timeout(nxt_task_t *task, void *obj, void *data)
                 req_rpc_data->stream);
     }
 
-    /*
-     * The acknowledgement moves the request's port off the shared queue and
-     * onto the worker that took it; nxt_router_msg_retract() reads the same
-     * fact.  A request a worker is running is not the router's to release:
-     * its port has to stay out of the idle economy until the worker answers
-     * or closes.  See nxt_router_app_abandon().
-     *
-     * An upgraded stream is not such a request.  Its accounting was already
-     * given back by NXT_APR_UPGRADE, so no worker is running it and there is
-     * no slot to hold; what does keep the port out of the idle economy is the
-     * session count, and that one is settled by the unlink below, because the
-     * upgrade left NXT_APR_WEBSOCKET_CLOSE as the action.  The mark would
-     * instead report the worker "detached" for as long as the connection
-     * lives.  The websocket state is the upgrade itself -- it is assigned
-     * beside that release, and nowhere else -- so a handshake still in flight
-     * or one that failed, both of which do hold their accounting, still reach
-     * the abandon.
-     */
-    if (req_rpc_data->app_port != NULL
-        && req_rpc_data->app_port->id != NXT_SHARED_PORT_ID
-        && r->state != &nxt_http_websocket)
-    {
-        /* The request is still linked, so it holds the application. */
-        nxt_assert(req_rpc_data->app != NULL);
-
-        nxt_router_app_abandon(task, req_rpc_data->app, req_rpc_data,
-                               req_rpc_data->app_port);
-    }
+    nxt_router_app_abandon_running(task, req_rpc_data);
 
     nxt_http_request_error(task, r, NXT_HTTP_SERVICE_UNAVAILABLE);
 
