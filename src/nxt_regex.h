@@ -7,6 +7,39 @@
 #ifndef _NXT_REGEX_H_INCLUDED_
 #define _NXT_REGEX_H_INCLUDED_
 
+
+/*
+ * What nxt_regex_match() found out about the UTF-8 of one subject.  A
+ * caller that matches the same bytes with several patterns keeps one of
+ * these and gives it to each match.  The first match in UTF mode checks
+ * the subject, and the other matches use the result.
+ *
+ * The result is for the bytes at "start" and "length" only.  A match on a
+ * different start or length does not use it: it checks its own subject and
+ * replaces the result.  The caller must not change the bytes while it keeps
+ * the result, and must call nxt_regex_utf_init() when it puts other bytes
+ * at the same place.
+ *
+ * NXT_REGEX_UTF_VALID comes only from PCRE2, which checked the subject, or
+ * from a subject that has only ASCII bytes.  PCRE 1 does not use the result.
+ */
+
+typedef enum {
+    NXT_REGEX_UTF_UNKNOWN = 0,
+    NXT_REGEX_UTF_VALID,
+    NXT_REGEX_UTF_INVALID,
+} nxt_regex_utf_state_t;
+
+typedef struct {
+    const u_char           *start;
+    size_t                 length;
+    nxt_regex_utf_state_t  state;
+} nxt_regex_utf_t;
+
+#define nxt_regex_utf_init(utf)                                               \
+    nxt_memzero(utf, sizeof(nxt_regex_utf_t))
+
+
 #if (NXT_HAVE_REGEX)
 
 /*
@@ -45,7 +78,7 @@ NXT_EXPORT nxt_regex_t *nxt_regex_compile(nxt_mp_t *mp, nxt_str_t *source,
     nxt_regex_err_t *err);
 NXT_EXPORT nxt_regex_match_t *nxt_regex_match_create(nxt_mp_t *mp, size_t size);
 NXT_EXPORT nxt_int_t nxt_regex_match(nxt_regex_t *re, u_char *subject,
-    size_t length, nxt_regex_match_t *match);
+    size_t length, nxt_regex_match_t *match, nxt_regex_utf_t *utf);
 #if (NXT_REGEX_JIT)
 NXT_EXPORT nxt_bool_t nxt_regex_jit_compiled(nxt_regex_t *re);
 #endif
@@ -62,6 +95,9 @@ extern nxt_uint_t  nxt_regex_test_warnings;
 
 /* The matches that skipped the UTF-8 check for an ASCII subject. */
 extern nxt_uint_t  nxt_regex_test_no_utf_check;
+
+/* The matches that let PCRE2 check the subject for UTF-8. */
+extern nxt_uint_t  nxt_regex_test_utf_checks;
 #endif
 
 #if (NXT_TESTS && NXT_HAVE_PCRE2)

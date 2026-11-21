@@ -79,6 +79,7 @@ static nxt_regex_jit_test_stats_t   nxt_pcre2_test_stats;
 nxt_uint_t  nxt_regex_test_match_creates;
 nxt_uint_t  nxt_regex_test_warnings;
 nxt_uint_t  nxt_regex_test_no_utf_check;
+nxt_uint_t  nxt_regex_test_utf_checks;
 
 void
 nxt_regex_jit_test_mode(nxt_uint_t mode)
@@ -781,33 +782,93 @@ nxt_regex_match_create(nxt_mp_t *mp, size_t size)
 
 nxt_int_t
 nxt_regex_match(nxt_regex_t *re, u_char *subject, size_t length,
-    nxt_regex_match_t *match)
+    nxt_regex_match_t *match, nxt_regex_utf_t *utf)
 {
-    uint32_t     options;
-    nxt_int_t    ret;
-    nxt_bool_t   utf_error;
-    const char   *limit;
-    PCRE2_UCHAR  errptr[ERR_BUF_SIZE];
+    uint32_t               options;
+    nxt_int_t              ret;
+    nxt_bool_t             utf_error;
+    const char             *limit;
+    nxt_regex_utf_state_t  state;
+    PCRE2_UCHAR            errptr[ERR_BUF_SIZE];
 
     match->budget = NXT_REGEX_MATCH_LIMIT;
 
     /*
      * In UTF mode pcre2_match() checks the whole subject before each match,
-     * at about 8 instructions a byte.  An ASCII subject is valid UTF-8, and
-     * the test below costs about 0.5 instructions a byte, so the check is
-     * skipped for it.
+     * at 13 to 16 instructions a byte.  The caller can keep the result of
+     * the check for its subject in "utf".  A result for other bytes is not
+     * used.
      */
+
+    state = NXT_REGEX_UTF_UNKNOWN;
+
+    if (utf != NULL && utf->start == subject && utf->length == length) {
+        state = utf->state;
+    }
 
     options = 0;
 
-    if (re->utf && nxt_pcre2_ascii(subject, length)) {
-        options = PCRE2_NO_UTF_CHECK;
+    if (re->utf) {
+
+        /*
+         * An ASCII subject is valid UTF-8.  The test costs about 0.5
+         * instructions a byte, so the check is skipped for it.
+         */
+
+        if (state == NXT_REGEX_UTF_UNKNOWN && nxt_pcre2_ascii(subject, length))
+        {
+            state = NXT_REGEX_UTF_VALID;
 #if (NXT_TESTS)
-        nxt_regex_test_no_utf_check++;
+            nxt_regex_test_no_utf_check++;
 #endif
+        }
+
+        if (state == NXT_REGEX_UTF_VALID) {
+            options = PCRE2_NO_UTF_CHECK;
+        }
     }
 
-    ret = nxt_pcre2_match(re->code, subject, length, options, re->jit, match);
+    if (re->utf && state == NXT_REGEX_UTF_INVALID) {
+
+        /*
+         * The check does not depend on the pattern, so it fails again.  The
+         * result is the error of the check, without the check.
+         */
+
+        ret = PCRE2_ERROR_UTF8_ERR1;
+
+    } else {
+#if (NXT_TESTS)
+        if (re->utf && options == 0) {
+            nxt_regex_test_utf_checks++;
+        }
+#endif
+
+        ret = nxt_pcre2_match(re->code, subject, length, options, re->jit,
+                              match);
+
+        /*
+         * pcre2_match() checks the whole subject before it matches, so a
+         * match or no match means that the subject is valid UTF-8.  Other
+         * errors, such as a limit, do not change the result: the request
+         * ends with an error.
+         */
+
+        if (re->utf && state == NXT_REGEX_UTF_UNKNOWN) {
+            if (ret >= 0 || ret == PCRE2_ERROR_NOMATCH) {
+                state = NXT_REGEX_UTF_VALID;
+
+            } else if (NXT_PCRE2_UTF_ERROR(ret)) {
+                state = NXT_REGEX_UTF_INVALID;
+            }
+        }
+    }
+
+    if (utf != NULL && state != NXT_REGEX_UTF_UNKNOWN) {
+        utf->start = subject;
+        utf->length = length;
+        utf->state = state;
+    }
 
     /*
      * The subject is not valid UTF-8.  The check runs before the match, so

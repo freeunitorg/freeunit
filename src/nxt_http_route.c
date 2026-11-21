@@ -96,6 +96,12 @@ struct nxt_http_route_rule_s {
     nxt_http_route_object_t        object:8;
     uint32_t                       items;
 
+    /*
+     * The offset of the UTF-8 check result in the request, for
+     * NXT_HTTP_ROUTE_STRING and NXT_HTTP_ROUTE_STRING_PTR.
+     */
+    uintptr_t                      utf_offset;
+
     union {
         uintptr_t                  offset;
 
@@ -228,8 +234,15 @@ static nxt_int_t nxt_http_route_cookies(nxt_http_request_t *r,
     nxt_http_route_rule_t *rule);
 static nxt_int_t nxt_http_route_test_cookie(nxt_http_request_t *r,
     nxt_http_route_rule_t *rule, nxt_array_t *array);
+static nxt_noinline nxt_int_t nxt_http_route_test_patterns(
+    nxt_http_request_t *r, nxt_http_route_rule_t *rule, u_char *start,
+    size_t length);
+static nxt_int_t nxt_http_route_test_value(nxt_http_request_t *r,
+    nxt_http_route_rule_t *rule, u_char *start, size_t length,
+    nxt_regex_utf_t *utf);
 static nxt_int_t nxt_http_route_pattern(nxt_http_request_t *r,
-    nxt_http_route_pattern_t *pattern, u_char *start, size_t length);
+    nxt_http_route_pattern_t *pattern, u_char *start, size_t length,
+    nxt_regex_utf_t *utf);
 static nxt_int_t nxt_http_route_memcmp(u_char *start, u_char *test,
     size_t length, nxt_bool_t case_sensitive);
 
@@ -515,6 +528,7 @@ nxt_http_route_match_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
         }
 
         rule->u.offset = offsetof(nxt_http_request_t, host);
+        rule->utf_offset = offsetof(nxt_http_request_t, host_utf);
         rule->object = NXT_HTTP_ROUTE_STRING;
         test->rule = rule;
         test++;
@@ -529,6 +543,7 @@ nxt_http_route_match_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
         }
 
         rule->u.offset = offsetof(nxt_http_request_t, path);
+        rule->utf_offset = offsetof(nxt_http_request_t, path_utf);
         rule->object = NXT_HTTP_ROUTE_STRING_PTR;
         test->rule = rule;
         test++;
@@ -543,6 +558,7 @@ nxt_http_route_match_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
         }
 
         rule->u.offset = offsetof(nxt_http_request_t, method);
+        rule->utf_offset = offsetof(nxt_http_request_t, method_utf);
         rule->object = NXT_HTTP_ROUTE_STRING_PTR;
         test->rule = rule;
         test++;
@@ -1837,7 +1853,13 @@ nxt_http_route_rule(nxt_http_request_t *r, nxt_http_route_rule_t *rule)
     length = s->length;
     start = s->start;
 
-    return nxt_http_route_test_rule(r, rule, start, length);
+    /*
+     * The host, the path and the method stay the same while routes test
+     * them, except for a rewrite of the path, which resets the result.
+     */
+
+    return nxt_http_route_test_value(r, rule, start, length,
+                                     nxt_pointer_to(r, rule->utf_offset));
 }
 
 
@@ -2122,8 +2144,10 @@ nxt_http_route_query(nxt_http_request_t *r, nxt_http_route_rule_t *rule)
         return -1;
     }
 
-    return nxt_http_route_test_rule(r, rule, r->args_decoded.start,
-                                    r->args_decoded.length);
+    /* The arguments are decoded once per request. */
+
+    return nxt_http_route_test_value(r, rule, r->args_decoded.start,
+                                     r->args_decoded.length, &r->query_utf);
 }
 
 
@@ -2177,9 +2201,50 @@ nxt_http_route_test_cookie(nxt_http_request_t *r,
 }
 
 
+/*
+ * The value is a header, an argument, a cookie or a MIME type: one of many
+ * values of its kind, which the next test does not use again.  So the
+ * UTF-8 check result is kept only while the patterns of this rule test the
+ * value, and only if the rule has more than one pattern.
+ */
+
 nxt_int_t
 nxt_http_route_test_rule(nxt_http_request_t *r, nxt_http_route_rule_t *rule,
     u_char *start, size_t length)
+{
+    if (rule->items == 1) {
+        return nxt_http_route_test_value(r, rule, start, length, NULL);
+    }
+
+    return nxt_http_route_test_patterns(r, rule, start, length);
+}
+
+
+/*
+ * A separate function, so that a rule with one pattern does not pay for
+ * the stack protector of "utf".
+ */
+
+static nxt_noinline nxt_int_t
+nxt_http_route_test_patterns(nxt_http_request_t *r,
+    nxt_http_route_rule_t *rule, u_char *start, size_t length)
+{
+    nxt_regex_utf_t  utf;
+
+    nxt_regex_utf_init(&utf);
+
+    return nxt_http_route_test_value(r, rule, start, length, &utf);
+}
+
+
+/*
+ * "utf" keeps the UTF-8 check result of the value.  If it is NULL, each
+ * regex pattern checks the value.
+ */
+
+static nxt_int_t
+nxt_http_route_test_value(nxt_http_request_t *r, nxt_http_route_rule_t *rule,
+    u_char *start, size_t length, nxt_regex_utf_t *utf)
 {
     nxt_int_t                 ret;
     nxt_http_route_pattern_t  *pattern, *end;
@@ -2189,7 +2254,7 @@ nxt_http_route_test_rule(nxt_http_request_t *r, nxt_http_route_rule_t *rule,
     end = pattern + rule->items;
 
     while (pattern < end) {
-        ret = nxt_http_route_pattern(r, pattern, start, length);
+        ret = nxt_http_route_pattern(r, pattern, start, length, utf);
         if (nxt_slow_path(ret == NXT_ERROR)) {
             return NXT_ERROR;
         }
@@ -2225,7 +2290,7 @@ nxt_http_route_test_regex(nxt_http_request_t *r, nxt_regex_t *re,
     pattern.regex = 1;
     pattern.u.regex = re;
 
-    return nxt_http_route_pattern(r, &pattern, start, length);
+    return nxt_http_route_pattern(r, &pattern, start, length, NULL);
 }
 
 #endif
@@ -2233,7 +2298,7 @@ nxt_http_route_test_regex(nxt_http_request_t *r, nxt_regex_t *re,
 
 static nxt_int_t
 nxt_http_route_pattern(nxt_http_request_t *r, nxt_http_route_pattern_t *pattern,
-    u_char *start, size_t length)
+    u_char *start, size_t length, nxt_regex_utf_t *utf)
 {
     u_char                          *p, *end, *test;
     size_t                          test_length;
@@ -2275,7 +2340,7 @@ nxt_http_route_pattern(nxt_http_request_t *r, nxt_http_route_pattern_t *pattern,
         }
 
         return nxt_regex_match(pattern->u.regex, start, length,
-                               engine->regex_match);
+                               engine->regex_match, utf);
     }
 #endif
 

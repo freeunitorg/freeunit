@@ -37,6 +37,7 @@ static nxt_mp_t  *nxt_pcre_mp;
 nxt_uint_t  nxt_regex_test_match_creates;
 nxt_uint_t  nxt_regex_test_warnings;
 nxt_uint_t  nxt_regex_test_no_utf_check;
+nxt_uint_t  nxt_regex_test_utf_checks;
 #endif
 
 /*
@@ -195,9 +196,11 @@ nxt_regex_match_create(nxt_mp_t *mp, size_t size)
 }
 
 
+/* PCRE 1 matches bytes, so "utf" is not used. */
+
 nxt_int_t
 nxt_regex_match(nxt_regex_t *re, u_char *subject, size_t length,
-    nxt_regex_match_t *match)
+    nxt_regex_match_t *match, nxt_regex_utf_t *utf)
 {
     int  ret;
 
