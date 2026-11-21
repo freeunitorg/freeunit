@@ -49,6 +49,9 @@ typedef struct {
     nxt_router_access_log_t  *access_log;
     /* The live logs of all configurations; under the lock. */
     nxt_queue_t              access_logs;
+
+    /* A graceful quit drains; see nxt_router_quit_handler(). */
+    nxt_atomic_uint_t        draining;
 } nxt_router_t;
 
 
@@ -603,6 +606,13 @@ nxt_int_t nxt_router_test_thread_create(nxt_task_t *task, nxt_runtime_t *rt,
 
 
 extern nxt_router_t  *nxt_router;
+
+
+nxt_inline nxt_bool_t
+nxt_router_draining(void)
+{
+    return nxt_router != NULL && nxt_atomic_load(&nxt_router->draining) != 0;
+}
 
 
 #endif  /* _NXT_ROUTER_H_INCLUDED_ */

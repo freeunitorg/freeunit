@@ -194,13 +194,10 @@ def test_sigquit_completes_inflight_request(unit_pid, skip_alert, module):
         processes the QUIT byte *while the response is mid-stream* --
         this is the variant that exercises the GRACEFUL worker drain.
         The request echoes a body in two chunks with a sleep in between.
-        The response *start* (200 + header-complete) is contractual; the
-        full-body echo is only delivered once the router also drains its
-        in-flight connections (roadmap P5), so a short body is xfail'd --
-        but ONLY after confirming the worker actually drained.  A short
-        body accompanied by the "active request on ctx quit" marker means
-        SIGQUIT regressed to the NORMAL fast exit, which is still a hard
-        failure (see below).
+        The router drains its in-flight client connections on a GRACEFUL
+        quit, so the full echo must arrive.  A short body is a failure; the
+        "active request on ctx quit" marker tells which side regressed
+        (see below).
     """
     client.load('delayed', module=module)
 
@@ -254,27 +251,14 @@ def test_sigquit_completes_inflight_request(unit_pid, skip_alert, module):
         )
 
         if received != payload:
-            # A short body has two possible causes and only one is
-            # acceptable, so disambiguate before deciding -- otherwise a real
-            # regression would silently xfail-pass.  Use the same positive log
-            # evidence as test_sigterm_drops_inflight_request: libunit emits
-            # "active request on ctx quit" only when nxt_unit_quit() walks a
-            # non-empty active_req on the NORMAL branch.  That branch is
+            # A short body has two possible causes; say which one.  libunit
+            # emits "active request on ctx quit" only when nxt_unit_quit()
+            # walks a non-empty active_req on the NORMAL branch, which is
             # unreachable on GRACEFUL (it returns early while a request is in
-            # flight), so the marker is proof the fast-exit path ran.
-            #
-            #   * marker present -> SIGQUIT regressed to the NORMAL fast exit
-            #     and tore the in-flight request down: the #107 regression
-            #     this test MUST catch (hard fail).
-            #   * marker absent  -> the worker drained (GRACEFUL branch), but
-            #     the full body was not delivered end-to-end because the
-            #     router tears its own connections down on its QUIT.  Closing
-            #     that needs server-initiated connection draining (roadmap P5,
-            #     see roadmap/plan-graceful-shutdown.md), not yet implemented
-            #     -- an accepted shortfall, so xfail.  By the time _recv_all()
-            #     has returned the quit is long processed and a present marker
-            #     is already written, so a short wait (wait counts 0.1 s ticks
-            #     -> ~2 s) catches a regression without hanging the xfail path.
+            # flight).  So the marker is proof the fast-exit path ran.
+            # Without it the worker drained and the router dropped the
+            # response: nxt_router_quit_handler() must keep the connection
+            # until its response is sent.
             regressed = Log.wait_for_record(
                 r'active request on ctx quit', wait=20
             ) is not None
@@ -287,10 +271,10 @@ def test_sigquit_completes_inflight_request(unit_pid, skip_alert, module):
                 'src/nxt_runtime.c nxt_runtime_quit_buf).'
             )
 
-            pytest.xfail(
-                'worker-level drain worked (no NORMAL-teardown marker) but '
-                'the full in-flight body was not delivered end-to-end: needs '
-                'router connection draining (roadmap P5), not yet implemented'
+            pytest.fail(
+                f'the worker drained but the router did not deliver the '
+                f'in-flight response: got {len(received)} of {len(payload)} '
+                f'body bytes (src/nxt_router.c nxt_router_quit_handler)'
             )
 
 

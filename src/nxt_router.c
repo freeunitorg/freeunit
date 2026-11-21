@@ -236,6 +236,14 @@ static const char *nxt_router_get_mmap_check(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_router_gate_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
+static void nxt_router_quit_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+static void nxt_router_quit_drain_engine(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_quit_close_listeners(nxt_task_t *task, void *obj,
+    void *data);
+static void nxt_router_quit_drain_timer(nxt_task_t *task, void *obj,
+    void *data);
 static void nxt_router_conf_data_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 static void nxt_router_app_restart_handler(nxt_task_t *task,
@@ -469,6 +477,21 @@ extern const nxt_http_request_state_t  nxt_http_websocket;
 
 nxt_router_t  *nxt_router;
 
+
+/*
+ * How long a graceful QUIT waits for busy client connections, and how often
+ * it checks.  The bound is below the 10 s that "docker stop" waits.
+ */
+#define NXT_ROUTER_DRAIN_TIMEOUT  (8 * 1000)
+#define NXT_ROUTER_DRAIN_POLL     100
+
+static nxt_timer_t         nxt_router_drain_timer;
+static nxt_msec_t          nxt_router_drain_deadline;
+static nxt_uint_t          nxt_router_drain_quiet;
+static nxt_atomic_t        nxt_router_drain_engines;
+static nxt_work_t          nxt_router_drain_close_work;
+static nxt_event_engine_t  *nxt_router_drain_main;
+
 static const nxt_str_t http_prefix = nxt_string("HTTP_");
 static const nxt_str_t empty_prefix = nxt_string("");
 
@@ -536,7 +559,7 @@ typedef struct {
 
 static const nxt_router_gate_t  nxt_router_gates[NXT_PORT_MSG_MAX] = {
     [_NXT_PORT_MSG_QUIT] =
-        { NXT_ROUTER_SENDER_MAIN, NULL, nxt_signal_quit_handler },
+        { NXT_ROUTER_SENDER_MAIN, NULL, nxt_router_quit_handler },
     [_NXT_PORT_MSG_CHANGE_FILE] =
         { NXT_ROUTER_SENDER_MAIN, NULL, nxt_port_change_log_file_handler },
     [_NXT_PORT_MSG_ACCESS_LOG] =
@@ -1360,6 +1383,17 @@ nxt_router_start_app_process(nxt_task_t *task, nxt_app_t *app)
     }
 #endif
 
+    /*
+     * No process starts while a graceful quit drains: the prototypes are
+     * exiting.  As for a stopping engine, the start is given back, and with
+     * no process left the waiting requests are answered with 503.
+     */
+    if (nxt_slow_path(nxt_router_draining())) {
+        nxt_router_app_start_failed(task, app, 1, 0);
+
+        return NXT_ERROR;
+    }
+
     rt = task->thread->runtime;
     router_port = rt->port_by_type[NXT_PROCESS_ROUTER];
 
@@ -2017,6 +2051,195 @@ nxt_router_gate_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     if (nxt_fast_path(nxt_router_msg_sender_ok(task, msg))) {
         nxt_router_gates[msg->port_msg.type].handler(task, msg);
     }
+}
+
+
+/*
+ * QUIT from main.  A NORMAL quit (SIGTERM) exits at once, and also ends a
+ * drain.  A GRACEFUL quit (SIGQUIT) first drains the client connections, so
+ * that the responses of the workers, which complete their requests, still
+ * reach the clients (#968).
+ */
+
+static void
+nxt_router_quit_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    nxt_work_t          *work;
+    nxt_event_engine_t  *engine;
+
+    if (msg->buf == NULL || nxt_buf_mem_used_size(&msg->buf->mem) < 1
+        || msg->buf->mem.pos[0] != NXT_PORT_QUIT_GRACEFUL)
+    {
+        nxt_signal_quit_handler(task, msg);
+        return;
+    }
+
+    if (nxt_router_draining()) {
+        return;
+    }
+
+    nxt_atomic_store(&nxt_router->draining, 1);
+
+    nxt_log(task, NXT_LOG_NOTICE, "graceful quit: draining connections");
+
+    engine = task->thread->engine;
+
+    nxt_router_drain_main = engine;
+
+    nxt_router_drain_close_work.handler = nxt_router_quit_close_listeners;
+    nxt_router_drain_close_work.task = &engine->task;
+
+    nxt_queue_each(engine, &nxt_router->engines, nxt_event_engine_t, link0) {
+        nxt_atomic_fetch_add(&nxt_router_drain_engines, 1);
+    } nxt_queue_loop;
+
+    nxt_queue_each(engine, &nxt_router->engines, nxt_event_engine_t, link0) {
+
+        work = nxt_zalloc(sizeof(nxt_work_t));
+        if (nxt_slow_path(work == NULL)) {
+            /*
+             * The engine keeps accepting until the router exits, and the
+             * listening sockets stay open; the flag still closes each
+             * connection after its response.
+             */
+            continue;
+        }
+
+        work->handler = nxt_router_quit_drain_engine;
+        work->task = &engine->task;
+        work->obj = work;
+
+        nxt_event_engine_post(engine, work);
+
+    } nxt_queue_loop;
+
+    engine = task->thread->engine;
+
+    nxt_router_drain_deadline = engine->timers.now + NXT_ROUTER_DRAIN_TIMEOUT;
+
+    nxt_router_drain_timer.bias = NXT_TIMER_DEFAULT_BIAS;
+    nxt_router_drain_timer.work_queue = &engine->fast_work_queue;
+    nxt_router_drain_timer.handler = nxt_router_quit_drain_timer;
+    nxt_router_drain_timer.task = &engine->task;
+    nxt_router_drain_timer.log = engine->task.log;
+
+    nxt_timer_add(engine, &nxt_router_drain_timer, NXT_ROUTER_DRAIN_POLL);
+}
+
+
+/*
+ * On each engine: stop accepting, also from the retry timer of a listener
+ * that ran out of connections, and close the idle connections.  The last
+ * engine hands over to nxt_router_quit_close_listeners(): no engine reads a
+ * listening socket any more when it is shut down.  An accept that was queued
+ * before this job fails then with EINVAL, which nxt_conn_accept_error()
+ * expects on a disabled listener.
+ */
+
+static void
+nxt_router_quit_drain_engine(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_listen_event_t  *lev;
+    nxt_event_engine_t  *engine;
+
+    nxt_free(obj);
+
+    engine = task->thread->engine;
+
+    nxt_queue_each(lev, &engine->listen_connections, nxt_listen_event_t,
+                   link)
+    {
+        if (nxt_fd_event_is_active(lev->socket.read)) {
+            nxt_fd_event_disable_read(engine, &lev->socket);
+        }
+
+        /* No further accept of the current batch is queued. */
+        lev->socket.read_ready = 0;
+
+        nxt_timer_delete(engine, &lev->timer);
+
+    } nxt_queue_loop;
+
+    nxt_runtime_close_idle_connections(engine);
+
+    if (nxt_atomic_fetch_add(&nxt_router_drain_engines, -1) == 1) {
+        nxt_event_engine_post(nxt_router_drain_main,
+                              &nxt_router_drain_close_work);
+    }
+}
+
+
+/*
+ * The router owns the listening sockets: main passed them on and closed its
+ * copies.  Shutting them down refuses new connections and resets those that
+ * wait in the backlog, as an exit would, instead of letting them wait for the
+ * drain.  The descriptors stay open until the exit, so their numbers are not
+ * reused meanwhile.
+ */
+
+static void
+nxt_router_quit_close_listeners(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_socket_conf_t  *skcf;
+
+    nxt_queue_each(skcf, &nxt_router->sockets, nxt_socket_conf_t, link) {
+
+        if (skcf->listen != NULL && skcf->listen->socket != -1) {
+            nxt_socket_shutdown(task, skcf->listen->socket, SHUT_RD);
+        }
+
+    } nxt_queue_loop;
+}
+
+
+/*
+ * The router exits when no client connection has been busy for two checks in
+ * a row, or at the deadline.  Busy is accepted - idle - closed, from the
+ * counters of /status, over all engines of the process: an engine that a
+ * reconfiguration retires is no longer in nxt_router->engines but can still
+ * serve requests.  The counters are written by the engine threads one at a
+ * time, so a single reading can catch a close between its two updates and
+ * count one connection short; a second reading does not.
+ */
+
+static void
+nxt_router_quit_drain_timer(nxt_task_t *task, void *obj, void *data)
+{
+    nxt_atomic_int_t    busy;
+    nxt_event_engine_t  *engine;
+
+    busy = 0;
+
+    nxt_queue_each(engine, &task->thread->runtime->engines,
+                   nxt_event_engine_t, link)
+    {
+        busy -= (nxt_atomic_int_t) nxt_atomic_load(&engine->closed_conns_cnt);
+        busy -= (nxt_atomic_int_t) nxt_atomic_load(&engine->idle_conns_cnt);
+        busy += (nxt_atomic_int_t) nxt_atomic_load(&engine->accepted_conns_cnt);
+
+    } nxt_queue_loop;
+
+    engine = task->thread->engine;
+
+    nxt_router_drain_quiet = (busy > 0) ? 0 : nxt_router_drain_quiet + 1;
+
+    if (nxt_router_drain_quiet < 2
+        && nxt_msec_diff(nxt_router_drain_deadline, engine->timers.now) > 0)
+    {
+        nxt_timer_add(engine, &nxt_router_drain_timer, NXT_ROUTER_DRAIN_POLL);
+        return;
+    }
+
+    if (busy <= 0) {
+        nxt_log(task, NXT_LOG_NOTICE, "graceful quit: connections drained");
+
+    } else {
+        nxt_log(task, NXT_LOG_WARN, "graceful quit: %A connection(s) "
+                "still busy after %d ms, closing", busy,
+                NXT_ROUTER_DRAIN_TIMEOUT);
+    }
+
+    nxt_process_quit(task, 0);
 }
 
 
