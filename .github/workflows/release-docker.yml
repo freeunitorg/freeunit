@@ -113,13 +113,15 @@ jobs:
 
           # Variant list is derived from pkg/eol.json (single source of truth).
           # Each runtime version -> "<runtime>-<version>"; a null version (wasm,
-          # minimal) -> just "<runtime>"; "slim": true adds a "-slim" sibling.
+          # minimal) -> just "<runtime>"; "slim": true adds a "-slim" sibling,
+          # "zts_variant": true a thread-safe "-zts" sibling (PHP 8.6+).
           # Variant == Dockerfile suffix (pkg/docker/Dockerfile.<variant>).
           all_variants=$(jq -c '[
             .runtimes | to_entries[] | .key as $rt | .value[] |
             if .version == null then $rt
             else ([$rt + "-" + .version]
-                  + (if .slim then [$rt + "-" + .version + "-slim"] else [] end))
+                  + (if .slim then [$rt + "-" + .version + "-slim"] else [] end)
+                  + (if .zts_variant then [$rt + "-" + .version + "-zts"] else [] end))
             end
           ] | flatten' pkg/eol.json)
 
@@ -231,9 +233,13 @@ jobs:
           PLATFORM: ${{ matrix.arch.platform }}
         run: |
           base_ref=$(awk '/^FROM /{print $2; exit}' "pkg/docker/Dockerfile.${VARIANT}")
-          case "${base_ref}" in
-            */*) base_name="docker.io/${base_ref}" ;;
-            *)   base_name="docker.io/library/${base_ref}" ;;
+          # A first component with a "." or ":" is a registry host, as in
+          # ghcr.io/freeunitorg/php-nts (the NTS PHP base, "nts_base" in
+          # pkg/eol.json).  The other names are Docker Hub names.
+          case "${base_ref%%/*}" in
+            "${base_ref}") base_name="docker.io/library/${base_ref}" ;;
+            *.*|*:*)       base_name="${base_ref}" ;;
+            *)             base_name="docker.io/${base_ref}" ;;
           esac
           docker pull --platform "${PLATFORM}" "${base_ref}"
           base_digest=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${base_ref}" \
@@ -307,8 +313,12 @@ jobs:
           # The expected daemon version comes from the release tag, not from
           # the checkout.  The build job checks out the dispatch ref, so the
           # version file of the checkout can name another version.
+          # A php-<version>-zts image must be thread-safe, every other PHP
+          # image non-thread-safe.
+          php_ts=nts
+          case "${{ matrix.variant }}" in *-zts) php_ts=zts ;; esac
           docker pull --platform "${PLATFORM}" "${IMAGE}"
-          make -C pkg/docker verify IMAGE="${IMAGE}" VERSION="${{ needs.setup.outputs.version }}"
+          make -C pkg/docker verify IMAGE="${IMAGE}" VERSION="${{ needs.setup.outputs.version }}" PHP_TS="${php_ts}"
 
   # ---------------------------------------------------------------------------
   # 3. Merge amd64 + arm64 into multi-arch manifests and push final tags

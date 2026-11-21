@@ -128,6 +128,14 @@ Changes with FreeUnit 1.37.3                                     17 Nov 2026
        decodeURIComponent() on text that is encoded on purpose. An njs
        "pass" can no longer select a name that holds a slash.
 
+    *) Feature: Docker images for PHP 8.6: "php-8.6" with the
+       non-thread-safe build (NTS), like the images of PHP 8.3 to 8.5, and
+       "php-8.6-zts" with the thread-safe build (ZTS). The official PHP
+       images are ZTS only from PHP 8.6, so the NTS base is built from the
+       official recipe without the ZTS options and published as
+       ghcr.io/freeunitorg/php-nts. The image check and the tests fail when
+       an image or a test leg has the other build.
+
     *) Bugfix: when the read of a response header from a proxied upstream
        ended without a complete header, for example after the timeout, the
        router did not free the header buffer and the memory of the request.
@@ -181,6 +189,12 @@ Changes with FreeUnit 1.37.3                                     17 Nov 2026
        (GHSA-f2pq-268w-886c), a WASI filesystem sandbox escape that affects
        Windows hosts only. Cranelift moves to 0.135.10 with Wasmtime. The
        contrib C API pin is 48.0.10 too.
+
+    *) Bugfix: with a thread-safe (ZTS) PHP, the working directory of a
+       script followed a replaced symlink only after "realpath_cache_ttl"
+       seconds, 120 by default: a deploy that renamed a new symlink over the
+       old one kept the requests in the old directory. The directory is now
+       resolved on every request, as with a non-thread-safe PHP.
 
 
 Changes with FreeUnit 1.37.2                                     09 Nov 2026

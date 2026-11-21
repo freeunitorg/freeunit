@@ -1,0 +1,223 @@
+name: PHP NTS base images
+
+# Non-thread-safe (NTS) PHP base images for the FreeUnit PHP images.
+#
+# From PHP 8.6 the official php images are thread-safe (ZTS) only.  The
+# FreeUnit "php-<branch>" image stays NTS, like the images of PHP 8.5 and
+# older, and "php-<branch>-zts" is the explicit ZTS image FROM the official
+# one.  So FreeUnit builds the NTS base itself, from the docker-library
+# recipe with the ZTS options removed (pkg/docker/php-nts/generate.sh).
+#
+# For each pkg/docker/php-nts/Dockerfile.<branch> this workflow builds and
+# tests the image on amd64 and arm64, and publishes
+#   ghcr.io/freeunitorg/php-nts:<branch>-cli-trixie             (floating)
+#   ghcr.io/freeunitorg/php-nts:<version>-cli-trixie
+#   ghcr.io/freeunitorg/php-nts:<version>-cli-trixie-<YYYYMMDD>
+# pkg/eol.json names the floating tag as "nts_base", and
+# pkg/docker/Makefile writes it into Dockerfile.php-<branch>.  So the release
+# images and the base-image refresh see a new PHP patch release or a new
+# Debian package in the base like they do for an official php image.
+#
+# Triggers:
+#   push to master  a changed recipe: publish it.
+#   schedule        every Monday: rebuild for Debian security updates.
+#   pull request    build and test the changed recipe, publish nothing.
+#   dispatch        build and test; publish when run on master with push.
+#
+# A new PHP patch release needs a new recipe: run generate.sh against the
+# docker-library checkout that has it, and merge the result.
+#
+# The package must be public on GHCR once, after the first publication:
+# docker pull of a FROM line in a release build has no credentials.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/php-nts-base.yml
+      - pkg/docker/php-nts/**
+  pull_request:
+    paths:
+      - .github/workflows/php-nts-base.yml
+      - pkg/docker/php-nts/**
+  schedule:
+    - cron: '23 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      push:
+        description: 'Push the images to GHCR (master only)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/php-nts
+
+jobs:
+  setup:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+      branches: ${{ steps.list.outputs.branches }}
+      date: ${{ steps.decide.outputs.date }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Publication is allowed only from refs/heads/master: a push of the
+      # recipe, the weekly schedule, or a dispatch with push=true.
+      - name: Decide whether to publish
+        id: decide
+        env:
+          PUSH: ${{ inputs.push }}
+        run: |
+          publish=false
+          if [ "$GITHUB_REF" = refs/heads/master ]; then
+            case "$GITHUB_EVENT_NAME" in
+            push|schedule) publish=true ;;
+            workflow_dispatch) [ "$PUSH" = true ] && publish=true ;;
+            esac
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: List the recipes
+        id: list
+        run: |
+          set -eu
+          branches=$(find pkg/docker/php-nts -maxdepth 1 -name 'Dockerfile.*' -printf '%f\n' \
+            | sed 's/^Dockerfile\.//' | sort | jq -R . | jq -cs .)
+          [ "$branches" != "[]" ] || { echo "::error::no recipe"; exit 1; }
+          echo "branches=$branches" >> "$GITHUB_OUTPUT"
+          echo "Recipes: $branches"
+
+  build:
+    needs: setup
+    runs-on: ${{ matrix.arch.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJSON(needs.setup.outputs.branches) }}
+        arch:
+          - name: amd64
+            platform: linux/amd64
+            runner: ubuntu-26.04
+          - name: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    env:
+      BRANCH: ${{ matrix.branch }}
+      ARCH: ${{ matrix.arch.name }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read the PHP version of the recipe
+        run: |
+          set -eu
+          version=$(sed -n 's/^ENV PHP_VERSION //p' "pkg/docker/php-nts/Dockerfile.$BRANCH")
+          case "$version" in
+          "$BRANCH".*) ;;
+          *) echo "::error::Dockerfile.$BRANCH has PHP '$version', not a $BRANCH release"; exit 1 ;;
+          esac
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: pkg/docker/php-nts
+          file: pkg/docker/php-nts/Dockerfile.${{ matrix.branch }}
+          platforms: ${{ matrix.arch.platform }}
+          pull: true
+          load: true
+          tags: php-nts:test
+          labels: |
+            org.opencontainers.image.title=PHP ${{ env.VERSION }} NTS (FreeUnit base)
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.freeunit.runtime.version=${{ env.VERSION }}
+          cache-from: type=gha,scope=php-nts-${{ matrix.branch }}-${{ matrix.arch.name }}
+          cache-to: type=gha,mode=max,scope=php-nts-${{ matrix.branch }}-${{ matrix.arch.name }}
+
+      # The FreeUnit PHP module links libphp and needs the embed SAPI.  The
+      # image must be NTS, and the docker-php-ext-* helpers must work from
+      # the bundled source, without network.
+      - name: Test
+        run: |
+          set -eux
+          docker run --rm --network none php-nts:test sh -euxc '
+            test "$(php -r "echo PHP_VERSION;")" = "$PHP_VERSION"
+            test "$(php -r "echo PHP_ZTS ? \"ZTS\" : \"NTS\";")" = NTS
+            php -i | grep -x "Thread Safety => disabled"
+            php-config --configure-options | tr " " "\n" | grep -x -- --enable-embed
+            test -e /usr/local/lib/libphp.so
+            docker-php-ext-install -j"$(nproc)" bcmath
+            php -m | grep -x bcmath
+          '
+          docker run --rm php-nts:test php -v | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to GHCR
+        if: needs.setup.outputs.publish == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the architecture tag
+        if: needs.setup.outputs.publish == 'true'
+        run: |
+          set -eux
+          tag="$IMAGE:$VERSION-cli-trixie-$ARCH"
+          docker tag php-nts:test "$tag"
+          docker push "$tag"
+
+  merge:
+    needs: [setup, build]
+    if: needs.setup.outputs.publish == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJSON(needs.setup.outputs.branches) }}
+    env:
+      BRANCH: ${{ matrix.branch }}
+      DATE: ${{ needs.setup.outputs.date }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The dated and the exact tags first: a run that stops before the
+      # floating tag leaves it on the previous, complete image.
+      - name: Create the multi-arch tags
+        run: |
+          set -eux
+          version=$(sed -n 's/^ENV PHP_VERSION //p' "pkg/docker/php-nts/Dockerfile.$BRANCH")
+          for tag in "$version-cli-trixie-$DATE" "$version-cli-trixie" "$BRANCH-cli-trixie"; do
+            docker buildx imagetools create -t "$IMAGE:$tag" \
+              "$IMAGE:$version-cli-trixie-amd64" "$IMAGE:$version-cli-trixie-arm64"
+          done
+          docker buildx imagetools inspect "$IMAGE:$BRANCH-cli-trixie"
+          echo "- published \`$IMAGE:$BRANCH-cli-trixie\` (PHP $version NTS)" >> "$GITHUB_STEP_SUMMARY"

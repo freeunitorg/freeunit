@@ -179,6 +179,17 @@ that holds a slash.
 </para>
 </change>
 
+<change type="feature">
+<para>
+Docker images for PHP 8.6: "php-8.6" with the non-thread-safe build (NTS),
+like the images of PHP 8.3 to 8.5, and "php-8.6-zts" with the thread-safe
+build (ZTS).  The official PHP images are ZTS only from PHP 8.6, so the NTS
+base is built from the official recipe without the ZTS options and published
+as ghcr.io/freeunitorg/php-nts.  The image check and the tests fail when an
+image or a test leg has the other build.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 when the read of a response header from a proxied upstream ended without a
@@ -264,6 +275,16 @@ update Wasmtime, wasmtime-wasi and wasmtime-wasi-http from 48.0.8 to 48.0.10.
 RUSTSEC-2026-0587 (GHSA-f2pq-268w-886c), a WASI filesystem sandbox escape
 that affects Windows hosts only.  Cranelift moves to 0.135.10 with Wasmtime.
 The contrib C API pin is 48.0.10 too.
+</para>
+</change>
+
+<change type="bugfix">
+<para>
+with a thread-safe (ZTS) PHP, the working directory of a script followed a
+replaced symlink only after "realpath_cache_ttl" seconds, 120 by default: a
+deploy that renamed a new symlink over the old one kept the requests in the
+old directory.  The directory is now resolved on every request, as with a
+non-thread-safe PHP.
 </para>
 </change>
 
