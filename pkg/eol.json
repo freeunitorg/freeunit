@@ -71,7 +71,8 @@
     "php": [
       {"version": "8.3", "eol": "2027-12", "supported_until": "2028-12"},
       {"version": "8.4", "eol": "2028-12", "supported_until": "2029-12"},
-      {"version": "8.5", "eol": "2029-12", "supported_until": "2030-12"}
+      {"version": "8.5", "eol": "2029-12", "supported_until": "2030-12"},
+      {"version": "8.6", "eol": "2030-12", "supported_until": "2031-12", "nts_base": "ghcr.io/freeunitorg/php-nts:8.6-cli-trixie", "zts_variant": true}
     ],
     "python": [
       {"version": "3.12", "eol": "2028-10", "supported_until": "2029-10", "slim": true},

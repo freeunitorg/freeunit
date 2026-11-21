@@ -29,6 +29,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | PHP | 8.3 | Dec 2027 | Dec 2028 |
 | PHP | 8.4 | Dec 2028 | Dec 2029 |
 | PHP | 8.5 | Dec 2029 | Dec 2030 |
+| PHP | 8.6 | Dec 2030 | Dec 2031 |
 | Python | 3.12 | Oct 2028 | Oct 2029 |
 | Python | 3.13 | Oct 2029 | Oct 2030 |
 | Python | 3.14 | Oct 2030 | Oct 2031 |

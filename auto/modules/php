@@ -167,6 +167,11 @@ if [ $nxt_found = no ]; then
 fi
 
 
+# Informational: the module builds and runs with both kinds of PHP.  A
+# thread-safe (ZTS) libphp and a non-thread-safe (NTS) one have different
+# ABIs, so the module works only with the libphp it was built with.  The
+# official php:8.6 images and later are ZTS only.
+
 nxt_feature="PHP Zend Thread Safety"
 nxt_feature_name=""
 nxt_feature_run=no
@@ -184,6 +189,12 @@ nxt_feature_test="
     }"
 
 . auto/feature
+
+if [ $nxt_found = yes ]; then
+    NXT_PHP_THREAD_SAFETY="ZTS (thread-safe)"
+else
+    NXT_PHP_THREAD_SAFETY="NTS (non-thread-safe)"
+fi
 
 
 # Bug #71041 (https://bugs.php.net/bug.php?id=71041).
@@ -561,6 +572,7 @@ fi
 
 
 $echo " + PHP module: ${NXT_PHP_MODULE}.unit.so"
+$echo " + PHP thread safety: ${NXT_PHP_THREAD_SAFETY}"
 if [ $nxt_php_tzdata_refused = no ]; then
     printf '%s\n' " + PHP timezone database:" \
                   "   ${NXT_PHP_TZDATA:-bundled, no mount required}"

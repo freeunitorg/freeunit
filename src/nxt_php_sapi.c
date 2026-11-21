@@ -1921,6 +1921,24 @@ shutdown:
 nxt_inline void
 nxt_php_vcwd_chdir(nxt_unit_request_info_t *req, u_char *dir)
 {
+#ifdef VIRTUAL_DIR
+    char  real[PATH_MAX];
+
+    /*
+     * A thread-safe (ZTS) PHP has a virtual working directory: VCWD_CHDIR()
+     * is virtual_chdir(), which does no chdir() and resolves the path
+     * through the realpath cache of PHP.  The cache keeps a symlink on the
+     * path for "realpath_cache_ttl" seconds, 120 by default, so after a
+     * deploy that replaces a symlink the requests would run in the old
+     * directory.  The path is resolved by the system here on every request,
+     * as chdir() does for a non-thread-safe PHP.  A resolved path has no
+     * symlink, so the cache cannot make it stale.
+     */
+    if (nxt_fast_path(realpath((char *) dir, real) != NULL)) {
+        dir = (u_char *) real;
+    }
+#endif
+
     if (nxt_slow_path(VCWD_CHDIR((char *) dir) != 0)) {
         nxt_unit_req_alert(req, "VCWD_CHDIR(%s) failed (%d: %s)",
                            dir, errno, strerror(errno));
