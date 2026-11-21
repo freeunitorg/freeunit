@@ -417,7 +417,7 @@ nxt_http_conn_test(nxt_task_t *task, void *obj, void *data)
 
     joint->count++;
 
-    tls->conn_init(task, tls, c);
+    tls->lib->conn_init(task, tls, c);
 }
 
 

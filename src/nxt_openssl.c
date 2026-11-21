@@ -158,6 +158,8 @@ const nxt_tls_lib_t  nxt_openssl_lib = {
 
     .server_init = nxt_openssl_server_init,
     .server_free = nxt_openssl_server_free,
+
+    .conn_init = nxt_openssl_conn_init,
 };
 
 
@@ -368,8 +370,6 @@ nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
     }
 
     if (last) {
-        conf->conn_init = nxt_openssl_conn_init;
-
         if (bundle->next != NULL) {
             SSL_CTX_set_tlsext_servername_callback(ctx, nxt_openssl_servername);
         }

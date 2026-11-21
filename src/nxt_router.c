@@ -4845,6 +4845,13 @@ nxt_router_tls_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg,
             goto fail;
         }
 
+        /*
+         * The core selects the TLS backend, so the core links the
+         * configuration to its table.  The connection entry point is
+         * reached through this table, not through a pointer the backend
+         * stores on the configuration.
+         */
+        tlscf->lib = task->thread->runtime->tls;
         tlscf->no_wait_shutdown = 1;
         tls->socket_conf->tls = tlscf;
 
