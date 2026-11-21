@@ -283,6 +283,257 @@ nxt_openssl_si_test_case(nxt_openssl_si_test_t *t, const char *name,
 }
 
 
+/*
+ * A configuration of the listener "*:443" with rotating ticket keys, made
+ * at the time "msec" of the clock of the rings.
+ */
+
+static nxt_int_t
+nxt_openssl_si_test_ring_conf(nxt_openssl_si_test_t *t, uint64_t msec,
+    nxt_time_t lifetime, const char *tickets)
+{
+    nxt_str_t  json;
+
+    nxt_openssl_test_ticket_msec = msec;
+
+    t->conf = nxt_mp_zget(t->mp, sizeof(nxt_tls_conf_t));
+    if (t->conf == NULL) {
+        return NXT_ERROR;
+    }
+
+    json.length = nxt_strlen(tickets);
+    json.start = (u_char *) tickets;
+
+    nxt_memzero(&t->tls_init, sizeof(nxt_tls_init_t));
+
+    t->tls_init.conf = t->conf;
+    t->tls_init.ticket_lifetime = lifetime;
+    nxt_str_set(&t->tls_init.listener, "*:443");
+
+    t->tls_init.tickets_conf = nxt_conf_json_parse_str(t->mp, &json);
+    if (t->tls_init.tickets_conf == NULL) {
+        return NXT_ERROR;
+    }
+
+    return nxt_openssl_si_test_init(t, "ticket ring", 0, 1, NXT_OK);
+}
+
+
+/* The key the ring issues with at the time "msec" of its clock. */
+
+static nxt_int_t
+nxt_openssl_si_test_ring_issue(nxt_openssl_si_test_t *t, uint64_t msec,
+    u_char *name)
+{
+    nxt_int_t  ret;
+
+    nxt_openssl_test_ticket_msec = msec;
+
+    ret = nxt_openssl_test_ticket_key(t->task, t->conf, name, 1);
+
+    NXT_TEST_CHECK(t->thr->log, ret == NXT_OK,
+                   "openssl ticket ring test: no key to issue with at %uL",
+                   msec);
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_openssl_si_test_ring_find(nxt_openssl_si_test_t *t, uint64_t msec,
+    u_char *name, nxt_int_t expect)
+{
+    nxt_int_t  ret;
+
+    nxt_openssl_test_ticket_msec = msec;
+
+    ret = nxt_openssl_test_ticket_key(t->task, t->conf, name, 0);
+
+    NXT_TEST_CHECK(t->thr->log, ret == expect,
+                   "openssl ticket ring test: at %uL the key is %i, "
+                   "expected %i", msec, ret, expect);
+
+    return NXT_OK;
+}
+
+
+/*
+ * The life of rotating ticket keys, with the clock of the rings in the
+ * hands of the test.  The lifetime is 10 seconds: a key issues for 10,
+ * only decrypts for 10 more, and then is gone.  The ring belongs to the
+ * listener, so the next configuration of the listener finds the keys.
+ */
+
+static nxt_int_t
+nxt_openssl_si_test_ring(nxt_openssl_si_test_t *t)
+{
+    nxt_tls_conf_t  *prev;
+    u_char          a[16], b[16], c[16], k1[48], k2[48];
+
+    /* Two keys as "tickets" has them: a name, an AES key and an HMAC key. */
+    static const char  key1[] =
+        "\"U1oDTh11mMxODuw12gS0EXX1E/PkZG13cJNQ6m5+6BGlfPTjNlIEw7PSVU3X1gTE\"";
+    static const char  key2[] =
+        "\"5AV0DSYIYbZWZQB7fCnTHZmMxtotb/aXjam+n2XS79lTvX3Tq9xGqpC8XKNEF2lt\"";
+
+    (void) nxt_base64_decode(k1, (u_char *) key1 + 1, 64);
+    (void) nxt_base64_decode(k2, (u_char *) key2 + 1, 64);
+
+    /* Generated keys. */
+
+    if (nxt_openssl_si_test_ring_conf(t, 1000, 10, "true") != NXT_OK
+        || nxt_openssl_si_test_ring_issue(t, 1000, a) != NXT_OK
+        || nxt_openssl_si_test_ring_find(t, 1000, a, NXT_OK) != NXT_OK
+        || nxt_openssl_si_test_ring_issue(t, 10999, b) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+    NXT_TEST_CHECK(t->thr->log, memcmp(a, b, 16) == 0,
+                   "openssl ticket ring test: a new key within the lifetime");
+
+    if (nxt_openssl_si_test_ring_find(t, 11000, a, NXT_AGAIN) != NXT_OK
+        || nxt_openssl_si_test_ring_issue(t, 11000, b) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+    NXT_TEST_CHECK(t->thr->log, memcmp(a, b, 16) != 0,
+                   "openssl ticket ring test: no new key after the lifetime");
+
+    if (nxt_openssl_si_test_ring_find(t, 11000, b, NXT_OK) != NXT_OK
+        || nxt_openssl_si_test_ring_find(t, 20999, a, NXT_AGAIN) != NXT_OK
+        || nxt_openssl_si_test_ring_find(t, 21000, a, NXT_DECLINED) != NXT_OK
+        || nxt_openssl_si_test_ring_find(t, 21000, b, NXT_AGAIN) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+    /*
+     * A clock value from before the key was born, as a thread has it that
+     * read the clock and then waited for the lock while another thread
+     * added the key.  The key is new for it, not very old.
+     */
+
+    if (nxt_openssl_si_test_ring_find(t, 10000, b, NXT_OK) != NXT_OK
+        || nxt_openssl_si_test_ring_find(t, 21000, b, NXT_AGAIN) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+    /*
+     * A reconfiguration with a key from the configuration.  The key of the
+     * previous configuration still decrypts, also after that configuration
+     * is freed.
+     */
+
+    prev = t->conf;
+
+    if (nxt_openssl_si_test_ring_conf(t, 21000, 10, key1) != NXT_OK
+        || nxt_openssl_si_test_ring_issue(t, 21000, c) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+    NXT_TEST_CHECK(t->thr->log, memcmp(c, k1, 16) == 0,
+                   "openssl ticket ring test: the configured key does not "
+                   "issue");
+
+    nxt_openssl_lib.server_free(t->task, prev);
+
+    if (nxt_openssl_si_test_ring_find(t, 21000, b, NXT_AGAIN) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    /*
+     * A configuration that the router rejects: it is made and freed, and
+     * never used.  Its lifetime and its key must not reach the ring: the
+     * other key is not there, and the generated key expires on time.
+     */
+
+    prev = t->conf;
+
+    if (nxt_openssl_si_test_ring_conf(t, 21500, 1000, key2) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    nxt_openssl_lib.server_free(t->task, t->conf);
+    t->conf = prev;
+
+    if (nxt_openssl_si_test_ring_find(t, 21500, k2, NXT_DECLINED) != NXT_OK
+        || nxt_openssl_si_test_ring_find(t, 30999, b, NXT_AGAIN) != NXT_OK
+        || nxt_openssl_si_test_ring_find(t, 31000, b, NXT_DECLINED) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+    /* A key that left the configuration decrypts until it ages out. */
+
+    if (nxt_openssl_si_test_ring_conf(t, 32000, 10, key2) != NXT_OK
+        || nxt_openssl_si_test_ring_issue(t, 32000, c) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+    NXT_TEST_CHECK(t->thr->log, memcmp(c, k2, 16) == 0,
+                   "openssl ticket ring test: the new configured key does "
+                   "not issue");
+
+    nxt_openssl_lib.server_free(t->task, prev);
+
+    if (nxt_openssl_si_test_ring_find(t, 40999, k1, NXT_AGAIN) != NXT_OK
+        || nxt_openssl_si_test_ring_find(t, 41000, k1, NXT_DECLINED) != NXT_OK
+        || nxt_openssl_si_test_ring_issue(t, 41999, c) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+    NXT_TEST_CHECK(t->thr->log, memcmp(c, k2, 16) == 0,
+                   "openssl ticket ring test: the configured key gave way "
+                   "within its lifetime");
+
+    /* A configured key that is not replaced gives way to a generated one. */
+
+    if (nxt_openssl_si_test_ring_issue(t, 42000, c) != NXT_OK) {
+        return NXT_ERROR;
+    }
+
+    NXT_TEST_CHECK(t->thr->log, memcmp(c, k2, 16) != 0,
+                   "openssl ticket ring test: the configured key issues "
+                   "after its lifetime");
+
+    /*
+     * A configured key that expired is not taken back by a reconfiguration
+     * that still lists it: its old tickets would work again.
+     */
+
+    if (nxt_openssl_si_test_ring_find(t, 51999, k2, NXT_AGAIN) != NXT_OK
+        || nxt_openssl_si_test_ring_find(t, 52000, k2, NXT_DECLINED) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+    prev = t->conf;
+
+    if (nxt_openssl_si_test_ring_conf(t, 52000, 10, key2) != NXT_OK
+        || nxt_openssl_si_test_ring_issue(t, 52000, c) != NXT_OK
+        || nxt_openssl_si_test_ring_find(t, 52000, k2, NXT_DECLINED) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+    NXT_TEST_CHECK(t->thr->log, memcmp(c, k2, 16) != 0,
+                   "openssl ticket ring test: an expired configured key "
+                   "issues again after a reconfiguration");
+
+    nxt_openssl_lib.server_free(t->task, prev);
+
+    nxt_openssl_test_ticket_msec = 0;
+
+    return nxt_openssl_si_test_free(t, "ticket ring");
+}
+
+
 nxt_int_t
 nxt_openssl_server_init_test(nxt_thread_t *thr)
 {
@@ -360,6 +611,11 @@ nxt_openssl_server_init_test(nxt_thread_t *thr)
     }
 
     ret = nxt_openssl_si_test_case(&t, "success", 1, 0);
+    if (ret != NXT_OK) {
+        goto done;
+    }
+
+    ret = nxt_openssl_si_test_ring(&t);
 
 done:
 

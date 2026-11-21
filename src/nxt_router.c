@@ -3389,6 +3389,8 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     static const nxt_str_t  conf_timeout_path =
                                 nxt_string("/tls/session/timeout");
     static const nxt_str_t  conf_tickets = nxt_string("/tls/session/tickets");
+    static const nxt_str_t  conf_ticket_lifetime_path =
+                                nxt_string("/tls/session/ticket_lifetime");
 #endif
 #if (NXT_HAVE_NJS)
     static const nxt_str_t  js_module_path = nxt_string("/settings/js_module");
@@ -3867,6 +3869,15 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
                 tls_init->tickets_conf = nxt_conf_get_path(listener,
                                                            &conf_tickets);
+
+                tls_init->ticket_lifetime = 0;
+                tls_init->listener = name;
+
+                value = nxt_conf_get_path(listener,
+                                          &conf_ticket_lifetime_path);
+                if (value != NULL) {
+                    tls_init->ticket_lifetime = nxt_conf_get_number(value);
+                }
 
                 n = nxt_conf_array_elements_count_or_1(certificate);
 

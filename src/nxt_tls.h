@@ -25,6 +25,9 @@
 
 #define NXT_TLS_BUFFER_SIZE       4096
 
+/* The most keys "tickets" can list when "ticket_lifetime" rotates them. */
+#define NXT_TLS_TICKET_KEYS_MAX   8
+
 
 typedef struct nxt_tls_conf_s         nxt_tls_conf_t;
 typedef struct nxt_tls_bundle_conf_s  nxt_tls_bundle_conf_t;
@@ -87,6 +90,10 @@ struct nxt_tls_init_s {
     nxt_time_t                    timeout;
     nxt_conf_value_t              *conf_cmds;
     nxt_conf_value_t              *tickets_conf;
+    /* Rotation of ticket keys: the seconds a key issues for; 0 is off. */
+    nxt_time_t                    ticket_lifetime;
+    /* The keys belong to the listener of this name. */
+    nxt_str_t                     listener;
 
     nxt_tls_conf_t                *conf;
 };
@@ -110,6 +117,18 @@ u_char *nxt_openssl_copy_error(u_char *p, u_char *end);
 NXT_EXPORT extern nxt_uint_t  nxt_openssl_test_fail;
 
 NXT_EXPORT nxt_uint_t nxt_openssl_test_log_level(int reason);
+
+/*
+ * For src/test/nxt_openssl_server_init_test.c: the clock of the ticket key
+ * rings in milliseconds, if not 0, and a key of the ring of a configuration.
+ * With "issue" the key that issues now is returned in "name"; else the key
+ * "name" is looked up: NXT_OK if it also issues, NXT_AGAIN if it only
+ * decrypts, NXT_DECLINED if the ring does not have it.
+ */
+NXT_EXPORT extern uint64_t  nxt_openssl_test_ticket_msec;
+
+NXT_EXPORT nxt_int_t nxt_openssl_test_ticket_key(nxt_task_t *task,
+    nxt_tls_conf_t *conf, u_char *name, nxt_bool_t issue);
 #endif
 #endif
 
