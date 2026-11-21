@@ -20,7 +20,8 @@ use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView,
                     WasiView};
 use wasmtime_wasi_http::p2::bindings::http::types::Scheme;
 use wasmtime_wasi_http::p2::bindings::ProxyPre;
-use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
+use wasmtime_wasi_http::p3::bindings::ServicePre;
+use wasmtime_wasi_http::p3::Request as P3Request;
 use wasmtime_wasi_http::{Error as HttpError, RequestOptions, WasiBody,
                          WasiHttpCtx, WasiHttpCtxView, WasiHttpHooks,
                          WasiHttpView};
@@ -199,9 +200,30 @@ struct GlobalConfig {
     execution_timeout: u64,
 }
 
+/// The `wasi:http` world the component exports, chosen once at load time.
+enum Handler {
+    /// WASI 0.2: `wasi:http/incoming-handler`.
+    P2(ProxyPre<StoreState>),
+    /// WASI 0.3: `wasi:http/handler@0.3.0`.
+    P3(ServicePre<StoreState>),
+}
+
+/// Whether `component` exports the WASI 0.3 handler.
+///
+/// A WASI 0.2 component exports `wasi:http/incoming-handler@0.2.x`, a WASI
+/// 0.3 one `wasi:http/handler@0.3.x`.  The two names differ, so a component
+/// takes exactly one path, and every component that worked before keeps the
+/// WASI 0.2 path.
+fn exports_wasi_http_0_3(engine: &Engine, component: &Component) -> bool {
+    component
+        .component_type()
+        .exports(engine)
+        .any(|(name, _)| name.starts_with("wasi:http/handler@0.3"))
+}
+
 struct GlobalState {
     engine: Engine,
-    component: ProxyPre<StoreState>,
+    component: Handler,
     global_config: &'static GlobalConfig,
     sender: mpsc::Sender<NxtRequestInfo>,
     /// `None` unless "execution_timeout" is configured, in which case the
@@ -246,6 +268,11 @@ impl GlobalState {
         let mut config = Config::new();
         config.wasm_component_model(true);
 
+        // WASI 0.3 is built on the async ABI of the component model.  It only
+        // lets a component use that ABI: a WASI 0.2 component does not use
+        // it, so it runs as before.
+        config.wasm_component_model_async(true);
+
         // A guest yields only at an async wasi import, so one that computes
         // without calling any stays inside a single `call_handle()` poll for
         // as long as it likes: `JoinHandle::abort()` is never observed, the
@@ -287,16 +314,39 @@ impl GlobalState {
         // result into the `anyhow::Error` these functions return.
         let component = Component::from_file(&engine, &global_config.component)
             .map_err(|e| e.context("failed to compile component"))?;
+        let p3 = exports_wasi_http_0_3(&engine, &component);
+
         let mut linker = Linker::<StoreState>::new(&engine);
         add_to_linker_async(&mut linker)
             .map_err(|e| e.context("failed to add wasi to linker"))?;
-        wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
-            .map_err(|e| e.context("failed to add wasi:http to linker"))?;
+
+        if p3 {
+            // A WASI 0.3 component can still import WASI 0.2 interfaces
+            // (wasi-libc does), so the 0.2 ones above stay linked.
+            wasmtime_wasi::p3::add_to_linker(&mut linker)
+                .map_err(|e| e.context("failed to add wasi 0.3 to linker"))?;
+            wasmtime_wasi_http::p3::add_to_linker(&mut linker).map_err(|e| {
+                e.context("failed to add wasi:http 0.3 to linker")
+            })?;
+
+        } else {
+            wasmtime_wasi_http::p2::add_only_http_to_linker_sync(&mut linker)
+                .map_err(|e| e.context("failed to add wasi:http to linker"))?;
+        }
+
         let component = linker.instantiate_pre(&component).map_err(|e| {
             e.context("failed to pre-instantiate the provided component")
         })?;
-        let proxy = ProxyPre::new(component)
-            .map_err(|e| e.context("failed to conform to proxy"))?;
+
+        let handler = if p3 {
+            Handler::P3(ServicePre::new(component).map_err(|e| {
+                e.context("failed to conform to wasi:http/service@0.3")
+            })?)
+
+        } else {
+            Handler::P2(ProxyPre::new(component)
+                .map_err(|e| e.context("failed to conform to proxy"))?)
+        };
 
         // Spin up the Tokio async runtime in a separate thread with a
         // communication channel into it. This thread will send requests to
@@ -306,7 +356,7 @@ impl GlobalState {
 
         Ok(GlobalState {
             engine,
-            component: proxy,
+            component: handler,
             sender,
             global_config,
             epoch,
@@ -362,7 +412,7 @@ impl GlobalState {
             http: WasiHttpCtx::new(),
             hooks: DenyOutboundHttp,
         };
-        let mut store = Store::new(&self.engine, data);
+        let store = Store::new(&self.engine, data);
 
         // Convert the `nxt_*` representation into the representation required
         // by Wasmtime's `wasi-http` implementation using the Rust `http`
@@ -384,6 +434,19 @@ impl GlobalState {
             .map_err(anyhow::Error::from)
             .context(BadRequest)?;
 
+        match &self.component {
+            Handler::P2(pre) => self.handle_p2(info, store, request, pre).await,
+            Handler::P3(pre) => self.handle_p3(info, store, request, pre).await,
+        }
+    }
+
+    async fn handle_p2(
+        &'static self,
+        info: &mut NxtRequestInfo,
+        mut store: Store<StoreState>,
+        request: http::Request<BoxBody<Bytes, Error>>,
+        pre: &'static ProxyPre<StoreState>,
+    ) -> Result<()> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
         // Instantiate the WebAssembly component and invoke its `handle`
@@ -410,8 +473,7 @@ impl GlobalState {
                 .http()
                 .new_incoming_request(Scheme::Http, request)?;
             let out = store.data_mut().http().new_response_outparam(sender)?;
-            self.component
-                .instantiate_async(&mut store)
+            pre.instantiate_async(&mut store)
                 .await?
                 .wasi_http_incoming_handler()
                 .call_handle(&mut store, req, out)
@@ -444,6 +506,80 @@ impl GlobalState {
 
         // Join on completion of the wasm task which should be done by this
         // point.
+        task.join().await?;
+
+        Ok(())
+    }
+
+    /// The WASI 0.3 path.
+    ///
+    /// The response body of a WASI 0.3 guest is a component-model stream,
+    /// and the store moves its data only while `run_concurrent()` runs.  So
+    /// the guest task does not return when the response head is ready: it
+    /// hands the response out, and then keeps the store running until the
+    /// body is written (`body_done`) and the request body is consumed.
+    async fn handle_p3(
+        &'static self,
+        info: &mut NxtRequestInfo,
+        mut store: Store<StoreState>,
+        request: http::Request<BoxBody<Bytes, Error>>,
+        pre: &'static ServicePre<StoreState>,
+    ) -> Result<()> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (body_done, body_written) = tokio::sync::oneshot::channel::<()>();
+
+        let mut task = GuestTask(Some(tokio::spawn(async move {
+            // See handle_p2() for why the deadline is armed here.
+            let _ticking = self.epoch.as_ref().map(|e| e.arm(&mut store));
+
+            let service = pre.instantiate_async(&mut store).await?;
+            let (req, io) =
+                P3Request::from_http(&mut store.data_mut().hooks, request);
+
+            store
+                .run_concurrent(async move |store| {
+                    let res = service.handle(store, req).await.map_err(|e| {
+                        e.context("failed to invoke wasm `handle`")
+                    })?;
+                    let res = res
+                        .map_err(|e| anyhow::anyhow!("guest error: {e:?}"))?;
+                    let res = store.with(|store| {
+                        res.into_http(store, async { Ok(()) })
+                    })?;
+
+                    if sender.send(res).is_err() {
+                        bail!("the receiver of the response disappeared");
+                    }
+
+                    // The writer drops `body_done` when it stops, so an error
+                    // on the write side ends this wait too.
+                    let (io, _) = futures::join!(io, body_written);
+                    io.map_err(|e| anyhow::anyhow!("request body: {e}"))?;
+
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await??;
+
+            Ok::<_, anyhow::Error>(())
+        })));
+
+        let response = match receiver.await {
+            Ok(response) => response,
+            Err(_) => {
+                task.join().await?;
+                bail!("the sender of the response disappeared");
+            }
+        };
+
+        let body = self.send_response(info, response)?;
+
+        let written = self
+            .send_response_body(info, body)
+            .await
+            .context("failed to write response body");
+        drop(body_done);
+        written?;
+
         task.join().await?;
 
         Ok(())
@@ -520,11 +656,15 @@ impl GlobalState {
         Ok(response.into_body())
     }
 
-    async fn send_response_body(
+    async fn send_response_body<B>(
         &self,
         info: &mut NxtRequestInfo,
-        mut body: HyperOutgoingBody,
-    ) -> Result<()> {
+        mut body: B,
+    ) -> Result<()>
+    where
+        B: http_body::Body<Data = Bytes> + Unpin,
+        B::Error: Into<anyhow::Error>,
+    {
         loop {
             // Acquire the next frame, and because nothing is actually async
             // at the moment this should never block meaning that the
