@@ -240,19 +240,13 @@ jobs:
           workspaces: ./tools/unitctl -> target
           save-if: ${{ github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/') }}
 
-      - name: Configure linux arm dependencies
+      # cross builds in its own image.  unitctl links no C TLS library
+      # (rustls with aws-lc-rs), so the image needs no packages: an apt
+      # pre-build here only made the build depend on the Ubuntu mirrors,
+      # which the xenial image of cross reaches through ubuntu.com.
+      - name: Build linux arm with cross
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          cat <<EOF > Cross.toml
-          [target.aarch64-unknown-linux-gnu]
-          pre-build = [
-              "dpkg --add-architecture \$CROSS_DEB_ARCH",
-              "apt-get update && apt-get install --assume-yes libssl-dev:\$CROSS_DEB_ARCH"
-          ]
-          EOF
-
-          cat Cross.toml
-          echo "CARGO=cross" >> $GITHUB_ENV
+        run: echo "CARGO=cross" >> $GITHUB_ENV
 
       - name: Install macOS dependencies
         if: startsWith(matrix.os, 'macos')
