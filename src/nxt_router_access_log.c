@@ -20,6 +20,7 @@ typedef struct {
 
 typedef struct {
     nxt_str_t                       text;
+    uint8_t                         too_large;  /* 1 bit */
 } nxt_router_access_log_ctx_t;
 
 
@@ -384,6 +385,8 @@ nxt_router_access_log_writer(nxt_task_t *task, nxt_http_request_t *r,
         goto close;
     }
 
+    ctx->too_large = 0;
+
     if (format->tstr != NULL) {
         ret = nxt_router_access_log_text(task, r, ctx, format->tstr);
 
@@ -393,7 +396,9 @@ nxt_router_access_log_writer(nxt_task_t *task, nxt_http_request_t *r,
 
     if (nxt_slow_path(ret != NXT_OK)) {
         nxt_router_access_log_lost(task, access_log,
-                                   "the record could not be built");
+                                   ctx->too_large
+                                   ? "the record is over the size bound"
+                                   : "the record could not be built");
         goto close;
     }
 
@@ -768,8 +773,12 @@ nxt_router_access_log_json(nxt_task_t *task, nxt_http_request_t *r,
      * The record and "\n".  nxt_conf_json_length() reports an unrepresentable
      * length as SIZE_MAX; nxt_size_add() refuses the addition rather than
      * wrapping, so the record never reaches nxt_mp_nget() with that size.
-     * The record bound and the per-field cap are 1.38 decisions; 1.37.1
-     * writes the record whole.
+     *
+     * A record past NXT_ACCESS_LOG_MAX_RECORD is dropped whole and counted;
+     * the per-field cap is still to come.  The bound is checked on the
+     * printed record, not on nxt_conf_json_length(): that is an upper bound
+     * (it counts a "," after the last member), so a record exactly at the
+     * bound would be dropped.
      */
 
     if (nxt_slow_path(nxt_size_add(nxt_conf_json_length(value, NULL), 1, &size)
@@ -789,6 +798,11 @@ nxt_router_access_log_json(nxt_task_t *task, nxt_http_request_t *r,
     *p++ = '\n';
 
     ctx->text.length = p - ctx->text.start;
+
+    if (ctx->text.length > NXT_ACCESS_LOG_MAX_RECORD) {
+        ctx->too_large = 1;
+        return NXT_ERROR;
+    }
 
     return NXT_OK;
 }
