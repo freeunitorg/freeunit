@@ -242,6 +242,29 @@ nxt_memcasecmp(const void *p1, const void *p2, size_t length)
 
 
 /*
+ * The pattern of nxt_memcase_eq_fold().  A letter is 'A' to 'Z' or 'a' to
+ * 'z', the bytes that nxt_lowcase() folds.  (c | 0x20) - 'a' is below 26
+ * for these bytes only: a byte from 0x80 up gives 63 or more.
+ */
+
+void
+nxt_casefold_set(u_char *low, const u_char *src, size_t length)
+{
+    u_char  c, *fold;
+    size_t  i;
+
+    fold = low + length;
+
+    for (i = 0; i < length; i++) {
+        c = src[i];
+
+        fold[i] = ((u_char) ((c | 0x20) - 'a') < 26) ? 0x20 : 0x00;
+        low[i] = nxt_lowcase(c);
+    }
+}
+
+
+/*
  * nxt_memstrn() is intended for search of static substring "ss"
  * with known length "length" in string "s" limited by parameter "end".
  * Zeros are ignored in both strings.

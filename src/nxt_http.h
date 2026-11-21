@@ -598,7 +598,7 @@ void nxt_http_proxy_buf_mem_free(nxt_task_t *task, nxt_http_request_t *r,
 
 extern nxt_time_string_t  nxt_http_date_cache;
 
-extern nxt_lvlhsh_t                        nxt_response_fields_hash;
+extern nxt_http_fields_hash_t              nxt_response_fields_hash;
 
 extern const nxt_http_proto_table_t  nxt_http_proto[];
 
