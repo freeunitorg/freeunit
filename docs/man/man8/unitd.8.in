@@ -90,6 +90,23 @@ permissions act as defense-in-depth rather than the sole access control.
 Where peer credentials are unavailable, or for an IP-based control
 socket, those socket permissions (or network reachability) remain the
 boundary.
+.Pp
+On Linux the UNIX-domain socket can be an abstract one:
+.Ql unix:@name .
+An abstract socket has no file, so
+.Fl Fl control-mode
+does not apply to it and nothing is chowned; the peer check above is its
+only access control, and
+.Fl Fl control-user
+and
+.Fl Fl control-group
+only add to the peers it accepts.
+Every process in the network namespace can connect to an abstract name,
+and can bind the name while
+.Nm
+does not run.
+Where untrusted local processes share the namespace, prefer a socket file
+in a directory that only trusted users can write.
 .It Fl Fl group Ar name , Fl Fl user Ar name
 Override group name and user name used to run Unit's non-privileged processes.
 .It Fl Fl log Ar file

@@ -100,6 +100,94 @@ echo "install algif_aead /bin/false" | sudo tee /etc/modprobe.d/disable-algif.co
 sudo rmmod algif_aead 2>/dev/null || true
 ```
 
+## Read-only root file system
+
+The images run with `docker run --read-only` (`read_only: true` in Compose)
+when the configuration is in the state directory.  No mount is needed.
+
+Under `--read-only` Docker keeps `/dev` and `/dev/shm` writable and nothing
+else.  `unitd` writes to four places:
+
+| Path | What | When it is read-only |
+|------|------|----------------------|
+| `/var/run/control.unit.sock` | control socket | `unitd` exits: `bind(...) failed (30: Read-only file system)` |
+| `/var/run/unit.pid` | pid file | `unitd` exits: `unable to create the pid file` |
+| `/var/lib/unit/` | state: `conf.json`, `certs/`, `scripts/` | the stored configuration loads; a change through the control API is applied, answers 500 `Failed to store the configuration.` and is lost at restart |
+| `/var/tmp/` | request bodies larger than `body_buffer_size` (16 KiB by default) | such a request gets a 500 |
+
+So put the configuration into the image as `conf.json`, and move the socket,
+the pid file and the temporary files to `/dev/shm`:
+
+```dockerfile
+FROM ghcr.io/freeunitorg/freeunit:latest-php-8.5
+COPY config.json /var/lib/unit/conf.json
+RUN mkdir -m 700 /var/lib/unit/certs /var/lib/unit/scripts
+CMD ["unitd", "--no-daemon", \
+     "--control", "unix:/dev/shm/control.unit.sock", \
+     "--pid", "/dev/shm/unit.pid", \
+     "--tmpdir", "/dev/shm"]
+```
+
+```bash
+docker run --read-only my-image
+docker exec <container> \
+    curl --unix-socket /dev/shm/control.unit.sock http://localhost/status
+```
+
+What to know about it:
+
+- **`conf.json` replaces `/docker-entrypoint.d/`.**  The entrypoint applies
+  the files in `/docker-entrypoint.d/` only when `/var/lib/unit/` is empty.
+  It does so through a temporary daemon, which has to store the result: with
+  a read-only state the PUT answers 500 and the container stops.  With
+  `conf.json` in the state the entrypoint starts `unitd` once.  The listeners
+  open one time, and no application starts twice.
+- **Certificates and njs modules go next to it.**  A PEM bundle (the
+  certificate chain and the key) is the file `/var/lib/unit/certs/<name>`, a
+  module is `/var/lib/unit/scripts/<name>`.  The configuration names them by
+  `<name>`, as it does after an upload through the control API.
+- **Create `certs/` and `scripts/` in your image.**  `unitd` creates them at
+  start.  On a read-only state it cannot, and logs four `[alert]` lines at
+  each start.  The base images do not ship the two directories: the
+  entrypoint takes any file in `/var/lib/unit/` as a stored state and would
+  skip `/docker-entrypoint.d/`.
+- **A `conf.json` that fails does not stop the container.**  After a syntax
+  error, a value that fails validation or a listener that cannot bind,
+  `unitd` runs with an empty configuration.  The log has one `[alert]` for a
+  syntax or validation error, and three for a listener that cannot bind: the
+  `bind()` error, `failed to apply new conf` and
+  `failed to apply previous configuration`.  Add a health check on the port
+  of the application.
+- **`/dev/shm` is memory.**  It holds 64 MB unless `--shm-size` (`shm_size:`
+  in Compose) sets another size, and it counts against the memory limit of
+  the container.  A request body that does not fit gets a 500.  For large
+  uploads mount a volume or a tmpfs of the right size and name it with
+  `--tmpdir`.
+- **A tmpfs does the same job.**  With `--tmpfs /var/run` the socket and the
+  pid file keep their default paths and the `CMD` of the image stays as it
+  is; add `--tmpfs /var/tmp` for the request bodies.
+- **Without root, give the state to that user.**  Add
+  `RUN chown -R unit:unit /var/lib/unit` and `USER unit` to the Dockerfile
+  above; `unit` is the 999:999 user of the image.  `unitd` has to read
+  `conf.json` and `certs/`, and the keys in `certs/` must stay unreadable
+  for others, so the directory keeps mode 700 and changes its owner.
+  `/dev/shm` is world-writable with the sticky bit: it needs no mount and no
+  `chown`.  A tmpfs is created root-owned; see
+  `test/security/docker/README.md` for the ownership a non-root container
+  needs there.
+- **The control socket can have no file at all** (1.38.0 and later, Linux):
+  `--control unix:@unit-control`, then
+  `curl --abstract-unix-socket unit-control http://localhost/`.  An abstract
+  socket has no file permissions.  The controller accepts root, the user
+  `unitd` runs as and the `--control-user` / `--control-group` peers only,
+  but every process in the network namespace can connect to the name, and
+  can bind it while `unitd` does not run.  With `--network host` the
+  namespace is the one of the host.
+
+`test/security/docker/test-hardening.sh` runs the recipe, with and without
+root, and the starts that have to fail: `/docker-entrypoint.d/` on a
+read-only state, and a pid file that cannot be created.
+
 ## Prerequisites (Ubuntu 24.04 LTS)
 
 ### Docker Engine

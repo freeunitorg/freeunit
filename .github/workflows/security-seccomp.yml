@@ -35,6 +35,10 @@ on:
       # canary reports back.
       - 'src/nxt_main_process.*'
       - 'src/nxt_application.*'
+      # The read-only cells: nxt_controller.c reads the stored conf.json at
+      # start and prepares the control socket, nxt_listen_socket.c creates it.
+      - 'src/nxt_controller.*'
+      - 'src/nxt_listen_socket.*'
       - '.github/workflows/security-seccomp.yml'
   pull_request:
     paths:
@@ -57,6 +61,10 @@ on:
       # canary reports back.
       - 'src/nxt_main_process.*'
       - 'src/nxt_application.*'
+      # The read-only cells: nxt_controller.c reads the stored conf.json at
+      # start and prepares the control socket, nxt_listen_socket.c creates it.
+      - 'src/nxt_controller.*'
+      - 'src/nxt_listen_socket.*'
       - '.github/workflows/security-seccomp.yml'
   workflow_dispatch:
 

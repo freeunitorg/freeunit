@@ -21,6 +21,7 @@ typedef enum {
 
 nxt_int_t nxt_main_process_start(nxt_thread_t *thr, nxt_task_t *task,
     nxt_runtime_t *runtime);
+nxt_bool_t nxt_main_process_exit_waits(nxt_runtime_t *rt);
 nxt_int_t nxt_main_file_store(nxt_task_t *task, const char *dir,
     const char *tmp_name, const char *name, u_char *buf, size_t size);
 

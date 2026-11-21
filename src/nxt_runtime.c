@@ -36,7 +36,7 @@ static nxt_int_t nxt_runtime_log_files_init(nxt_runtime_t *rt);
 static nxt_int_t nxt_runtime_log_files_create(nxt_task_t *task,
     nxt_runtime_t *rt);
 static nxt_int_t nxt_runtime_pid_file_create(nxt_task_t *task,
-    nxt_file_name_t *pid_file);
+    nxt_runtime_t *rt);
 static void nxt_runtime_thread_pool_destroy(nxt_task_t *task, nxt_runtime_t *rt,
     nxt_runtime_cont_t cont);
 static void nxt_runtime_thread_pool_init(void);
@@ -426,7 +426,7 @@ nxt_runtime_initial_start(nxt_task_t *task, nxt_uint_t status)
         }
     }
 
-    ret = nxt_runtime_pid_file_create(task, rt->pid_file);
+    ret = nxt_runtime_pid_file_create(task, rt);
     if (ret != NXT_OK) {
         goto fail;
     }
@@ -472,7 +472,18 @@ nxt_runtime_quit(nxt_task_t *task, nxt_uint_t status)
 
         if (rt->type == NXT_PROCESS_MAIN) {
             nxt_runtime_stop_all_processes(task, rt);
-            done = 0;
+
+            /*
+             * Main ends its exit in the SIGCHLD handler, which calls
+             * nxt_runtime_quit() again when the registry holds no process
+             * but main and no store child runs.  When that is so already,
+             * as when the start fails before the first fork(), no SIGCHLD
+             * comes, and main would wait in the event loop for ever: the
+             * exit ends here.
+             */
+            if (nxt_main_process_exit_waits(rt)) {
+                done = 0;
+            }
         }
     }
 
@@ -710,7 +721,11 @@ nxt_runtime_exit(nxt_task_t *task, void *obj, void *data)
 
             sa = rt->controller_listen;
 
-            if (sa->u.sockaddr.sa_family == AF_UNIX) {
+            /* As below: an abstract socket has no file to remove. */
+
+            if (sa->u.sockaddr.sa_family == AF_UNIX
+                && sa->u.sockaddr_un.sun_path[0] != '\0')
+            {
                 name = (nxt_file_name_t *) sa->u.sockaddr_un.sun_path;
                 (void) nxt_file_delete(name);
             }
@@ -1540,7 +1555,7 @@ nxt_runtime_listen_sockets_enable(nxt_task_t *task, nxt_runtime_t *rt)
 
 
 static nxt_int_t
-nxt_runtime_pid_file_create(nxt_task_t *task, nxt_file_name_t *pid_file)
+nxt_runtime_pid_file_create(nxt_task_t *task, nxt_runtime_t *rt)
 {
     size_t      size, written;
     ssize_t     n;
@@ -1550,14 +1565,27 @@ nxt_runtime_pid_file_create(nxt_task_t *task, nxt_file_name_t *pid_file)
 
     nxt_memzero(&file, sizeof(nxt_file_t));
 
-    file.name = pid_file;
+    file.name = rt->pid_file;
 
-    nxt_fs_mkdir_p_dirname(pid_file, 0755);
+    nxt_fs_mkdir_p_dirname(file.name, 0755);
 
     ret = nxt_file_open(task, &file, O_WRONLY, O_CREAT | O_TRUNC,
                         NXT_FILE_DEFAULT_ACCESS);
 
     if (ret != NXT_OK) {
+        /*
+         * nxt_file_open() logs nothing here: the zero log level of the
+         * file means "do not log", although zero is NXT_LOG_ALERT.
+         */
+        nxt_alert(task, "unable to create the pid file: open(\"%FN\") "
+                  "failed %E", file.name, file.error);
+
+        /*
+         * Main did not create the file, so nxt_runtime_exit() must not
+         * remove it: a file at this path is not the file of this process.
+         */
+        rt->pid_file = NULL;
+
         return NXT_ERROR;
     }
 
