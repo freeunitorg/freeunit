@@ -227,7 +227,6 @@ A summary (OK / FAILED) is printed at the end.
 | `java-17` | eclipse-temurin:17-jdk-resolute |
 | `java-21` | eclipse-temurin:21-jdk-resolute |
 | `java-25` | eclipse-temurin:25-jdk-resolute |
-| `java-26` | eclipse-temurin:26-jdk-resolute |
 | `java-27` | eclipse-temurin:27-jdk-resolute |
 | `node-22` | node:22 |
 | `node-24` | node:24 |

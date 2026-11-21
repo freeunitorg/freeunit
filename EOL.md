@@ -17,7 +17,6 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Java (JSC) | 17 (LTS) | Oct 2027 | Oct 2028 |
 | Java (JSC) | 21 (LTS) | Dec 2029 | Dec 2030 |
 | Java (JSC) | 25 (LTS) | Sep 2031 | Sep 2032 |
-| Java (JSC) | 26 (EOL) † | Sep 2026 | Sep 2027 |
 | Java (JSC) | 27 | Mar 2027 | Mar 2028 |
 | Node.js | 22 (LTS) | Apr 2027 | Apr 2028 |
 | Node.js | 24 (LTS) | Apr 2028 | Apr 2029 |

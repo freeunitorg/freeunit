@@ -8,6 +8,12 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        moves to 0.135.10 with Wasmtime. The contrib C API pin is 48.0.10
        too.
 
+    *) Change: the Java 26 Docker image (java-26) is no longer built. Java
+       26 reached upstream end-of-life in September 2026 and receives no fix
+       for CVE-2026-114938, a heap overflow in the Base64 decoder on x86-64
+       with AVX-512. Use java-27. The published java-26 tags stay in both
+       registries with the 1.37.2 image and are no longer rebuilt.
+
     *) Change: a request target that contains an unencoded space, a control
        character such as HTAB, or DEL now gets a 400 response. Before, the
        unencoded space, DEL and the control characters other than NUL, CR
