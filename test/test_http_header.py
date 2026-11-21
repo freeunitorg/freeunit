@@ -317,8 +317,40 @@ def test_http_header_host_empty():
 
     resp = client.get(headers={'Host': '', 'Connection': 'close'})
 
-    assert resp['status'] == 200, 'Host empty status'
-    assert resp['headers']['X-Server-Name'] != '', 'Host empty SERVER_NAME'
+    assert resp['status'] == 400, 'Host empty status'
+
+
+def test_http_header_host_absent_server_name():
+    client.load('host')
+
+    resp = client.get(http_10=True, headers={})
+
+    assert resp['status'] == 200, 'Host absent status'
+    assert (
+        resp['headers']['X-Server-Name'] == 'localhost'
+    ), 'Host absent SERVER_NAME'
+
+
+@pytest.mark.parametrize('value', ['.', ':8080', '.:8080', '.:.', ':'])
+def test_http_header_host_empty_after_normalization(value):
+    client.load('host')
+
+    resp = client.get(headers={'Host': value, 'Connection': 'close'})
+
+    assert resp['status'] == 400, f'Host "{value}" status'
+
+
+def test_http_header_host_trailing_period_port_period():
+    client.load('host')
+
+    resp = client.get(
+        headers={'Host': 'example.com.:8.0', 'Connection': 'close'}
+    )
+
+    assert resp['status'] == 200, 'Host trailing period port status'
+    assert (
+        resp['headers']['X-Server-Name'] == 'example.com'
+    ), 'Host trailing period port SERVER_NAME'
 
 
 def test_http_header_host_big():

@@ -193,10 +193,7 @@ def test_return_location_edit():
         '"${host}"', 'routes/0/action/location'
     ), 'location empty with variable'
     assert (
-        client.get(headers={"Host": "", "Connection": "close"})['headers'][
-            'Location'
-        ]
-        == ""
+        client.get(http_10=True, headers={})['headers']['Location'] == ""
     ), 'location with empty variable'
 
 
