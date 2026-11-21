@@ -22,6 +22,19 @@ The contrib C API pin is 48.0.10 too.
 
 <change type="change">
 <para>
+the Docker image release checks the runtime in each image against a security
+floor, "min_patch" in pkg/eol.json, and does not publish a variant whose
+runtime is below it.  The floors are Ruby 3.3.14, 3.4.13 and 4.0.10 (seven
+regexp and String case conversion advisories) and Java 17.0.21.1, 21.0.13.1,
+25.0.5.1 and 27.0.1.1 (CVE-2026-114938).  The Java images are not published
+again until Eclipse Temurin has the fixed builds; pkg/community/RUNTIME.CVE.md
+describes a JVM option for the meantime.  Java 26 has no fixed release and no
+floor; its image is removed separately.
+</para>
+</change>
+
+<change type="change">
+<para>
 a request target that contains an unencoded space, a control character such
 as HTAB, or DEL now gets a 400 response.  Before, the unencoded space, DEL and
 the control characters other than NUL, CR and LF were accepted as part of the
