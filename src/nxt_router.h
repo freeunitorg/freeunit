@@ -114,6 +114,11 @@ typedef struct {
     nxt_array_t            *engines;
     nxt_router_conf_t      *router_conf;
     nxt_mp_t               *mem_pool;
+
+#if (NXT_HAVE_SCHEDULER)
+    /* "schedules" of this configuration; see src/nxt_schedule.c. */
+    struct nxt_schedule_conf_s  *schedules;
+#endif
 } nxt_router_temp_conf_t;
 
 

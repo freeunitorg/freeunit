@@ -62,6 +62,10 @@ cat << END
 
   --usdt               enable USDT probes (requires sys/sdt.h)
 
+  --scheduler          enable the "schedules" configuration object: a
+                       command that runs at an interval in the context
+                       of an application (off by default)
+
   --debug              enable debug logging
 
   --hardening=MODE     add compiler and linker hardening flags, probed for

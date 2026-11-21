@@ -15,6 +15,9 @@
 #include <nxt_http_route_addr.h>
 #include <nxt_http_compression.h>
 #include <nxt_regex.h>
+#if (NXT_HAVE_SCHEDULER)
+#include <nxt_schedule.h>
+#endif
 
 
 typedef enum {
@@ -245,6 +248,18 @@ static nxt_int_t nxt_conf_vldt_java_option(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value);
 static nxt_int_t nxt_conf_vldt_upstream(nxt_conf_validation_t *vldt,
     nxt_str_t *name, nxt_conf_value_t *value);
+#if (NXT_HAVE_SCHEDULER)
+static nxt_int_t nxt_conf_vldt_schedule(nxt_conf_validation_t *vldt,
+    nxt_str_t *name, nxt_conf_value_t *value);
+static nxt_int_t nxt_conf_vldt_schedule_application(
+    nxt_conf_validation_t *vldt, nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_schedule_executable(
+    nxt_conf_validation_t *vldt, nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_schedule_arguments(
+    nxt_conf_validation_t *vldt, nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_schedule_seconds(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+#endif
 static nxt_int_t nxt_conf_vldt_server(nxt_conf_validation_t *vldt,
     nxt_str_t *name, nxt_conf_value_t *value);
 static nxt_int_t nxt_conf_vldt_server_weight(nxt_conf_validation_t *vldt,
@@ -367,6 +382,27 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_root_members[] = {
         .type       = NXT_CONF_VLDT_STRING | NXT_CONF_VLDT_OBJECT,
         .validator  = nxt_conf_vldt_access_log,
     },
+
+#if (NXT_HAVE_SCHEDULER)
+    {
+        .name       = nxt_string("schedules"),
+        .type       = NXT_CONF_VLDT_OBJECT,
+        .validator  = nxt_conf_vldt_object_iterator,
+        .u.object   = nxt_conf_vldt_schedule,
+    },
+#else
+    /*
+     * A configuration with "schedules" is refused with the reason, not as
+     * an unknown parameter: the same configuration is valid in a build
+     * with "./configure --scheduler".
+     */
+    {
+        .name       = nxt_string("schedules"),
+        .type       = NXT_CONF_VLDT_ANY_TYPE,
+        .validator  = nxt_conf_vldt_unsupported,
+        .u.string   = "schedules",
+    },
+#endif
 
     NXT_CONF_VLDT_END
 };
@@ -1625,6 +1661,42 @@ static nxt_conf_vldt_object_t nxt_conf_vldt_app_procmap_members[] = {
         .name       = nxt_string("size"),
         .type       = NXT_CONF_VLDT_INTEGER,
         .flags      = NXT_CONF_VLDT_REQUIRED,
+    },
+
+    NXT_CONF_VLDT_END
+};
+
+#endif
+
+
+#if (NXT_HAVE_SCHEDULER)
+
+static nxt_conf_vldt_object_t  nxt_conf_vldt_schedule_members[] = {
+    {
+        .name       = nxt_string("application"),
+        .type       = NXT_CONF_VLDT_STRING,
+        .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_schedule_application,
+    }, {
+        .name       = nxt_string("executable"),
+        .type       = NXT_CONF_VLDT_STRING,
+        .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_schedule_executable,
+    }, {
+        .name       = nxt_string("arguments"),
+        .type       = NXT_CONF_VLDT_ARRAY,
+        .validator  = nxt_conf_vldt_schedule_arguments,
+    }, {
+        .name       = nxt_string("interval"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+        .flags      = NXT_CONF_VLDT_REQUIRED,
+        .validator  = nxt_conf_vldt_schedule_seconds,
+        .u.string   = "interval",
+    }, {
+        .name       = nxt_string("timeout"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+        .validator  = nxt_conf_vldt_schedule_seconds,
+        .u.string   = "timeout",
     },
 
     NXT_CONF_VLDT_END
@@ -5172,6 +5244,183 @@ nxt_conf_vldt_java_option(nxt_conf_validation_t *vldt, nxt_conf_value_t *value)
 
     return NXT_OK;
 }
+
+
+#if (NXT_HAVE_SCHEDULER)
+
+/*
+ * One member of "schedules"; src/nxt_schedule.h has the limits.  The name
+ * goes into log lines, a process title and /status/schedules, so it is a
+ * plain token: a letter or a digit first, then also ".", "_" and "-".
+ */
+
+static nxt_int_t
+nxt_conf_vldt_schedule(nxt_conf_validation_t *vldt, nxt_str_t *name,
+    nxt_conf_value_t *value)
+{
+    u_char     ch;
+    size_t     i, length;
+    nxt_int_t  ret;
+
+    length = name->length;
+
+    if (length == 0 || length > NXT_SCHEDULE_NAME_MAX) {
+        return nxt_conf_vldt_error(vldt, "The schedule name must be from 1 "
+                                   "to %d characters long.",
+                                   NXT_SCHEDULE_NAME_MAX);
+    }
+
+    for (i = 0; i < length; i++) {
+        ch = name->start[i];
+
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+            || (ch >= '0' && ch <= '9'))
+        {
+            continue;
+        }
+
+        if (i != 0 && (ch == '.' || ch == '_' || ch == '-')) {
+            continue;
+        }
+
+        return nxt_conf_vldt_error(vldt, "The schedule name \"%V\" is "
+                                   "invalid: it must start with a letter or "
+                                   "a digit and contain only letters, "
+                                   "digits, \".\", \"_\" and \"-\".", name);
+    }
+
+    ret = nxt_conf_vldt_type(vldt, name, value, NXT_CONF_VLDT_OBJECT);
+
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+    return nxt_conf_vldt_object(vldt, value, nxt_conf_vldt_schedule_members);
+}
+
+
+static nxt_int_t
+nxt_conf_vldt_schedule_application(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    nxt_str_t         name;
+    nxt_conf_value_t  *apps;
+
+    static const nxt_str_t  apps_str = nxt_string("applications");
+
+    nxt_conf_get_string(value, &name);
+
+    apps = nxt_conf_get_object_member(vldt->conf, &apps_str, NULL);
+
+    if (apps == NULL
+        || nxt_conf_type(apps) != NXT_CONF_OBJECT
+        || nxt_conf_get_object_member(apps, &name, NULL) == NULL)
+    {
+        return nxt_conf_vldt_error(vldt, "The schedule \"application\" value "
+                                   "\"%V\" is not an application of this "
+                                   "configuration.", &name);
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_conf_vldt_schedule_executable(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    nxt_str_t  str;
+
+    nxt_conf_get_string(value, &str);
+
+    if (str.length == 0) {
+        return nxt_conf_vldt_error(vldt, "The schedule \"executable\" must "
+                                   "not be empty.");
+    }
+
+    if (memchr(str.start, '\0', str.length) != NULL) {
+        return nxt_conf_vldt_error(vldt, "The schedule \"executable\" must "
+                                   "not contain null character.");
+    }
+
+    return NXT_OK;
+}
+
+
+static nxt_int_t
+nxt_conf_vldt_schedule_arguments(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    size_t            size;
+    uint32_t          i;
+    nxt_str_t         str;
+    nxt_conf_value_t  *arg;
+
+    if (nxt_conf_array_elements_count(value) > NXT_SCHEDULE_ARGS_MAX) {
+        return nxt_conf_vldt_error(vldt, "The schedule \"arguments\" array "
+                                   "must not have more than %d elements.",
+                                   NXT_SCHEDULE_ARGS_MAX);
+    }
+
+    size = 0;
+
+    for (i = 0; /* void */ ; i++) {
+        arg = nxt_conf_get_array_element(value, i);
+        if (arg == NULL) {
+            break;
+        }
+
+        if (nxt_conf_type(arg) != NXT_CONF_STRING) {
+            return nxt_conf_vldt_error(vldt, "The schedule \"arguments\" "
+                                       "array must contain only string "
+                                       "values.");
+        }
+
+        nxt_conf_get_string(arg, &str);
+
+        /* memchr() on a null pointer is undefined even for a zero length. */
+
+        if (str.length != 0 && memchr(str.start, '\0', str.length) != NULL) {
+            return nxt_conf_vldt_error(vldt, "The schedule \"arguments\" "
+                                       "array must not contain strings with "
+                                       "null character.");
+        }
+
+        /* Each argument with its NUL, as the command gets them. */
+        size += str.length + 1;
+    }
+
+    if (size > NXT_SCHEDULE_ARGS_SIZE) {
+        return nxt_conf_vldt_error(vldt, "The schedule \"arguments\" must "
+                                   "not take more than %d bytes in total, "
+                                   "with one byte more for each argument.",
+                                   NXT_SCHEDULE_ARGS_SIZE);
+    }
+
+    return NXT_OK;
+}
+
+
+/* "interval" and "timeout": whole seconds that fit a timer. */
+
+static nxt_int_t
+nxt_conf_vldt_schedule_seconds(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    double  num;
+
+    num = nxt_conf_get_number(value);
+
+    if (num < 1 || num > NXT_SCHEDULE_INTERVAL_MAX) {
+        return nxt_conf_vldt_error(vldt, "The schedule \"%s\" must be from "
+                                   "1 to %d seconds.", data,
+                                   NXT_SCHEDULE_INTERVAL_MAX);
+    }
+
+    return NXT_OK;
+}
+
+#endif
 
 
 static nxt_int_t

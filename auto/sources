@@ -134,6 +134,11 @@ if [ "$NXT_OTEL" != "NO" ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_otel.c"
 fi
 
+if [ "$NXT_SCHEDULER" = "YES" ]; then
+    NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_schedule.c src/nxt_schedule_main.c"
+    NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_schedule_process.c"
+fi
+
 NXT_LIB_EPOLL_SRCS="src/nxt_epoll_engine.c"
 NXT_LIB_KQUEUE_SRCS="src/nxt_kqueue_engine.c"
 NXT_LIB_EVENTPORT_SRCS="src/nxt_eventport_engine.c"
@@ -259,6 +264,11 @@ fi
 
 if [ "$NXT_HAVE_CGROUP" = "YES" ]; then
     NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_cgroup_test.c"
+fi
+
+if [ "$NXT_SCHEDULER" = "YES" ]; then
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_schedule_slot_test.c"
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_schedule_main_test.c"
 fi
 
 

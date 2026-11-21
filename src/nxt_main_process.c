@@ -19,6 +19,9 @@
 #if (NXT_HAVE_NJS)
 #include <nxt_script.h>
 #endif
+#if (NXT_HAVE_SCHEDULER)
+#include <nxt_schedule.h>
+#endif
 
 #include <sys/mount.h>
 #include <dirent.h>
@@ -104,7 +107,6 @@ static nxt_int_t nxt_main_store_job_run(nxt_task_t *task,
 static void nxt_main_store_job_done(nxt_task_t *task,
     nxt_main_store_job_t *job, nxt_int_t ret);
 static void nxt_main_store_reply(nxt_task_t *task, nxt_int_t ret);
-static void nxt_main_store_close_fds(void);
 #if (NXT_LINUX)
 static nxt_int_t nxt_main_store_close_proc_fds(void);
 #endif
@@ -563,14 +565,12 @@ nxt_main_new_port_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 static void
 nxt_main_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
 {
-    u_char                 *start, *p, ch;
-    size_t                 type_len;
+    u_char                 *start, *p;
     nxt_int_t              ret;
     nxt_buf_t              *b;
     nxt_port_t             *port;
     nxt_runtime_t          *rt;
     nxt_process_t          *process;
-    nxt_app_type_t         idx;
     nxt_conf_value_t       *conf;
     nxt_process_init_t     *init;
     nxt_common_app_conf_t  *app_conf;
@@ -656,9 +656,6 @@ nxt_main_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     p = nxt_cpymem(p, "\" prototype", 11);
     *p = '\0';
 
-    app_conf->shm_limit = 100 * 1024 * 1024;
-    app_conf->request_limit = 0;
-
     start += app_conf->name.length + 1;
 
     conf = nxt_conf_json_parse(process->mem_pool, start, b->mem.free, NULL);
@@ -668,57 +665,10 @@ nxt_main_start_process_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         goto failed;
     }
 
-    rt = task->thread->runtime;
-
-    app_conf->user.start  = (u_char*)rt->user_cred.user;
-    app_conf->user.length = nxt_strlen(rt->user_cred.user);
-
-    ret = nxt_conf_map_object(process->mem_pool, conf, nxt_common_app_conf,
-                              nxt_nitems(nxt_common_app_conf), app_conf);
-
-    if (ret != NXT_OK) {
-        nxt_alert(task, "failed to map common app conf received from router");
-        goto failed;
-    }
-
-    for (type_len = 0; type_len != app_conf->type.length; type_len++) {
-        ch = app_conf->type.start[type_len];
-
-        if (ch == ' ' || nxt_isdigit(ch)) {
-            break;
-        }
-    }
-
-    idx = nxt_app_parse_type(app_conf->type.start, type_len);
-
-    if (nxt_slow_path(idx >= nxt_nitems(nxt_app_maps))) {
-        nxt_alert(task, "invalid app type %d received from router", (int) idx);
-        goto failed;
-    }
-
-    ret = nxt_conf_map_object(process->mem_pool, conf, nxt_app_maps[idx].map,
-                              nxt_app_maps[idx].size, app_conf);
-
+    ret = nxt_main_app_conf_map(task, process->mem_pool, conf, app_conf);
     if (nxt_slow_path(ret != NXT_OK)) {
-        nxt_alert(task, "failed to map app conf received from router");
         goto failed;
     }
-
-    if (app_conf->limits != NULL) {
-        ret = nxt_conf_map_object(process->mem_pool, app_conf->limits,
-                                  nxt_common_app_limits_conf,
-                                  nxt_nitems(nxt_common_app_limits_conf),
-                                  app_conf);
-
-        if (nxt_slow_path(ret != NXT_OK)) {
-            nxt_alert(task, "failed to map app limits received from router");
-            goto failed;
-        }
-    }
-
-    app_conf->shm_limit = nxt_app_shm_limit(app_conf->shm_limit);
-
-    app_conf->self = conf;
 
     process->stream = msg->port_msg.stream;
     process->data.app = app_conf;
@@ -782,6 +732,87 @@ failed:
 
     nxt_fd_close(msg->fd[1]);
     msg->fd[1] = -1;
+}
+
+
+/*
+ * Fill "app_conf" from "conf", the application object as the router sent
+ * it: the common members, the members of the application type and the
+ * limits.  The values are allocated from "mp" or point into "conf", so
+ * both must live as long as "app_conf".  The caller sets the name and the
+ * descriptors of the shared port.
+ *
+ * nxt_main_start_process_handler() maps the configuration of a prototype
+ * with it.  It is a function of its own so that a process which runs in
+ * the context of an application, but is not its prototype, gets the same
+ * mapping.
+ */
+nxt_int_t
+nxt_main_app_conf_map(nxt_task_t *task, nxt_mp_t *mp, nxt_conf_value_t *conf,
+    nxt_common_app_conf_t *app_conf)
+{
+    u_char          ch;
+    size_t          type_len;
+    nxt_int_t       ret;
+    nxt_runtime_t   *rt;
+    nxt_app_type_t  idx;
+
+    app_conf->shm_limit = 100 * 1024 * 1024;
+    app_conf->request_limit = 0;
+
+    rt = task->thread->runtime;
+
+    app_conf->user.start  = (u_char*)rt->user_cred.user;
+    app_conf->user.length = nxt_strlen(rt->user_cred.user);
+
+    ret = nxt_conf_map_object(mp, conf, nxt_common_app_conf,
+                              nxt_nitems(nxt_common_app_conf), app_conf);
+
+    if (ret != NXT_OK) {
+        nxt_alert(task, "failed to map common app conf received from router");
+        return NXT_ERROR;
+    }
+
+    for (type_len = 0; type_len != app_conf->type.length; type_len++) {
+        ch = app_conf->type.start[type_len];
+
+        if (ch == ' ' || nxt_isdigit(ch)) {
+            break;
+        }
+    }
+
+    idx = nxt_app_parse_type(app_conf->type.start, type_len);
+
+    if (nxt_slow_path(idx >= nxt_nitems(nxt_app_maps))) {
+        nxt_alert(task, "invalid app type %d received from router", (int) idx);
+        return NXT_ERROR;
+    }
+
+    ret = nxt_conf_map_object(mp, conf, nxt_app_maps[idx].map,
+                              nxt_app_maps[idx].size, app_conf);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_alert(task, "failed to map app conf received from router");
+        return NXT_ERROR;
+    }
+
+    if (app_conf->limits != NULL) {
+        ret = nxt_conf_map_object(mp, app_conf->limits,
+                                  nxt_common_app_limits_conf,
+                                  nxt_nitems(nxt_common_app_limits_conf),
+                                  app_conf);
+
+        if (nxt_slow_path(ret != NXT_OK)) {
+            nxt_alert(task, "failed to map app limits received from router");
+            return NXT_ERROR;
+        }
+    }
+
+    app_conf->shm_limit = nxt_app_shm_limit(app_conf->shm_limit);
+
+    app_conf->self = conf;
+
+    return NXT_OK;
 }
 
 
@@ -1166,11 +1197,36 @@ refused:
 }
 
 
+#if (NXT_HAVE_SCHEDULER)
+
+/*
+ * A run of a schedule is a child of main that says it is ready and then
+ * executes a command.  It is not announced to the other processes, as a
+ * prototype is: nxt_schedule_main_ready() closes its port instead.
+ */
+
+static void
+nxt_main_process_ready_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
+{
+    if (nxt_schedule_main_ready(task, msg)) {
+        return;
+    }
+
+    nxt_port_process_ready_handler(task, msg);
+}
+
+#endif
+
+
 static nxt_port_handlers_t  nxt_main_process_port_handlers = {
     .data             = nxt_main_data_handler,
     .new_port         = nxt_main_gate_handler,
     .process_created  = nxt_main_process_created_handler,
+#if (NXT_HAVE_SCHEDULER)
+    .process_ready    = nxt_main_process_ready_handler,
+#else
     .process_ready    = nxt_port_process_ready_handler,
+#endif
     .whoami           = nxt_main_process_whoami_handler,
     .remove_pid       = nxt_main_gate_handler,
 #if (NXT_USE_CMSG_PID)
@@ -1194,6 +1250,9 @@ static nxt_port_handlers_t  nxt_main_process_port_handlers = {
     .access_log       = nxt_main_port_access_log_handler,
     .rpc_ready        = nxt_port_rpc_handler,
     .rpc_error        = nxt_port_rpc_handler,
+#if (NXT_HAVE_SCHEDULER)
+    .schedule         = nxt_schedule_main_handler,
+#endif
 };
 
 
@@ -1911,8 +1970,16 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
             return;
         }
 
-        if (nxt_main_store_cancelled(pid, status)) {
-            /* Main stopped it; see nxt_main_store_cancel(). */
+        if (nxt_main_store_cancelled(pid, status)
+#if (NXT_HAVE_SCHEDULER)
+            || nxt_schedule_main_killed(pid, status)
+#endif
+           )
+        {
+            /*
+             * Main stopped it; see nxt_main_store_cancel() and, for a run
+             * of a schedule, nxt_schedule_main_kill().
+             */
             nxt_trace(task, "process %PI exited on signal %d",
                       pid, WTERMSIG(status));
 
@@ -1941,6 +2008,14 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
          * for the whole handler.
          */
 
+#if (NXT_HAVE_SCHEDULER)
+        if (nxt_schedule_main_exited(task, pid, status)) {
+            /*
+             * A run of a schedule.  Its record is not in the runtime any
+             * more, or it is released there; the slot is free.
+             */
+        } else
+#endif
         if (!nxt_main_store_exited(task, pid, status)) {
             process = nxt_runtime_process_find(rt, pid);
 
@@ -2032,6 +2107,14 @@ nxt_main_process_sigchld_handler(nxt_task_t *task, void *obj, void *data)
                           nxt_main_store.pid);
                 continue;
             }
+
+#if (NXT_HAVE_SCHEDULER)
+            /* And for the runs of the schedules, which it has killed. */
+            if (nxt_schedule_main_running()) {
+                nxt_debug(task, "waiting for the runs of the schedules");
+                continue;
+            }
+#endif
 
             nxt_runtime_quit(task, 0);
 
@@ -2775,6 +2858,10 @@ nxt_main_start_exit(nxt_task_t *task)
     nxt_exiting = 1;
 
     nxt_main_store_cancel(task);
+
+#if (NXT_HAVE_SCHEDULER)
+    nxt_schedule_main_stop(task);
+#endif
 }
 
 
@@ -3194,7 +3281,7 @@ nxt_main_store_job_done(nxt_task_t *task, nxt_main_store_job_t *job,
  * took 862 to 892 ms per store.  All of this runs in the child, not in
  * main.
  */
-static void
+void
 nxt_main_store_close_fds(void)
 {
 #if (NXT_HAVE_CLOSEFROM && !NXT_HAVE_CLOSE_RANGE && !NXT_HAVE_SYS_CLOSE_RANGE)

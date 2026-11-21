@@ -25,6 +25,9 @@
 #include <nxt_checked.h>
 #include <nxt_http_compression.h>
 #include <nxt_usdt.h>
+#if (NXT_HAVE_SCHEDULER)
+#include <nxt_schedule.h>
+#endif
 
 #if (NXT_HAVE_OTEL)
 #define NXT_OTEL_BATCH_DEFAULT     128
@@ -573,6 +576,10 @@ static const nxt_router_gate_t  nxt_router_gates[NXT_PORT_MSG_MAX] = {
         { NXT_ROUTER_SENDER_NOT_APP, NULL, nxt_port_rpc_handler },
     [_NXT_PORT_MSG_RPC_ERROR] =
         { NXT_ROUTER_SENDER_NOT_APP, NULL, nxt_port_rpc_handler },
+#if (NXT_HAVE_SCHEDULER)
+    [_NXT_PORT_MSG_SCHEDULE_STATUS] =
+        { NXT_ROUTER_SENDER_MAIN, NULL, nxt_schedule_status_handler },
+#endif
 };
 
 
@@ -592,6 +599,9 @@ static const nxt_port_handlers_t  nxt_router_process_port_handlers = {
     .rpc_error    = nxt_router_gate_handler,
     .oosm         = nxt_router_gate_handler,
     .detached     = nxt_router_detached_handler,
+#if (NXT_HAVE_SCHEDULER)
+    .schedule_status = nxt_router_gate_handler,
+#endif
 };
 
 
@@ -2368,6 +2378,9 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     nxt_status_report_t      *report;
     nxt_router_access_log_t  *access_log;
     uint64_t                 access_log_lost;
+#if (NXT_HAVE_SCHEDULER)
+    nxt_uint_t               nschedules;
+#endif
 
     port = nxt_runtime_port_find(task->thread->runtime,
                                  msg->port_msg.pid,
@@ -2390,6 +2403,10 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         alloc += sizeof(nxt_status_app_t) + app->name.length;
 
     } nxt_queue_loop;
+
+#if (NXT_HAVE_SCHEDULER)
+    alloc += nxt_schedule_status_size(&nschedules);
+#endif
 
     b = nxt_buf_mem_alloc(port->mem_pool, alloc, 0);
     if (nxt_slow_path(b == NULL)) {
@@ -2480,6 +2497,14 @@ nxt_router_status_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
         report->apps_count++;
         app_stat++;
     } nxt_queue_loop;
+
+#if (NXT_HAVE_SCHEDULER)
+    /* The entries of the schedules follow those of the applications. */
+    report->schedules_count = nschedules;
+
+    (void) nxt_schedule_status_report(nxt_status_report_schedules(report),
+                                      b->mem.pos, p);
+#endif
 
     type = NXT_PORT_MSG_RPC_READY_LAST;
 
@@ -2807,6 +2832,11 @@ nxt_router_conf_apply(nxt_task_t *task, void *obj, void *data)
     nxt_router_apps_hash_use(task, rtcf, 1);
 
     nxt_router_engines_post(router, tmcf);
+
+#if (NXT_HAVE_SCHEDULER)
+    /* The configuration cannot fail from here on. */
+    nxt_schedule_conf_apply(task, tmcf->schedules);
+#endif
 
     nxt_queue_add(&router->sockets, &updating_sockets);
     nxt_queue_add(&router->sockets, &creating_sockets);
@@ -3921,6 +3951,14 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             goto fail;
         }
     }
+
+#if (NXT_HAVE_SCHEDULER)
+    ret = nxt_schedule_conf_create(task, tmcf->mem_pool, root,
+                                   &tmcf->schedules);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        goto fail;
+    }
+#endif
 
 #if (NXT_HAVE_NJS)
     js_module = nxt_conf_get_path(root, &js_module_path);

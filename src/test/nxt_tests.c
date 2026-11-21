@@ -730,6 +730,16 @@ main(int argc, char **argv)
         return 1;
     }
 
+#if (NXT_HAVE_SCHEDULER)
+    if (nxt_schedule_slot_test(thr) != NXT_OK) {
+        return 1;
+    }
+
+    if (nxt_schedule_main_test(thr) != NXT_OK) {
+        return 1;
+    }
+#endif
+
 #if (NXT_HAVE_CLONE_NEWUSER)
     if (nxt_clone_creds_test(thr) != NXT_OK) {
         return 1;
