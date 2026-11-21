@@ -76,6 +76,9 @@ jobs:
       - name: Run libunit malformed port message test
         run: ./build/unit_msg_test
 
+      - name: Run libunit wake test
+        run: ./build/unit_wake_test
+
       - name: Run libunit close-provenance test
         run: ./build/unit_close_test
 
