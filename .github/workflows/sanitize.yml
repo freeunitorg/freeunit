@@ -52,6 +52,13 @@ on:
       - '.github/workflows/sanitize.yml'
       - '.github/scripts/check-sanitizer-reports.sh'
       - '.github/sanitizer-allowlist.txt'
+  # The python leg is the slowest (about 6 minutes) and its pytest subset
+  # largely repeats the python legs of build-test.yml, so a pull request
+  # skips it.  It runs on every master and pre-* push, every night and on a
+  # manual run, with the other legs.
+  schedule:
+    - cron: '41 2 * * *'
+  workflow_dispatch:
 
 concurrency:
   # Cancel superseded runs for the same pull request.  Non-PR events fall back
@@ -88,6 +95,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The base list lets the exclude below drop the python leg from a
+        # pull request: an exclude does not remove an include-only entry.
+        runtime: [python, php, go]
+        exclude:
+          - runtime: ${{ github.event_name == 'pull_request' && 'python' || 'none' }}
         include:
           - runtime: python
             apt: python3-dev libpython3-dev
