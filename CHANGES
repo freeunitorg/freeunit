@@ -62,6 +62,12 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        "opcache.restrict_api" is set, when the script is not cached, and on
        PHP older than 8.1.
 
+    *) Bugfix: an application process could be counted as idle while it
+       still ran a request whose client had closed the connection. The
+       process could then get a new request while busy, and idle_timeout
+       could stop it. Now the process returns to the idle processes only
+       after its last message for the request.
+
 
 Changes with FreeUnit 1.37.2                                     09 Nov 2026
 
