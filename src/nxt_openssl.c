@@ -107,6 +107,8 @@ static nxt_int_t nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
     nxt_tls_init_t *tls_init, nxt_bool_t last);
 static nxt_int_t nxt_openssl_chain_file(nxt_task_t *task, SSL_CTX *ctx,
     nxt_tls_conf_t *conf, nxt_mp_t *mp, nxt_bool_t single);
+static nxt_int_t nxt_openssl_session_id_context(nxt_task_t *task,
+    SSL_CTX *ctx);
 #if (NXT_HAVE_OPENSSL_CONF_CMD)
 static nxt_int_t nxt_ssl_conf_commands(nxt_task_t *task, SSL_CTX *ctx,
     nxt_conf_value_t *value, nxt_mp_t *mp);
@@ -291,6 +293,12 @@ nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
     if (nxt_openssl_chain_file(task, ctx, conf, mp,
                                last && bundle->next == NULL)
         != NXT_OK)
+    {
+        goto fail;
+    }
+
+    if (tls_init->sid_ctx_certificate
+        && nxt_openssl_session_id_context(task, ctx) != NXT_OK)
     {
         goto fail;
     }
@@ -501,6 +509,40 @@ clean:
     X509_free(cert);
 
     return ret;
+}
+
+
+/*
+ * A resumed handshake has no certificate exchange, so a session must only be
+ * resumed under the certificate it was established with.  OpenSSL treats a
+ * session of another session id context as a cache miss and does a full
+ * handshake.  The context is the SHA-256 digest of the certificate, which is
+ * SSL_MAX_SID_CTX_LENGTH bytes.
+ */
+
+static nxt_int_t
+nxt_openssl_session_id_context(nxt_task_t *task, SSL_CTX *ctx)
+{
+    X509           *cert;
+    unsigned int   len;
+    unsigned char  digest[EVP_MAX_MD_SIZE];
+
+    cert = SSL_CTX_get0_certificate(ctx);
+
+    if (cert == NULL || X509_digest(cert, EVP_sha256(), digest, &len) != 1) {
+        nxt_openssl_log_error(task, NXT_LOG_ALERT, "X509_digest() failed");
+        return NXT_ERROR;
+    }
+
+    len = nxt_min(len, SSL_MAX_SID_CTX_LENGTH);
+
+    if (SSL_CTX_set_session_id_context(ctx, digest, len) != 1) {
+        nxt_openssl_log_error(task, NXT_LOG_ALERT,
+                              "SSL_CTX_set_session_id_context() failed");
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
 }
 
 

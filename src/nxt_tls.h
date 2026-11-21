@@ -85,6 +85,8 @@ struct nxt_tls_conf_s {
 struct nxt_tls_init_s {
     size_t                        cache_size;
     nxt_time_t                    timeout;
+    /* The session id context is a digest of the certificate. */
+    uint8_t                       sid_ctx_certificate;  /* 1 bit */
     nxt_conf_value_t              *conf_cmds;
     nxt_conf_value_t              *tickets_conf;
 
