@@ -87,9 +87,63 @@ struct nxt_tls_ticket_s {
 };
 
 
+typedef struct nxt_tls_ticket_ring_s  nxt_tls_ticket_ring_t;
+
+
 struct nxt_tls_tickets_s {
-    nxt_uint_t        count;
-    nxt_tls_ticket_t  tickets[];
+    nxt_uint_t             count;
+
+    /*
+     * Key rotation, "ticket_lifetime": what the configuration asks of the
+     * ring of its listener.  The ring gets it when the configuration is
+     * first used, so a configuration that the router rejects changes nothing.
+     */
+    nxt_tls_ticket_ring_t  *ring;
+    uint64_t               seq;       /* The order of the configurations. */
+    uint64_t               lifetime;  /* Milliseconds. */
+    uint64_t               time;      /* When the configuration was made. */
+
+    nxt_tls_ticket_t       tickets[];
+};
+
+
+/*
+ * Rotating ticket keys.  A ring belongs to a listener name, not to an
+ * SSL_CTX: every reconfiguration builds new contexts, and the keys have to
+ * outlive them.  The newest key issues tickets until it is one lifetime old.
+ * Then a new key is generated, and the old one only decrypts, until it is
+ * two lifetimes old.
+ */
+
+#define NXT_TLS_TICKET_RING_KEYS  16
+
+typedef struct {
+    nxt_tls_ticket_t           ticket;
+    uint64_t                   born;        /* Monotonic milliseconds. */
+    uint8_t                    configured;  /* 1 bit */
+} nxt_tls_ticket_ring_key_t;
+
+
+struct nxt_tls_ticket_ring_s {
+    nxt_tls_ticket_ring_t      *next;
+    nxt_str_t                  listener;
+    nxt_uint_t                 refs;
+
+    /* The policy of the newest configuration that was used. */
+    uint64_t                   seq;
+    uint64_t                   lifetime;    /* Milliseconds. */
+
+    /* The key that was added last is first; only it issues tickets. */
+    nxt_uint_t                 count;
+    nxt_tls_ticket_ring_key_t  keys[NXT_TLS_TICKET_RING_KEYS];
+
+    /*
+     * The names of the configured keys that are gone.  Such a key is not
+     * taken back while the configuration lists it: its old tickets would
+     * work again.
+     */
+    nxt_uint_t                 ndead;
+    u_char                     dead[NXT_TLS_TICKET_KEYS_MAX][16];
 };
 
 
@@ -118,6 +172,28 @@ static nxt_int_t nxt_tls_ticket_keys(nxt_task_t *task, SSL_CTX *ctx,
 static int nxt_tls_ticket_key_callback(SSL *s, unsigned char *name,
     unsigned char *iv, EVP_CIPHER_CTX *ectx, nxt_tls_ticket_mac_t *hctx,
     int enc);
+static int nxt_tls_ticket_crypt(nxt_conn_t *c, nxt_tls_ticket_t *ticket,
+    nxt_uint_t count, nxt_bool_t renew, unsigned char *name,
+    unsigned char *iv, EVP_CIPHER_CTX *ectx, nxt_tls_ticket_mac_t *hctx,
+    int enc);
+static nxt_int_t nxt_tls_ticket_ring_attach(nxt_task_t *task,
+    nxt_tls_init_t *tls_init, nxt_tls_tickets_t *tickets);
+static void nxt_tls_ticket_ring_release(nxt_tls_ticket_ring_t *ring);
+static uint64_t nxt_tls_ticket_ring_lock(nxt_tls_tickets_t *tickets);
+static void nxt_tls_ticket_ring_apply(nxt_tls_tickets_t *tickets,
+    uint64_t now);
+static nxt_bool_t nxt_tls_ticket_ring_has(nxt_tls_ticket_ring_t *ring,
+    const u_char *name);
+static void nxt_tls_ticket_ring_prune(nxt_tls_ticket_ring_t *ring,
+    uint64_t now);
+static void nxt_tls_ticket_ring_push(nxt_tls_ticket_ring_t *ring,
+    nxt_tls_ticket_t *ticket, uint64_t born, nxt_bool_t configured);
+static void nxt_tls_ticket_ring_bury(nxt_tls_ticket_ring_t *ring,
+    nxt_tls_ticket_ring_key_t *key);
+static nxt_int_t nxt_tls_ticket_ring_issue(nxt_task_t *task,
+    nxt_tls_tickets_t *tickets, nxt_tls_ticket_t *ticket);
+static nxt_int_t nxt_tls_ticket_ring_find(nxt_tls_tickets_t *tickets,
+    const u_char *name, nxt_tls_ticket_t *ticket, nxt_bool_t *renew);
 #endif
 #endif
 static void nxt_ssl_session_cache(SSL_CTX *ctx, size_t cache_size,
@@ -163,6 +239,7 @@ const nxt_tls_lib_t  nxt_openssl_lib = {
 
 #if (NXT_TESTS)
 nxt_uint_t  nxt_openssl_test_fail;
+uint64_t    nxt_openssl_test_ticket_msec;
 #endif
 
 
@@ -179,6 +256,14 @@ static nxt_conn_io_t  nxt_openssl_conn_io = {
 
 static long  nxt_openssl_version;
 static int   nxt_openssl_connection_index;
+
+#ifdef NXT_OPENSSL_TICKET_KEY_CB
+/* One lock for the list of the rings and for all that is in them. */
+static nxt_thread_mutex_t     nxt_tls_ticket_ring_mutex =
+                                  PTHREAD_MUTEX_INITIALIZER;
+static nxt_tls_ticket_ring_t  *nxt_tls_ticket_rings;
+static uint64_t               nxt_tls_ticket_ring_seq;
+#endif
 
 
 static nxt_int_t
@@ -612,19 +697,38 @@ nxt_tls_ticket_keys(nxt_task_t *task, SSL_CTX *ctx, nxt_tls_init_t *tls_init,
             goto no_ticket;
         }
 
-        return NXT_OK;
-    }
+        if (tls_init->ticket_lifetime == 0) {
+            return NXT_OK;
+        }
 
-    count = nxt_conf_array_elements_count_or_1(tickets_conf);
+        /* Rotation with generated keys only. */
+        count = 0;
 
-    if (count == 0) {
-        goto no_ticket;
+    } else {
+        count = nxt_conf_array_elements_count_or_1(tickets_conf);
+
+        if (count == 0) {
+            goto no_ticket;
+        }
     }
 
 #ifdef NXT_OPENSSL_TICKET_KEY_CB
 
-    tickets = nxt_mp_get(mp, sizeof(nxt_tls_tickets_t)
-                             + count * sizeof(nxt_tls_ticket_t));
+    if (tls_init->ticket_lifetime != 0) {
+        /*
+         * Without a session cache the context keeps the two hours OpenSSL
+         * gives a ticket, which a rotated key cannot honour.
+         */
+        SSL_CTX_set_timeout(ctx, (long) tls_init->timeout);
+
+        if (tls_init->conf->tickets != NULL) {
+            /* Another certificate of the listener has set the keys up. */
+            goto callback;
+        }
+    }
+
+    tickets = nxt_mp_zget(mp, sizeof(nxt_tls_tickets_t)
+                              + count * sizeof(nxt_tls_ticket_t));
     if (nxt_slow_path(tickets == NULL)) {
         return NXT_ERROR;
     }
@@ -633,7 +737,7 @@ nxt_tls_ticket_keys(nxt_task_t *task, SSL_CTX *ctx, nxt_tls_init_t *tls_init,
     tls_init->conf->tickets = tickets;
     i = 0;
 
-    do {
+    while (i < count) {
         ticket = &tickets->tickets[i];
 
         i++;
@@ -659,8 +763,15 @@ nxt_tls_ticket_keys(nxt_task_t *task, SSL_CTX *ctx, nxt_tls_init_t *tls_init,
             nxt_memcpy(ticket->aes_key, buf + 48, 32);
             ticket->size = 32;
         }
+    }
 
-    } while (i < count);
+    if (tls_init->ticket_lifetime != 0
+        && nxt_tls_ticket_ring_attach(task, tls_init, tickets) != NXT_OK)
+    {
+        return NXT_ERROR;
+    }
+
+callback:
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
     if (SSL_CTX_set_tlsext_ticket_key_evp_cb(ctx, nxt_tls_ticket_key_callback)
@@ -703,15 +814,12 @@ static int
 nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
     EVP_CIPHER_CTX *ectx, nxt_tls_ticket_mac_t *hctx, int enc)
 {
-    nxt_uint_t          i;
+    int                 ret;
+    nxt_bool_t          renew;
     nxt_conn_t          *c;
-    const EVP_MD        *digest;
-    const EVP_CIPHER    *cipher;
-    nxt_tls_ticket_t    *ticket;
+    nxt_tls_ticket_t    key;
+    nxt_tls_tickets_t   *tickets;
     nxt_openssl_conn_t  *tls;
-#if OPENSSL_VERSION_NUMBER >= 0x30000000L
-    OSSL_PARAM          params[2];
-#endif
 
     c = SSL_get_ex_data(s, nxt_openssl_connection_index);
 
@@ -721,7 +829,64 @@ nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
     }
 
     tls = c->u.tls;
-    ticket = tls->conf->tickets->tickets;
+    tickets = tls->conf->tickets;
+
+    if (tickets->ring == NULL) {
+        return nxt_tls_ticket_crypt(c, tickets->tickets, tickets->count, 0,
+                                    name, iv, ectx, hctx, enc);
+    }
+
+    /* The key is copied out of the ring under its lock. */
+
+    renew = 0;
+
+    if (enc == 1) {
+        if (nxt_tls_ticket_ring_issue(c->socket.task, tickets, &key)
+            != NXT_OK)
+        {
+            return -1;
+        }
+
+    } else {
+        if (nxt_tls_ticket_ring_find(tickets, name, &key, &renew) != NXT_OK) {
+            nxt_debug(c->socket.task,
+                      "TLS session ticket decrypt, key not found");
+            return 0;
+        }
+
+#ifdef TLS1_3_VERSION
+        /* A TLS 1.3 client should use a ticket once: RFC 8446, C.4. */
+        if (SSL_version(s) == TLS1_3_VERSION) {
+            renew = 1;
+        }
+#endif
+    }
+
+    ret = nxt_tls_ticket_crypt(c, &key, 1, renew, name, iv, ectx, hctx, enc);
+
+    OPENSSL_cleanse(&key, sizeof(nxt_tls_ticket_t));
+
+    return ret;
+}
+
+
+/*
+ * Sets up the cipher and the MAC of a ticket with ticket[0] to encrypt, or
+ * with the one of "count" keys that has the name to decrypt.  The ticket is
+ * renewed unless ticket[0] decrypts it and "renew" is not set.
+ */
+
+static int
+nxt_tls_ticket_crypt(nxt_conn_t *c, nxt_tls_ticket_t *ticket, nxt_uint_t count,
+    nxt_bool_t renew, unsigned char *name, unsigned char *iv,
+    EVP_CIPHER_CTX *ectx, nxt_tls_ticket_mac_t *hctx, int enc)
+{
+    nxt_uint_t        i;
+    const EVP_MD      *digest;
+    const EVP_CIPHER  *cipher;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    OSSL_PARAM        params[2];
+#endif
 
     i = 0;
 
@@ -755,7 +920,7 @@ nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
                 goto found;
             }
 
-        } while (++i < tls->conf->tickets->count);
+        } while (++i < count);
 
         nxt_debug(c->socket.task, "TLS session ticket decrypt, key not found");
 
@@ -766,7 +931,7 @@ nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
         nxt_debug(c->socket.task,
                   "TLS session ticket decrypt, key number: \"%d\"", i);
 
-        enc = (i == 0) ? 1 : 2 /* renew */;
+        enc = (i == 0 && !renew) ? 1 : 2 /* renew */;
 
         cipher = (ticket[i].size == 16) ? EVP_aes_128_cbc() : EVP_aes_256_cbc();
 
@@ -818,6 +983,420 @@ nxt_tls_ticket_key_callback(SSL *s, unsigned char *name, unsigned char *iv,
 
     return enc;
 }
+
+
+nxt_inline uint64_t
+nxt_tls_ticket_ring_msec(void)
+{
+    nxt_monotonic_time_t  now;
+
+#if (NXT_TESTS)
+    if (nxt_openssl_test_ticket_msec != 0) {
+        return nxt_openssl_test_ticket_msec;
+    }
+#endif
+
+    nxt_monotonic_time(&now);
+
+    return now.monotonic / 1000000;
+}
+
+
+/* A key that was born after "now" was read is new, not very old. */
+
+nxt_inline uint64_t
+nxt_tls_ticket_ring_age(nxt_tls_ticket_ring_key_t *key, uint64_t now)
+{
+    return (now > key->born) ? now - key->born : 0;
+}
+
+
+nxt_inline nxt_bool_t
+nxt_tls_ticket_configured(nxt_tls_tickets_t *tickets, const u_char *name)
+{
+    nxt_uint_t  i;
+
+    for (i = 0; i < tickets->count; i++) {
+        if (memcmp(tickets->tickets[i].name, name, 16) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+/*
+ * Gives the configuration a reference to the ring of its listener.  The
+ * ring itself does not change here: see nxt_tls_ticket_ring_apply().
+ */
+
+static nxt_int_t
+nxt_tls_ticket_ring_attach(nxt_task_t *task, nxt_tls_init_t *tls_init,
+    nxt_tls_tickets_t *tickets)
+{
+    nxt_str_t              *name;
+    nxt_tls_ticket_ring_t  *ring;
+
+    if (tickets->count > NXT_TLS_TICKET_KEYS_MAX) {
+        /* The validation refuses it; "dead" has no room for more. */
+        nxt_alert(task, "too many session ticket keys to rotate");
+        return NXT_ERROR;
+    }
+
+    name = &tls_init->listener;
+
+    nxt_thread_mutex_lock(&nxt_tls_ticket_ring_mutex);
+
+    for (ring = nxt_tls_ticket_rings; ring != NULL; ring = ring->next) {
+        if (nxt_strstr_eq(&ring->listener, name)) {
+            break;
+        }
+    }
+
+    if (ring == NULL) {
+        ring = nxt_zalloc(sizeof(nxt_tls_ticket_ring_t) + name->length);
+        if (nxt_slow_path(ring == NULL)) {
+            nxt_thread_mutex_unlock(&nxt_tls_ticket_ring_mutex);
+            return NXT_ERROR;
+        }
+
+        ring->listener.length = name->length;
+        ring->listener.start = nxt_pointer_to(ring,
+                                              sizeof(nxt_tls_ticket_ring_t));
+        nxt_memcpy(ring->listener.start, name->start, name->length);
+
+        ring->next = nxt_tls_ticket_rings;
+        nxt_tls_ticket_rings = ring;
+    }
+
+    ring->refs++;
+
+    tickets->ring = ring;
+    tickets->seq = ++nxt_tls_ticket_ring_seq;
+    tickets->lifetime = (uint64_t) tls_init->ticket_lifetime * 1000;
+    tickets->time = nxt_tls_ticket_ring_msec();
+
+    nxt_thread_mutex_unlock(&nxt_tls_ticket_ring_mutex);
+
+    return NXT_OK;
+}
+
+
+static void
+nxt_tls_ticket_ring_release(nxt_tls_ticket_ring_t *ring)
+{
+    nxt_tls_ticket_ring_t  **link;
+
+    nxt_thread_mutex_lock(&nxt_tls_ticket_ring_mutex);
+
+    if (--ring->refs == 0) {
+        for (link = &nxt_tls_ticket_rings; *link != ring;
+             link = &(*link)->next)
+        {
+            /* void */
+        }
+
+        *link = ring->next;
+
+        OPENSSL_cleanse(ring->keys, sizeof(ring->keys));
+        nxt_free(ring);
+    }
+
+    nxt_thread_mutex_unlock(&nxt_tls_ticket_ring_mutex);
+}
+
+
+/*
+ * Locks the rings and brings the ring of the configuration up to date.  The
+ * clock is read under the lock, so no key in the ring is born after "now".
+ */
+
+static uint64_t
+nxt_tls_ticket_ring_lock(nxt_tls_tickets_t *tickets)
+{
+    uint64_t  now;
+
+    nxt_thread_mutex_lock(&nxt_tls_ticket_ring_mutex);
+
+    now = nxt_tls_ticket_ring_msec();
+
+    nxt_tls_ticket_ring_apply(tickets, now);
+    nxt_tls_ticket_ring_prune(tickets->ring, now);
+
+    return now;
+}
+
+
+/*
+ * Makes the policy of a configuration the policy of its ring, unless a newer
+ * configuration has done so: the lifetime, and the configured keys the ring
+ * does not have.  A new key is born at the time of its configuration.  This
+ * runs when the configuration is used and not when it is made, because the
+ * router can still reject it then.
+ */
+
+static void
+nxt_tls_ticket_ring_apply(nxt_tls_tickets_t *tickets, uint64_t now)
+{
+    nxt_uint_t             i, n;
+    nxt_tls_ticket_t       *ticket;
+    nxt_tls_ticket_ring_t  *ring;
+
+    ring = tickets->ring;
+
+    if (tickets->seq <= ring->seq) {
+        return;
+    }
+
+    /* What has expired by the old lifetime does not get a new one. */
+    nxt_tls_ticket_ring_prune(ring, now);
+
+    ring->seq = tickets->seq;
+    ring->lifetime = tickets->lifetime;
+
+    /* A dead key that left the configuration is forgotten. */
+
+    n = 0;
+
+    for (i = 0; i < ring->ndead; i++) {
+        if (nxt_tls_ticket_configured(tickets, ring->dead[i])) {
+            nxt_memmove(ring->dead[n++], ring->dead[i], 16);
+        }
+    }
+
+    ring->ndead = n;
+
+    for (i = 0; i < ring->count; i++) {
+        ring->keys[i].configured =
+            nxt_tls_ticket_configured(tickets, ring->keys[i].ticket.name);
+    }
+
+    /* tickets[0] is the newest configured key: it is added last. */
+
+    for (i = tickets->count; i != 0; i--) {
+        ticket = &tickets->tickets[i - 1];
+
+        if (!nxt_tls_ticket_ring_has(ring, ticket->name)) {
+            nxt_tls_ticket_ring_push(ring, ticket, tickets->time, 1);
+        }
+    }
+}
+
+
+/* True if the ring has a key of the name, alive or dead. */
+
+static nxt_bool_t
+nxt_tls_ticket_ring_has(nxt_tls_ticket_ring_t *ring, const u_char *name)
+{
+    nxt_uint_t  i;
+
+    for (i = 0; i < ring->count; i++) {
+        if (memcmp(ring->keys[i].ticket.name, name, 16) == 0) {
+            return 1;
+        }
+    }
+
+    for (i = 0; i < ring->ndead; i++) {
+        if (memcmp(ring->dead[i], name, 16) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+/* Drops the keys that are two lifetimes old. */
+
+static void
+nxt_tls_ticket_ring_prune(nxt_tls_ticket_ring_t *ring, uint64_t now)
+{
+    nxt_uint_t                 i, n;
+    nxt_tls_ticket_ring_key_t  *key;
+
+    n = 0;
+
+    for (i = 0; i < ring->count; i++) {
+        key = &ring->keys[i];
+
+        if (nxt_tls_ticket_ring_age(key, now) >= 2 * ring->lifetime) {
+            nxt_tls_ticket_ring_bury(ring, key);
+            continue;
+        }
+
+        if (n != i) {
+            ring->keys[n] = *key;
+            OPENSSL_cleanse(key, sizeof(nxt_tls_ticket_ring_key_t));
+        }
+
+        n++;
+    }
+
+    ring->count = n;
+}
+
+
+static void
+nxt_tls_ticket_ring_push(nxt_tls_ticket_ring_t *ring, nxt_tls_ticket_t *ticket,
+    uint64_t born, nxt_bool_t configured)
+{
+    nxt_tls_ticket_ring_key_t  *key;
+
+    if (ring->count == NXT_TLS_TICKET_RING_KEYS) {
+        /* The oldest key gives way; its tickets get a full handshake. */
+        ring->count--;
+        nxt_tls_ticket_ring_bury(ring, &ring->keys[ring->count]);
+    }
+
+    key = ring->keys;
+
+    nxt_memmove(key + 1, key,
+                ring->count * sizeof(nxt_tls_ticket_ring_key_t));
+
+    key->ticket = *ticket;
+    key->born = born;
+    key->configured = configured;
+
+    ring->count++;
+}
+
+
+/* Wipes a key.  The name of a configured key is kept: see "dead". */
+
+static void
+nxt_tls_ticket_ring_bury(nxt_tls_ticket_ring_t *ring,
+    nxt_tls_ticket_ring_key_t *key)
+{
+    if (key->configured && ring->ndead < NXT_TLS_TICKET_KEYS_MAX) {
+        nxt_memcpy(ring->dead[ring->ndead++], key->ticket.name, 16);
+    }
+
+    OPENSSL_cleanse(key, sizeof(nxt_tls_ticket_ring_key_t));
+}
+
+
+/* Copies out the key that issues tickets now, generating one if needed. */
+
+static nxt_int_t
+nxt_tls_ticket_ring_issue(nxt_task_t *task, nxt_tls_tickets_t *tickets,
+    nxt_tls_ticket_t *ticket)
+{
+    uint64_t               now;
+    nxt_int_t              ret;
+    nxt_bool_t             stale;
+    nxt_tls_ticket_ring_t  *ring;
+
+    ret = NXT_OK;
+    stale = 0;
+    ring = tickets->ring;
+
+    now = nxt_tls_ticket_ring_lock(tickets);
+
+    if (ring->count == 0
+        || nxt_tls_ticket_ring_age(ring->keys, now) >= ring->lifetime)
+    {
+        stale = (ring->count != 0 && ring->keys[0].configured);
+
+        ticket->size = 32;
+
+        if (RAND_bytes(ticket->name, 16) == 1
+            && RAND_bytes(ticket->hmac_key, 32) == 1
+            && RAND_bytes(ticket->aes_key, 32) == 1)
+        {
+            nxt_tls_ticket_ring_push(ring, ticket, now, 0);
+
+        } else {
+            ret = NXT_ERROR;
+        }
+    }
+
+    *ticket = ring->keys[0].ticket;
+
+    nxt_thread_mutex_unlock(&nxt_tls_ticket_ring_mutex);
+
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_openssl_log_error(task, NXT_LOG_ALERT, "RAND_bytes() failed");
+        return NXT_ERROR;
+    }
+
+    if (stale) {
+        nxt_log(task, NXT_LOG_WARN, "listener \"%V\": the newest configured "
+                "TLS session ticket key is older than \"ticket_lifetime\", "
+                "a generated key issues the tickets until a new key is "
+                "configured", &ring->listener);
+    }
+
+    return NXT_OK;
+}
+
+
+/*
+ * Copies out the key of the name if the ring still has it.  "renew" is set
+ * if the key no longer issues: the client then gets a ticket of the newest
+ * key along with the resumed session.
+ */
+
+static nxt_int_t
+nxt_tls_ticket_ring_find(nxt_tls_tickets_t *tickets, const u_char *name,
+    nxt_tls_ticket_t *ticket, nxt_bool_t *renew)
+{
+    uint64_t                   now;
+    nxt_int_t                  ret;
+    nxt_uint_t                 i;
+    nxt_tls_ticket_ring_t      *ring;
+    nxt_tls_ticket_ring_key_t  *key;
+
+    ret = NXT_DECLINED;
+    ring = tickets->ring;
+
+    now = nxt_tls_ticket_ring_lock(tickets);
+
+    for (i = 0; i < ring->count; i++) {
+        key = &ring->keys[i];
+
+        if (memcmp(name, key->ticket.name, 16) == 0) {
+            *ticket = key->ticket;
+            *renew = (i != 0
+                      || nxt_tls_ticket_ring_age(key, now) >= ring->lifetime);
+
+            ret = NXT_OK;
+            break;
+        }
+    }
+
+    nxt_thread_mutex_unlock(&nxt_tls_ticket_ring_mutex);
+
+    return ret;
+}
+
+
+#if (NXT_TESTS)
+
+nxt_int_t
+nxt_openssl_test_ticket_key(nxt_task_t *task, nxt_tls_conf_t *conf,
+    u_char *name, nxt_bool_t issue)
+{
+    nxt_int_t         ret;
+    nxt_bool_t        renew;
+    nxt_tls_ticket_t  ticket;
+
+    if (issue) {
+        ret = nxt_tls_ticket_ring_issue(task, conf->tickets, &ticket);
+
+        if (ret == NXT_OK) {
+            nxt_memcpy(name, ticket.name, 16);
+        }
+
+        return ret;
+    }
+
+    ret = nxt_tls_ticket_ring_find(conf->tickets, name, &ticket, &renew);
+
+    return (ret == NXT_OK && renew) ? NXT_AGAIN : ret;
+}
+
+#endif
 
 #endif /* NXT_OPENSSL_TICKET_KEY_CB */
 
@@ -1184,6 +1763,13 @@ nxt_openssl_server_free(nxt_task_t *task, nxt_tls_conf_t *conf)
     if (conf->tickets) {
         nxt_memzero(conf->tickets->tickets,
                     conf->tickets->count * sizeof(nxt_tls_ticket_t));
+
+#ifdef NXT_OPENSSL_TICKET_KEY_CB
+        if (conf->tickets->ring != NULL) {
+            nxt_tls_ticket_ring_release(conf->tickets->ring);
+            conf->tickets->ring = NULL;
+        }
+#endif
     }
 
 #if (OPENSSL_VERSION_NUMBER >= 0x1010100fL \

@@ -108,6 +108,10 @@ static nxt_int_t nxt_conf_vldt_certificate_element(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value);
 static nxt_int_t nxt_conf_vldt_tls_cache_size(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_tls_session(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
+static nxt_int_t nxt_conf_vldt_tls_ticket_lifetime(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data);
 static nxt_int_t nxt_conf_vldt_tls_timeout(nxt_conf_validation_t *vldt,
     nxt_conf_value_t *value, void *data);
 #if (NXT_HAVE_OPENSSL_TLSEXT)
@@ -684,7 +688,7 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_tls_members[] = {
     }, {
         .name       = nxt_string("session"),
         .type       = NXT_CONF_VLDT_OBJECT,
-        .validator  = nxt_conf_vldt_object,
+        .validator  = nxt_conf_vldt_tls_session,
         .u.members  = nxt_conf_vldt_session_members,
     },
 
@@ -712,10 +716,86 @@ static nxt_conf_vldt_object_t  nxt_conf_vldt_session_members[] = {
         .validator  = nxt_conf_vldt_unsupported,
         .u.string   = "tickets",
 #endif
+    }, {
+        .name       = nxt_string("ticket_lifetime"),
+        .type       = NXT_CONF_VLDT_INTEGER,
+#if (NXT_HAVE_OPENSSL_TLSEXT)
+        .validator  = nxt_conf_vldt_tls_ticket_lifetime,
+#else
+        .validator  = nxt_conf_vldt_unsupported,
+        .u.string   = "ticket_lifetime",
+#endif
     },
 
     NXT_CONF_VLDT_END
 };
+
+
+/* "ticket_lifetime" rotates the ticket keys, so it needs "tickets". */
+
+static nxt_int_t
+nxt_conf_vldt_tls_session(nxt_conf_validation_t *vldt, nxt_conf_value_t *value,
+    void *data)
+{
+    nxt_int_t         ret;
+    nxt_conf_value_t  *tickets;
+
+    static const nxt_str_t  tickets_name = nxt_string("tickets");
+    static const nxt_str_t  lifetime_name = nxt_string("ticket_lifetime");
+
+    ret = nxt_conf_vldt_object(vldt, value, data);
+    if (ret != NXT_OK) {
+        return ret;
+    }
+
+    if (nxt_conf_get_object_member(value, &lifetime_name, NULL) == NULL) {
+        return NXT_OK;
+    }
+
+    tickets = nxt_conf_get_object_member(value, &tickets_name, NULL);
+
+    if (tickets == NULL
+        || (nxt_conf_type(tickets) == NXT_CONF_BOOLEAN
+            ? !nxt_conf_get_boolean(tickets)
+            : nxt_conf_array_elements_count_or_1(tickets) == 0))
+    {
+        return nxt_conf_vldt_error(vldt, "The \"ticket_lifetime\" option "
+                                   "requires \"tickets\" to be enabled.");
+    }
+
+    if (nxt_conf_type(tickets) != NXT_CONF_BOOLEAN
+        && nxt_conf_array_elements_count_or_1(tickets)
+           > NXT_TLS_TICKET_KEYS_MAX)
+    {
+        return nxt_conf_vldt_error(vldt, "With \"ticket_lifetime\" the "
+                                   "\"tickets\" option must not list more "
+                                   "than %d keys.", NXT_TLS_TICKET_KEYS_MAX);
+    }
+
+    return NXT_OK;
+}
+
+
+#if (NXT_HAVE_OPENSSL_TLSEXT)
+
+static nxt_int_t
+nxt_conf_vldt_tls_ticket_lifetime(nxt_conf_validation_t *vldt,
+    nxt_conf_value_t *value, void *data)
+{
+    double  lifetime;
+
+    lifetime = nxt_conf_get_number(value);
+
+    if (lifetime < 1 || lifetime > NXT_INT32_T_MAX) {
+        return nxt_conf_vldt_error(vldt, "The \"ticket_lifetime\" number "
+                                   "must be between 1 and %d.",
+                                   NXT_INT32_T_MAX);
+    }
+
+    return NXT_OK;
+}
+
+#endif
 
 
 static nxt_int_t

@@ -8139,6 +8139,22 @@ components:
         tickets:
           $ref: "#/components/schemas/configListenerTlsSessionTickets"
 
+        ticket_lifetime:
+          type: integer
+          minimum: 1
+          description: "Rotates the session ticket keys; requires `tickets`.
+            A key issues tickets for this many seconds and decrypts them
+            for as many more; then it is dropped, and its tickets get a
+            full handshake. The keys survive a reconfiguration, not a
+            restart. With `tickets` set to `true` the keys are generated.
+            Keys listed in `tickets`, at most 8, are aged from the
+            configuration that first lists them, and a listed key that has
+            expired is not used again: replace the newest one at least once
+            per lifetime, else a generated key takes over. With this option
+            `timeout` also limits the lifetime of a ticket; keep it at or
+            below this value. Without this option ticket keys do not
+            expire."
+
     # /config/listeners/{listenerName}/tls/session/tickets
     configListenerTlsSessionTickets:
       description: "Configures TLS session tickets."

@@ -69,6 +69,18 @@ checks it.  The source tarball also has a .sha256 checksum file next to its
 
 <change type="feature">
 <para>
+the "ticket_lifetime" option of the TLS "session" object of a listener rotates
+the session ticket keys.  A key issues tickets for that many seconds and
+decrypts them for as many more, and a reconfiguration keeps the keys: a ticket
+can be resumed for one lifetime after it was issued, and none is accepted two
+lifetimes after its key was created.  With "tickets" set to true the keys are
+generated; keys from the configuration are aged from the moment they are first
+seen.  Session tickets stay off by default.
+</para>
+</change>
+
+<change type="feature">
+<para>
 PHP exposes the decoded, normalized request path, without the query, in
 $_SERVER['UNIT_REWRITTEN_PATH'] when it differs from the target's path in
 REQUEST_URI, or after a route "rewrite" action.  It is absent for a request
