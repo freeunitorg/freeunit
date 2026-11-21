@@ -298,17 +298,5 @@
     "file": "src/wasm/nxt_wasm.c",
     "function": "nxt_wasm_do_send_headers",
     "text": "rh->nfields"
-  },
-  {
-    "ruleId": "unchecked-realloc",
-    "file": "src/nxt_isolation.c",
-    "function": "nxt_isolation_make_private_mount",
-    "text": "mounts = nxt_realloc(mounts, nmounts)"
-  },
-  {
-    "ruleId": "unchecked-realloc",
-    "file": "src/nxt_isolation.c",
-    "function": "nxt_isolation_make_private_mount",
-    "text": "shared = nxt_realloc(shared, nmounts)"
   }
 ]
