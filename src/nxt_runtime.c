@@ -426,9 +426,11 @@ nxt_runtime_initial_start(nxt_task_t *task, nxt_uint_t status)
         }
     }
 
-    ret = nxt_runtime_pid_file_create(task, rt->pid_file);
-    if (ret != NXT_OK) {
-        goto fail;
+    if (rt->pid_file != NULL) {
+        ret = nxt_runtime_pid_file_create(task, rt->pid_file);
+        if (ret != NXT_OK) {
+            goto fail;
+        }
     }
 
     if (nxt_runtime_event_engine_change(task, rt) != NXT_OK) {
@@ -710,7 +712,7 @@ nxt_runtime_exit(nxt_task_t *task, void *obj, void *data)
 
             sa = rt->controller_listen;
 
-            if (sa->u.sockaddr.sa_family == AF_UNIX) {
+            if (sa != NULL && sa->u.sockaddr.sa_family == AF_UNIX) {
                 name = (nxt_file_name_t *) sa->u.sockaddr_un.sun_path;
                 (void) nxt_file_delete(name);
             }
@@ -949,12 +951,14 @@ nxt_runtime_conf_init(nxt_task_t *task, nxt_runtime_t *rt)
 
     rt->engine = interface->name;
 
-    ret = nxt_file_name_create(rt->mem_pool, &file_name, "%s%Z", rt->pid);
-    if (nxt_slow_path(ret != NXT_OK)) {
-        return NXT_ERROR;
-    }
+    if (rt->pid != NULL) {
+        ret = nxt_file_name_create(rt->mem_pool, &file_name, "%s%Z", rt->pid);
+        if (nxt_slow_path(ret != NXT_OK)) {
+            return NXT_ERROR;
+        }
 
-    rt->pid_file = file_name.start;
+        rt->pid_file = file_name.start;
+    }
 
     ret = nxt_file_name_create(rt->mem_pool, &file_name, "%s%Z", rt->log);
     if (nxt_slow_path(ret != NXT_OK)) {
@@ -1048,6 +1052,10 @@ nxt_runtime_conf_init(nxt_task_t *task, nxt_runtime_t *rt)
                   "mkdir(%s) failed %E", file_name.start, nxt_errno);
     }
 
+    if (rt->control == NULL) {
+        return NXT_OK;
+    }
+
     control.length = nxt_strlen(rt->control);
     control.start = (u_char *) rt->control;
 
@@ -1114,6 +1122,7 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
         "\n"
         "  --control ADDRESS    set address of control API socket\n"
         "                       default: \"" NXT_CONTROL_SOCK "\"\n"
+        "                       \"none\" disables the control API\n"
         "\n"
         "  --control-mode MODE  set mode of the control API socket\n"
         "                       default: 0600\n"
@@ -1122,7 +1131,7 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
         "\n"
         "  --control-group GROUP  set the group of the control API socket\n"
         "\n"
-        "  --pid FILE           set pid filename\n"
+        "  --pid FILE           set pid filename; \"none\" writes no pid file\n"
         "                       default: \"" NXT_PID "\"\n"
         "\n"
         "  --log FILE           set log filename\n"
@@ -1165,7 +1174,7 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
 
             p = *argv++;
 
-            rt->control = p;
+            rt->control = (nxt_strcmp(p, "none") == 0) ? NULL : p;
 
             continue;
         }
@@ -1246,7 +1255,7 @@ nxt_runtime_conf_read_cmd(nxt_task_t *task, nxt_runtime_t *rt)
 
             p = *argv++;
 
-            rt->pid = p;
+            rt->pid = (nxt_strcmp(p, "none") == 0) ? NULL : p;
 
             continue;
         }
