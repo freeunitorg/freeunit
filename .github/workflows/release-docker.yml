@@ -4,7 +4,9 @@
 #
 # Architecture:
 #   setup -> build (variants x 2 native archs, max 20 parallel;
-#                   or a filtered subset when `inputs.variants` is passed)
+#                   or a filtered subset when `inputs.variants` is passed;
+#                   each image is pushed by digest, checked, and only then
+#                   tagged `<version>-<variant>-<arch>`)
 #         -> merge (per variant: combines -amd64 and -arm64 into multi-arch
 #                   manifests for `<version>-<variant>`, `latest-<variant>`,
 #                   and immutable `<version>-<variant>-<YYYYMMDD>`)
@@ -259,6 +261,7 @@ jobs:
           echo "Base image: ${base_name}@${base_digest} (runtime_version=${runtime_version})"
 
       - name: Build and push (${{ matrix.arch.name }})
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: pkg/docker
@@ -272,10 +275,13 @@ jobs:
           build-args: |
             UNIT_VERSION=${{ needs.setup.outputs.version }}
             SOURCE_DATE_EPOCH=${{ needs.setup.outputs.source_date_epoch }}
-          push: true
+          # Pushed by digest, without a tag.  The per-arch tag is set by
+          # "Tag the verified image" below, after the checks, so an image
+          # that fails a check is never public under a tag.
           tags: |
-            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}:${{ needs.setup.outputs.version }}-${{ matrix.variant }}-${{ matrix.arch.name }}
-            ${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}:${{ needs.setup.outputs.version }}-${{ matrix.variant }}-${{ matrix.arch.name }}
+            ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}
+            ${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.source=https://github.com/freeunitorg/freeunit
             org.opencontainers.image.version=${{ needs.setup.outputs.version }}
@@ -293,10 +299,30 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.arch.name }}-${{ matrix.variant }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch.name }}-${{ matrix.variant }}
 
+      - name: Verify runtime floor (${{ matrix.arch.name }})
+        env:
+          # The image of this build, by digest: a later push to the same tag
+          # cannot change what is checked here or published from here.
+          IMAGE: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.arch.platform }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          # The runtime in the pushed image must be at or above the
+          # "min_patch" of its version in pkg/eol.json.  The base tags
+          # float, so only the image itself tells which patch release it
+          # carries.  A failure stops this job, so the image gets no
+          # per-arch tag, and the merge job creates no final tag and no
+          # floating tag for this variant.  A SKIP (a version without a
+          # floor) passes; an unknown variant fails.
+          docker pull --platform "${PLATFORM}" "${IMAGE}"
+          pkg/docker/verify-runtime-floor.sh "${IMAGE}" "${VARIANT}"
+
       - name: Verify PHP image (${{ matrix.arch.name }})
         if: startsWith(matrix.variant, 'php-')
         env:
-          IMAGE: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}:${{ needs.setup.outputs.version }}-${{ matrix.variant }}-${{ matrix.arch.name }}
+          # The image of this build, by digest: a later push to the same tag
+          # cannot change what is checked here or published from here.
+          IMAGE: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           PLATFORM: ${{ matrix.arch.platform }}
         run: |
           # The check reads four values inside the pushed image: the PHP
@@ -310,11 +336,54 @@ jobs:
           docker pull --platform "${PLATFORM}" "${IMAGE}"
           make -C pkg/docker verify IMAGE="${IMAGE}" VERSION="${{ needs.setup.outputs.version }}"
 
+      # The checks passed: only now does the image get its per-arch tag in
+      # both registries.  --prefer-index=false copies the manifest as it
+      # is, so the tag points at the digest that was checked.
+      - name: Tag the verified image (${{ matrix.arch.name }})
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ needs.setup.outputs.version }}-${{ matrix.variant }}-${{ matrix.arch.name }}
+        run: |
+          for REPO in \
+            "${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}" \
+            "${{ env.DOCKERHUB_REGISTRY }}/${{ env.DOCKERHUB_IMAGE_NAME }}"; do
+            docker buildx imagetools create --prefer-index=false \
+              --tag "${REPO}:${TAG}" "${REPO}@${DIGEST}"
+          done
+
+      # The merge job publishes a variant only when both architectures
+      # leave this marker, so a variant that fails a check above (the
+      # runtime floor, the PHP image) does not stop the other variants.
+      # The marker holds the digest of the checked image, and the merge
+      # job publishes that digest, not the per-arch tag.  So a marker from
+      # an earlier attempt of the run can only publish the image it was
+      # made for, never a later push that failed its checks.
+      - name: Mark the image verified (${{ matrix.arch.name }})
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          case "${DIGEST}" in
+          sha256:????????????????????????????????????????????????????????????????) ;;
+          *) echo "::error::no image digest from the build step: '${DIGEST}'"; exit 1 ;;
+          esac
+          echo "${DIGEST}" \
+            > "verified-${{ matrix.variant }}-${{ matrix.arch.name }}.txt"
+
+      - name: Upload the verified marker (${{ matrix.arch.name }})
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: verified-${{ matrix.variant }}-${{ matrix.arch.name }}
+          overwrite: true
+          path: verified-${{ matrix.variant }}-${{ matrix.arch.name }}.txt
+
   # ---------------------------------------------------------------------------
   # 3. Merge amd64 + arm64 into multi-arch manifests and push final tags
   # ---------------------------------------------------------------------------
   merge:
     needs: [setup, build]
+    # Each variant decides for itself: a failed build leg of one variant
+    # (for example a runtime below its floor) must not skip the others.
+    if: ${{ !cancelled() && needs.setup.result == 'success' }}
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
@@ -322,6 +391,16 @@ jobs:
       matrix:
         variant: ${{ fromJSON(needs.setup.outputs.variants) }}
     steps:
+      - name: Download the verified markers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: verified-${{ matrix.variant }}-*
+          path: verified
+          # One flat directory whatever the number of markers: without it,
+          # a single artifact is extracted without its own subdirectory.
+          merge-multiple: true
+
       - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
@@ -338,8 +417,51 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Create and push multi-arch manifest
+      # "Re-run failed jobs" runs this job again for every variant, also
+      # for one that this run already published and whose per-arch tags
+      # the cleanup job then deleted.  The build-date tag of this run
+      # tells that apart from a variant that still needs its merge.
+      - name: Skip a variant already published by this run
+        id: done
         env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          BUILD_DATE: ${{ needs.setup.outputs.build_date }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          GHCR_REPO="${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}"
+          if ! docker buildx imagetools inspect "${GHCR_REPO}:${VERSION}-${VARIANT}-amd64" >/dev/null 2>&1 \
+            && docker buildx imagetools inspect "${GHCR_REPO}:${VERSION}-${VARIANT}-${BUILD_DATE}" >/dev/null 2>&1
+          then
+            echo "::notice::${VARIANT}: already published by this run as ${VERSION}-${VARIANT}-${BUILD_DATE}"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require both architectures verified
+        id: verified
+        if: steps.done.outputs.skip != 'true'
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          missing=
+          for arch in amd64 arm64; do
+            f="verified/verified-${VARIANT}-${arch}.txt"
+            digest=$(cat "${f}" 2>/dev/null || true)
+            if printf '%s' "${digest}" | grep -qE '^sha256:[0-9a-f]{64}$'; then
+              echo "digest_${arch}=${digest}" >> "$GITHUB_OUTPUT"
+            else
+              missing="${missing} ${arch}"
+            fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error::${VARIANT}: no verified image for${missing}; see the build job.  No tag is published for this variant."
+            exit 1
+          fi
+
+      - name: Create and push multi-arch manifest
+        if: steps.done.outputs.skip != 'true'
+        env:
+          DIGEST_AMD64: ${{ steps.verified.outputs.digest_amd64 }}
+          DIGEST_ARM64: ${{ steps.verified.outputs.digest_arm64 }}
           VERSION: ${{ needs.setup.outputs.version }}
           REVISION: ${{ needs.setup.outputs.revision }}
           BUILD_DATE: ${{ needs.setup.outputs.build_date }}
@@ -348,7 +470,7 @@ jobs:
         run: |
           GHCR_REPO="${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}"
 
-          raw_idx=$(docker buildx imagetools inspect --raw "${GHCR_REPO}:${VERSION}-${VARIANT}-amd64")
+          raw_idx=$(docker buildx imagetools inspect --raw "${GHCR_REPO}@${DIGEST_AMD64}")
           BASE_NAME=$(jq -r '(.annotations["org.opencontainers.image.base.name"] // .manifests[0].annotations["org.opencontainers.image.base.name"]) // empty' <<< "${raw_idx}")
           RUNTIME_VER=$(jq -r '(.annotations["org.freeunit.runtime.version"] // .manifests[0].annotations["org.freeunit.runtime.version"]) // empty' <<< "${raw_idx}")
           EXTRA_ANNOTATIONS=()
@@ -381,64 +503,131 @@ jobs:
               --annotation "index:org.opencontainers.image.version=${VERSION}" \
               --annotation "index:org.opencontainers.image.revision=${REVISION}" \
               "${EXTRA_ANNOTATIONS[@]}" \
-              "${REPO}:${VERSION}-${VARIANT}-amd64" \
-              "${REPO}:${VERSION}-${VARIANT}-arm64"
+              "${REPO}@${DIGEST_AMD64}" \
+              "${REPO}@${DIGEST_ARM64}"
             docker buildx imagetools inspect "${REPO}:${VERSION}-${VARIANT}"
           done
+
+      # The marker names the per-arch images that went into the manifest.
+      # The cleanup job deletes a per-arch tag only while it still points
+      # at that image, so a marker of an earlier attempt of the run does
+      # not delete the inputs of a merge that failed in this attempt.
+      - name: Mark the variant merged
+        if: steps.done.outputs.skip != 'true'
+        env:
+          VARIANT: ${{ matrix.variant }}
+          DIGEST_AMD64: ${{ steps.verified.outputs.digest_amd64 }}
+          DIGEST_ARM64: ${{ steps.verified.outputs.digest_arm64 }}
+        run: |
+          printf '%s amd64 %s\n%s arm64 %s\n' \
+            "${VARIANT}" "${DIGEST_AMD64}" "${VARIANT}" "${DIGEST_ARM64}" \
+            > "merged-${VARIANT}.txt"
+
+      - name: Upload the merged marker
+        if: steps.done.outputs.skip != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+        with:
+          name: merged-${{ matrix.variant }}
+          overwrite: true
+          path: merged-${{ matrix.variant }}.txt
 
   # ---------------------------------------------------------------------------
   # 4. Delete temporary per-arch tags (-amd64, -arm64) from both registries
   # ---------------------------------------------------------------------------
   cleanup:
     needs: [setup, merge]
-    if: always() && needs.merge.result == 'success'
+    # Only the per-arch images that were merged lose their tags.  A
+    # variant whose merge failed keeps them, so its merge can be re-run.
+    if: ${{ !cancelled() && needs.setup.result == 'success' }}
     runs-on: ubuntu-26.04
     steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Download the merged markers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c   # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: merged-*
+          path: merged
+          merge-multiple: true
+
+      # A per-arch tag is deleted only while it still points at the image
+      # that its marker says was merged.  The same digest is pushed to
+      # both registries, so GHCR answers for both.
+      - name: List the merged per-arch tags
+        id: merged
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+        run: |
+          shopt -s nullglob
+          GHCR_REPO="${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}"
+          tags=()
+          for f in merged/merged-*.txt; do
+            while read -r variant arch digest; do
+              [ -n "${digest}" ] || continue
+              tag="${VERSION}-${variant}-${arch}"
+              now=$(docker buildx imagetools inspect "${GHCR_REPO}:${tag}" \
+                --format '{{.Manifest.Digest}}' 2>/dev/null || true)
+              if [ "${now}" = "${digest}" ]; then
+                tags+=("${tag}")
+              else
+                echo "Keeping ${tag}: it is not the merged image ${digest} (now '${now}')"
+              fi
+            done < "${f}"
+          done
+          if [ "${#tags[@]}" -eq 0 ]; then
+            list='[]'
+          else
+            list=$(printf '%s\n' "${tags[@]}" | jq -R . | jq -cs .)
+          fi
+          echo "tags=${list}" >> "$GITHUB_OUTPUT"
+          echo "Per-arch tags to delete: ${list}"
+
       - name: Delete temporary tags from Docker Hub
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          VERSION: ${{ needs.setup.outputs.version }}
-          VARIANTS: ${{ needs.setup.outputs.variants }}
+          TAGS: ${{ steps.merged.outputs.tags }}
         run: |
           TOKEN=$(curl -sf -X POST https://hub.docker.com/v2/users/login \
             -H "Content-Type: application/json" \
             -d "{\"username\": \"${DOCKERHUB_USERNAME}\", \"password\": \"${DOCKERHUB_TOKEN}\"}" \
             | jq -r '.token')
 
-          for variant in $(echo "${VARIANTS}" | jq -r '.[]'); do
-            for arch in amd64 arm64; do
-              tag="${VERSION}-${variant}-${arch}"
-              echo "Deleting Docker Hub tag: ${tag}"
-              curl -sf -X DELETE \
-                "https://hub.docker.com/v2/repositories/${DOCKERHUB_IMAGE_NAME}/tags/${tag}/" \
-                -H "Authorization: JWT ${TOKEN}" || echo "Warning: failed to delete ${tag}"
-            done
+          for tag in $(echo "${TAGS}" | jq -r '.[]'); do
+            echo "Deleting Docker Hub tag: ${tag}"
+            curl -sf -X DELETE \
+              "https://hub.docker.com/v2/repositories/${DOCKERHUB_IMAGE_NAME}/tags/${tag}/" \
+              -H "Authorization: JWT ${TOKEN}" || echo "Warning: failed to delete ${tag}"
           done
 
       - name: Delete temporary tags from GHCR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.setup.outputs.version }}
-          VARIANTS: ${{ needs.setup.outputs.variants }}
+          TAGS: ${{ steps.merged.outputs.tags }}
         run: |
           # Fetch all package versions once and map tag -> version ID locally
           PACKAGE_VERSIONS=$(gh api --paginate \
             "/orgs/${{ github.repository_owner }}/packages/container/freeunit/versions" \
             --jq '.[] | {id: .id, tags: .metadata.container.tags}')
 
-          for variant in $(echo "${VARIANTS}" | jq -r '.[]'); do
-            for arch in amd64 arm64; do
-              tag="${VERSION}-${variant}-${arch}"
-              version_id=$(echo "${PACKAGE_VERSIONS}" \
-                | jq -r "select(.tags[]? == \"${tag}\") | .id" | head -n1)
-              if [ -n "${version_id}" ]; then
-                echo "Deleting GHCR tag: ${tag} (version ${version_id})"
-                gh api --method DELETE \
-                  "/orgs/${{ github.repository_owner }}/packages/container/freeunit/versions/${version_id}" \
-                  || echo "Warning: failed to delete ${tag}"
-              else
-                echo "GHCR tag ${tag} not found, skipping"
-              fi
-            done
+          for tag in $(echo "${TAGS}" | jq -r '.[]'); do
+            version_id=$(echo "${PACKAGE_VERSIONS}" \
+              | jq -r "select(.tags[]? == \"${tag}\") | .id" | head -n1)
+            if [ -n "${version_id}" ]; then
+              echo "Deleting GHCR tag: ${tag} (version ${version_id})"
+              gh api --method DELETE \
+                "/orgs/${{ github.repository_owner }}/packages/container/freeunit/versions/${version_id}" \
+                || echo "Warning: failed to delete ${tag}"
+            else
+              echo "GHCR tag ${tag} not found, skipping"
+            fi
           done

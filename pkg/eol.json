@@ -4,6 +4,7 @@
   "_policy_os": "Each OS version is supported for 3 years (36 months) after upstream EOL. EOL dates: https://endoflife.date",
   "_grace_runtimes": 12,
   "_grace_os": 36,
+  "_min_patch": "min_patch is the security floor of a runtime version: the first patch release that carries the fix of a known security defect. release-docker.yml runs pkg/docker/verify-runtime-floor.sh in every image and does not publish one below its floor. Raise it when the runtime announces a security release (RELEASE-PROCESS.md, Runtime security floors).",
   "_date_format": "eol and supported_until use YYYY-MM. default_python reflects what the OS ships, not necessarily an active runtime version.",
   "os": {
     "fedora": [
@@ -51,11 +52,11 @@
       {"version": "1.27", "eol": "2027-08", "supported_until": "2028-08"}
     ],
     "java": [
-      {"version": "17", "eol": "2027-10", "supported_until": "2028-10", "base": "eclipse-temurin", "lts": true},
-      {"version": "21", "eol": "2029-12", "supported_until": "2030-12", "base": "eclipse-temurin", "lts": true},
-      {"version": "25", "eol": "2031-09", "supported_until": "2032-09", "base": "eclipse-temurin", "lts": true},
+      {"version": "17", "eol": "2027-10", "supported_until": "2028-10", "base": "eclipse-temurin", "lts": true, "min_patch": "17.0.21.1"},
+      {"version": "21", "eol": "2029-12", "supported_until": "2030-12", "base": "eclipse-temurin", "lts": true, "min_patch": "21.0.13.1"},
+      {"version": "25", "eol": "2031-09", "supported_until": "2032-09", "base": "eclipse-temurin", "lts": true, "min_patch": "25.0.5.1"},
       {"version": "26", "eol": "2026-09", "supported_until": "2027-09", "base": "eclipse-temurin", "note": "EOL"},
-      {"version": "27", "eol": "2027-03", "supported_until": "2028-03", "base": "eclipse-temurin"}
+      {"version": "27", "eol": "2027-03", "supported_until": "2028-03", "base": "eclipse-temurin", "min_patch": "27.0.1.1"}
     ],
     "node": [
       {"version": "22", "eol": "2027-04", "supported_until": "2028-04"},
@@ -80,9 +81,9 @@
       {"version": "3.15", "eol": "2031-10", "supported_until": "2032-10", "slim": true}
     ],
     "ruby": [
-      {"version": "3.3", "eol": "2027-03", "supported_until": "2028-03"},
-      {"version": "3.4", "eol": "2028-03", "supported_until": "2029-03"},
-      {"version": "4.0", "eol": "2029-03", "supported_until": "2030-03"}
+      {"version": "3.3", "eol": "2027-03", "supported_until": "2028-03", "min_patch": "3.3.14"},
+      {"version": "3.4", "eol": "2028-03", "supported_until": "2029-03", "min_patch": "3.4.13"},
+      {"version": "4.0", "eol": "2029-03", "supported_until": "2030-03", "min_patch": "4.0.10"}
     ],
     "wasm": [
       {"version": null, "eol": null, "supported_until": null}
