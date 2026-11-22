@@ -196,6 +196,15 @@ Changes with FreeUnit 1.37.3                                     17 Nov 2026
        old one kept the requests in the old directory. The directory is now
        resolved on every request, as with a non-thread-safe PHP.
 
+    *) Bugfix: a PHP worker did not run the per-child start of PHP after it
+       forked from the prototype process, which PHP 8.5 and later need. So
+       every worker of an application shared one Zend memory-manager heap
+       key: a deterministic sequence across the workers, which weakened the
+       heap-overflow check of PHP, and a PHP built with debugging stopped
+       each worker with an assertion at the end of its first request. The
+       worker now runs this start step, as the PHP FPM, CGI and Apache
+       processes do.
+
 
 Changes with FreeUnit 1.37.2                                     09 Nov 2026
 
