@@ -241,7 +241,6 @@ is not a directory.  A directory with a trailing "/" is served as before.
 </para>
 </change>
 
-
 <change type="change">
 <para>
 the value of a variable other than "$request_uri" in a "rewrite" or a "pass"
@@ -378,6 +377,22 @@ The contrib C API pin is 48.0.10 too.
 </para>
 </change>
 
+<change type="security">
+<para>
+update url to 2.5.9 for RUSTSEC-2026-0592 in the OpenTelemetry module, in
+unitctl and in the WebAssembly component module.  In url 2.5.8 and
+earlier, Url::origin() and quirks::origin() parse the path of a "blob:"
+URL and call themselves on the result, so a nested "blob:" URL overflows
+the stack.  No FreeUnit component calls either function; the update
+clears the cargo audit.
+</para>
+<para>
+The vendored Wasmtime 48.0.10 C API source lock keeps url 2.5.7.  This
+exact version has a documented audit exception; the C API does not reach
+the affected functions.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 with a thread-safe (ZTS) PHP, the working directory of a script followed a
@@ -385,21 +400,6 @@ replaced symlink only after "realpath_cache_ttl" seconds, 120 by default: a
 deploy that renamed a new symlink over the old one kept the requests in the
 old directory.  The directory is now resolved on every request, as with a
 non-thread-safe PHP.
-</para>
-</change>
-
-<change type="security">
-<para>
-update url to 2.5.9 for RUSTSEC-2026-0592 in the OpenTelemetry module, in
-unitctl and in the WebAssembly component module.  In url 2.5.8 and
-earlier, Url::origin() and quirks::origin() parse the path of a "blob:"
-URL and call themselves on the result, so a nested "blob:" URL overflows
-the stack.
-</para>
-<para>
-The vendored Wasmtime 48.0.10 C API source lock keeps url 2.5.7.  This
-exact version has a documented audit exception; the C API does not reach
-the affected functions.
 </para>
 </change>
 
