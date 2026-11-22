@@ -22,6 +22,8 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
     nxt_app_type_t         type, prev_type;
     nxt_status_app_t       *app;
     nxt_conf_value_t       *status, *obj, *mods, *apps, *app_obj, *mod_obj;
+    nxt_conf_value_t       *zones, *zone_obj;
+    nxt_status_limit_zone_t  *zone;
     nxt_app_lang_module_t  *modules;
 
     static const nxt_str_t  modules_str = nxt_string("modules");
@@ -47,6 +49,13 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
     static const nxt_str_t  start_str = nxt_string("starting");
     static const nxt_str_t  unacc_str = nxt_string("unaccounted");
     static const nxt_str_t  detached_str = nxt_string("detached");
+    static const nxt_str_t  limit_req_str = nxt_string("limit_req");
+    static const nxt_str_t  keys_str = nxt_string("keys");
+    static const nxt_str_t  keys_max_str = nxt_string("keys_max");
+    static const nxt_str_t  passed_str = nxt_string("passed");
+    static const nxt_str_t  rejected_str = nxt_string("rejected");
+    static const nxt_str_t  evicted_str = nxt_string("evicted");
+    static const nxt_str_t  overflow_str = nxt_string("overflow");
 
     /*
      * modules, connections, requests, applications -- plus "telemetry" when
@@ -57,7 +66,8 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
      */
     status = nxt_conf_create_object(mp, 4
                                     + (report->otel_configured != 0)
-                                    + (report->access_log_configured != 0));
+                                    + (report->access_log_configured != 0)
+                                    + (report->limit_zones_count != 0));
     if (nxt_slow_path(status == NULL)) {
         return NULL;
     }
@@ -276,6 +286,46 @@ nxt_status_get(nxt_status_report_t *report, nxt_mp_t *mp)
         nxt_conf_set_member(app_obj, &reqs_str, obj, 1);
 
         nxt_conf_set_member_integer(obj, &active_str, app->active_requests, 0);
+    }
+
+    /* "limit_req" is omitted, as "access_log" is, when no zone exists. */
+
+    if (report->limit_zones_count != 0) {
+        zones = nxt_conf_create_object(mp, report->limit_zones_count);
+        if (nxt_slow_path(zones == NULL)) {
+            return NULL;
+        }
+
+        nxt_conf_set_member(status, &limit_req_str, zones, idx++);
+
+        zone = nxt_status_limit_zones(report);
+
+        for (i = 0; i < report->limit_zones_count; i++, zone++) {
+            zone_obj = nxt_conf_create_object(mp, 6);
+            if (nxt_slow_path(zone_obj == NULL)) {
+                return NULL;
+            }
+
+            name.length = zone->name.length;
+            name.start = nxt_pointer_to(report, (uintptr_t) zone->name.start);
+
+            ret = nxt_conf_set_member_dup(zones, mp, &name, zone_obj, i);
+            if (nxt_slow_path(ret != NXT_OK)) {
+                return NULL;
+            }
+
+            nxt_conf_set_member_integer(zone_obj, &keys_str, zone->keys, 0);
+            nxt_conf_set_member_integer(zone_obj, &keys_max_str,
+                                        zone->keys_max, 1);
+            nxt_conf_set_member_integer(zone_obj, &passed_str, zone->passed,
+                                        2);
+            nxt_conf_set_member_integer(zone_obj, &rejected_str,
+                                        zone->rejected, 3);
+            nxt_conf_set_member_integer(zone_obj, &evicted_str,
+                                        zone->evicted, 4);
+            nxt_conf_set_member_integer(zone_obj, &overflow_str,
+                                        zone->overflow, 5);
+        }
     }
 
     return status;
