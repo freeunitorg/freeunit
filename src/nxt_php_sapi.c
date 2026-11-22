@@ -512,6 +512,25 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
     conf = data->app;
     c = &conf->u.php;
 
+#if (PHP_VERSION_ID >= 80500)
+    /*
+     * The worker is a fork() of the prototype process, which ran
+     * php_module_startup() in nxt_php_setup().  Every forking PHP SAPI
+     * (fpm, cgi, apache2handler, litespeed, the cli server) calls
+     * php_child_init() in the child after the fork; the module did not.
+     *
+     * Since PHP 8.5 php_child_init() gives the child its own Zend MM heap
+     * key (a release build inherits the prototype's key stream otherwise,
+     * so every worker of an application shares one deterministic sequence;
+     * a debug build aborts at the end of the first request on the
+     * "heap was re-used ... after a fork" assertion).  From PHP 8.7 it also
+     * runs the modules' child_init handlers, such as the session GC seed.
+     * The max_execution_time timer does not need it: init_executor()
+     * re-creates the timer on every request.
+     */
+    php_child_init();
+#endif
+
     n = (c->targets != NULL) ? nxt_conf_object_members_count(c->targets) : 1;
 
     nxt_php_targets = nxt_zalloc(sizeof(nxt_php_target_t) * n);
