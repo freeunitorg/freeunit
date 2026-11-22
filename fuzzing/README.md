@@ -40,6 +40,7 @@ $ make fuzz -j$(nproc)
 $ mkdir -p build/fuzz_basic_seed
 $ mkdir -p build/fuzz_http_chunk_seed
 $ mkdir -p build/fuzz_http_controller_seed
+$ mkdir -p build/fuzz_http_field_value_seed
 $ mkdir -p build/fuzz_http_h1p_seed
 $ mkdir -p build/fuzz_http_h1p_peer_seed
 $ mkdir -p build/fuzz_http_h1p_peer_response_seed
@@ -51,6 +52,7 @@ $ mkdir -p build/fuzz_unit_msg_seed
 $ ./build/fuzz_basic            build/fuzz_basic_seed            fuzzing/fuzz_basic_seed_corpus
 $ ./build/fuzz_http_chunk       build/fuzz_http_chunk_seed       fuzzing/fuzz_http_chunk_seed_corpus
 $ ./build/fuzz_http_controller  build/fuzz_http_controller_seed  fuzzing/fuzz_http_seed_corpus
+$ ./build/fuzz_http_field_value build/fuzz_http_field_value_seed fuzzing/fuzz_http_field_value_seed_corpus
 $ ./build/fuzz_http_h1p         build/fuzz_http_h1p_seed         fuzzing/fuzz_http_seed_corpus
 $ ./build/fuzz_http_h1p_peer    build/fuzz_http_h1p_peer_seed    fuzzing/fuzz_http_seed_corpus
 $ ./build/fuzz_http_h1p_peer_response \
@@ -64,7 +66,7 @@ $ ./build/fuzz_unit_msg         build/fuzz_unit_msg_seed         fuzzing/fuzz_un
 
 ### Differential targets.
 
-Three targets check a result, not only that the code does not crash.  Each
+Four targets check a result, not only that the code does not crash.  Each
 one aborts on a difference, so a wrong answer is reported like a crash.
 
 - `fuzz_http_chunk` decodes a chunked body two times: one time as a single
@@ -77,6 +79,12 @@ one aborts on a difference, so a wrong answer is reported like a crash.
   `NXT_AGAIN`.  A run that gets the header a few bytes at a time must give
   the same status, header size and fields as a run that gets it in one pass.
   The first input byte seeds the read sizes.
+- `fuzz_http_field_value` compares the field value scan, which tests 8
+  bytes at a time, with the byte loop and the DEL check that it replaced.
+  The scan of each range from one of the first 9 bytes to one of the last 9
+  bytes must stop at the same byte.  The value parser must give the result
+  of a copy of the old one, except that a DEL is now rejected before the
+  line ends.  The input is the field value.
 - `fuzz_http_ws_utf8` runs the UTF-8 check for WebSocket text messages and
   close reasons on masked frames that are split into several buffers.  It
   compares the verdict after each frame with a small validator written from
@@ -119,13 +127,13 @@ UBSan and runs `fuzzing/run-ci.sh`, which gives each target a bounded
 libFuzzer budget against its seed corpus and fails on the first crash.
 
 ```shell
-$ fuzzing/run-ci.sh                                   # all ten, 60s each
+$ fuzzing/run-ci.sh                                   # all eleven, 60s each
 $ fuzzing/run-ci.sh -t 120 fuzz_http_h1p              # one target, longer
 ```
 
 A pull request that touches `src/nxt_http*`, `src/nxt_h1proto*`,
 `src/nxt_controller*`, `src/nxt_conf*`, `src/nxt_unit*`, `src/nxt_router*` or
-`fuzzing/` runs all ten targets -- roughly ten minutes; a manual
+`fuzzing/` runs all eleven targets -- roughly eleven minutes; a manual
 `workflow_dispatch` takes a budget and a target list as inputs.  Reproducers
 land in `build/fuzz-artifacts/` and are uploaded as an artifact when the job
 fails.

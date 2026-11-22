@@ -10,7 +10,7 @@
 #   fuzzing/run-ci.sh [-t SECONDS] [TARGET ...]
 #
 #   -t SECONDS   libFuzzer budget per target (default 60)
-#   TARGET ...   fuzzer names; default is all ten
+#   TARGET ...   fuzzer names; default is all eleven
 #
 # Expects the fuzzers to be built already:
 #   CC=clang CXX=clang++ \
@@ -49,7 +49,8 @@ corpus_for() {
         fuzz_basic)     echo fuzz_basic_seed_corpus ;;
         fuzz_json)      echo fuzz_json_seed_corpus ;;
         fuzz_unit_msg)  echo fuzz_unit_msg_seed_corpus ;;
-        fuzz_http_chunk | fuzz_http_h1p_peer_response | fuzz_http_ws_utf8)
+        fuzz_http_chunk | fuzz_http_field_value | \
+        fuzz_http_h1p_peer_response | fuzz_http_ws_utf8)
                         echo "$1_seed_corpus" ;;
         fuzz_router_app_response)
                         echo fuzz_router_app_response_seed_corpus ;;
@@ -59,10 +60,10 @@ corpus_for() {
 }
 
 # fuzz_http.dict holds request words.  They also help the upstream response
-# header, but not a chunked body or WebSocket text.
+# header, but not a chunked body, a field value or WebSocket text.
 dict_for() {
     case "$1" in
-        fuzz_http_chunk | fuzz_http_ws_utf8)
+        fuzz_http_chunk | fuzz_http_field_value | fuzz_http_ws_utf8)
                         echo "" ;;
         fuzz_http_*)    echo fuzz_http.dict ;;
         *)              echo "" ;;
@@ -70,7 +71,7 @@ dict_for() {
 }
 
 [ $# -gt 0 ] || set -- fuzz_basic fuzz_json fuzz_http_controller \
-                       fuzz_http_h1p fuzz_http_h1p_peer \
+                       fuzz_http_field_value fuzz_http_h1p fuzz_http_h1p_peer \
                        fuzz_http_h1p_peer_response fuzz_http_chunk \
                        fuzz_http_ws_utf8 fuzz_router_app_response \
                        fuzz_unit_msg
