@@ -388,6 +388,21 @@ non-thread-safe PHP.
 </para>
 </change>
 
+<change type="security">
+<para>
+update url to 2.5.9 for RUSTSEC-2026-0592 in the OpenTelemetry module, in
+unitctl and in the WebAssembly component module.  In url 2.5.8 and
+earlier, Url::origin() and quirks::origin() parse the path of a "blob:"
+URL and call themselves on the result, so a nested "blob:" URL overflows
+the stack.
+</para>
+<para>
+The vendored Wasmtime 48.0.10 C API source lock keeps url 2.5.7.  This
+exact version has a documented audit exception; the C API does not reach
+the affected functions.
+</para>
+</change>
+
 </changes>
 
 

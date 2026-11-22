@@ -273,6 +273,16 @@ Changes with FreeUnit 1.37.3                                     17 Nov 2026
        old one kept the requests in the old directory. The directory is now
        resolved on every request, as with a non-thread-safe PHP.
 
+    *) Security: update url to 2.5.9 for RUSTSEC-2026-0592 in the
+       OpenTelemetry module, in unitctl and in the WebAssembly component
+       module. In url 2.5.8 and earlier, Url::origin() and quirks::origin()
+       parse the path of a "blob:" URL and call themselves on the result, so
+       a nested "blob:" URL overflows the stack.
+
+       The vendored Wasmtime 48.0.10 C API source lock keeps url 2.5.7. This
+       exact version has a documented audit exception; the C API does not
+       reach the affected functions.
+
 
 Changes with FreeUnit 1.37.2                                     09 Nov 2026
 

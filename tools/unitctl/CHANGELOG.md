@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - rustix 1.1.4 → 1.1.6 (RUSTSEC-2026-0486).
+- url 2.5.8 → 2.5.9 (RUSTSEC-2026-0592).
 
 ### Changed
 - Version bump to track the FreeUnit 1.37.3 release.
