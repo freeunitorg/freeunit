@@ -1338,7 +1338,10 @@ paths:
       summary: "Restart the {appName} application"
       description: "Tells Unit to [restart]
         (https://unit.nginx.org/configuration/#process-management)
-        the application identified by `{appName}`."
+        the application identified by `{appName}`.
+        When a process of the application exits before it answers
+        anything, new processes start after a delay of at most 5 s.
+        A restart ends this delay."
 
       tags:
         - apps
