@@ -7,7 +7,7 @@
 
 <changes apply="unit"
          ver="1.37.3" rev="1"
-         date="2026-11-17" time="00:00:00 +0000"
+         date="2026-11-22" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change type="security">
@@ -429,7 +429,7 @@ FPM, CGI and Apache processes do.
                 unit-jsc19 unit-jsc20 unit-jsc21
                 unit-wasm"
          ver="1.37.3" rev="1"
-         date="2026-11-17" time="00:00:00 +0000"
+         date="2026-11-22" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change>

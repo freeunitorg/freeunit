@@ -1,5 +1,5 @@
 
-Changes with FreeUnit 1.37.3                                     17 Nov 2026
+Changes with FreeUnit 1.37.3                                     22 Nov 2026
 
     *) Security: the router process could crash when a WebSocket connection
        ended while messages of the application were still unsent, or when
