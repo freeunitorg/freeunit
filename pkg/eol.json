@@ -54,7 +54,6 @@
       {"version": "17", "eol": "2027-10", "supported_until": "2028-10", "base": "eclipse-temurin", "lts": true},
       {"version": "21", "eol": "2029-12", "supported_until": "2030-12", "base": "eclipse-temurin", "lts": true},
       {"version": "25", "eol": "2031-09", "supported_until": "2032-09", "base": "eclipse-temurin", "lts": true},
-      {"version": "26", "eol": "2026-09", "supported_until": "2027-09", "base": "eclipse-temurin", "note": "EOL"},
       {"version": "27", "eol": "2027-03", "supported_until": "2028-03", "base": "eclipse-temurin"}
     ],
     "node": [
