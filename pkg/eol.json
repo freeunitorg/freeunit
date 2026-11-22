@@ -11,7 +11,8 @@
       {"version": "41", "eol": "2025-12", "supported_until": "2028-12", "default_python": "3.12", "note": "EOL"},
       {"version": "42", "eol": "2026-05", "supported_until": "2029-05", "default_python": "3.13", "note": "EOL"},
       {"version": "43", "eol": "2026-12", "supported_until": "2029-12", "default_python": "3.14"},
-      {"version": "44", "eol": "2027-06", "supported_until": "2030-06", "default_python": "3.14"}
+      {"version": "44", "eol": "2027-06", "supported_until": "2030-06", "default_python": "3.14"},
+      {"version": "45", "eol": "2027-12", "supported_until": "2030-12", "default_python": "3.15"}
     ],
     "centos_stream": [
       {"version": "9",  "eol": "2027-05", "supported_until": "2030-05", "default_python": "3.11"},
