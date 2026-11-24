@@ -22,6 +22,10 @@
 # go, php and ruby, while node, java and python keep the legs of the rules
 # below, and perl keeps its one leg.  A missing or empty list also gives the full matrix.
 #
+# On a pull request, java and php always get their one leg, even when a
+# changed path belongs to them or the matrix definition changes; their other
+# legs run on the master push and in the weekly run.
+#
 # A pull request with the label "ci-full" gets no list from build-test.yml,
 # and build-test.yml passes --scheduled for it, so it runs the full matrix
 # with every python version.  Use it for a shared change that one version
@@ -67,6 +71,14 @@ set -eu
 
 versioned="go java node php ruby"
 
+# Runtimes that get their one leg on every pull request, whatever paths
+# change: a change to their own paths or to the matrix definition does not
+# widen them.  Their other legs run on the master push and in the weekly run;
+# the "ci-full" label still gives a pull request every leg.  java and php
+# legs take 3 to 4 minutes each, and a pull request that touched them used
+# to run up to three of each.
+pr_one_rts="java php"
+
 # Runtimes whose legs are the oldest supported, the newest supported and the
 # newest supported LTS, not every version.
 minmax_rts="java node"
@@ -109,6 +121,18 @@ matrix() {
                 echo "$rt: one version" >&2
             fi
         done
+    fi
+
+    # A pull request: java and php keep their one leg.
+    if [ -n "$changed" ] && [ -s "$changed" ]; then
+        local keep="" r
+        for r in $every; do
+            case " $pr_one_rts " in
+            *" $r "*) echo "$r: a pull request, one version" >&2 ;;
+            *) keep="$keep $r" ;;
+            esac
+        done
+        every=$keep
     fi
 
     # Slow legs come first, as before; see the comment in build-test.yml.
@@ -195,6 +219,8 @@ EOF
     local r1="ruby-4.0" rall="ruby-3.4 ruby-4.0"
     # The full matrix: python, node and java keep their two or three legs.
     local full="$py $jall $pall $gall $nall $rall"
+    # The full matrix of a pull request: java and php keep their one leg.
+    local prfull="$py $j1 $p1 $gall $nall $rall"
 
     # check NAME EXPECTED [PATH...]
     # With no PATH the list is empty.  NAME "missing" passes no list, and
@@ -228,10 +254,10 @@ EOF
     check "src/nxt_router.c" "$py $j1 $p1 $g1 $n1 $r1" src/nxt_router.c
     check "test/unit/check/tls.py" "$py $j1 $p1 $g1 $n1 $r1" \
         test/unit/check/tls.py
-    check "pkg/eol.json" "$full" pkg/eol.json
-    check "build-test.yml" "$full" .github/workflows/build-test.yml
-    check "test-matrix.sh" "$full" .github/scripts/test-matrix.sh
-    check "matrix file among others" "$full" src/nxt_router.c pkg/eol.json
+    check "pkg/eol.json" "$prfull" pkg/eol.json
+    check "build-test.yml" "$prfull" .github/workflows/build-test.yml
+    check "test-matrix.sh" "$prfull" .github/scripts/test-matrix.sh
+    check "matrix file among others" "$prfull" src/nxt_router.c pkg/eol.json
     check "go/" "$py $j1 $p1 $gall $n1 $r1" go/nxt_cgo_lib.c
     check "python paths still give the oldest and the newest" \
         "$py $j1 $p1 $g1 $n1 $r1" src/python/nxt_python.c \
@@ -245,22 +271,22 @@ EOF
     sched=0
     check "test/test_go_*" "$py $j1 $p1 $gall $n1 $r1" \
         test/test_go_application.py
-    check "src/java/" "$py $jall $p1 $g1 $n1 $r1" \
+    check "src/java/" "$py $j1 $p1 $g1 $n1 $r1" \
         src/java/nginx/unit/Context.java
-    check "src/nxt_java.c" "$py $jall $p1 $g1 $n1 $r1" src/nxt_java.c
-    check "auto/modules/java_jar.sha512" "$py $jall $p1 $g1 $n1 $r1" \
+    check "src/nxt_java.c" "$py $j1 $p1 $g1 $n1 $r1" src/nxt_java.c
+    check "auto/modules/java_jar.sha512" "$py $j1 $p1 $g1 $n1 $r1" \
         auto/modules/java_jar.sha512
     check "src/nodejs/" "$py $j1 $p1 $g1 $nall $r1" \
         src/nodejs/unit-http/http.js
     check "test/unit/check/node.py" "$py $j1 $p1 $g1 $nall $r1" \
         test/unit/check/node.py
-    check "src/nxt_php_sapi.c" "$py $j1 $pall $g1 $n1 $r1" src/nxt_php_sapi.c
-    check "a new src/nxt_php_*.c" "$py $j1 $pall $g1 $n1 $r1" \
+    check "src/nxt_php_sapi.c" "$py $j1 $p1 $g1 $n1 $r1" src/nxt_php_sapi.c
+    check "a new src/nxt_php_*.c" "$py $j1 $p1 $g1 $n1 $r1" \
         src/nxt_php_extension.c
-    check "test/test_php_*" "$py $j1 $pall $g1 $n1 $r1" \
+    check "test/test_php_*" "$py $j1 $p1 $g1 $n1 $r1" \
         test/test_php_targets.py
     check "src/ruby/" "$py $j1 $p1 $g1 $n1 $rall" src/ruby/nxt_ruby.c
-    check "two runtimes" "$py $jall $p1 $g1 $n1 $rall" \
+    check "two runtimes" "$py $j1 $p1 $g1 $n1 $rall" \
         src/nxt_router.c src/java/nxt_jni.c src/ruby/nxt_ruby.c
 
     # min+max follows eol.json: a new version moves max, a new EOL note
