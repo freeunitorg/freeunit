@@ -145,8 +145,8 @@ The socket address of Unit's control API.
 .Pp
 SPDX-License-Identifier: Apache-2.0
 .Sh See also
-.Lk https://unit.nginx.org Website
+.Lk https://freeunit.org Website
 .Pp
 .Lk https://mailman.nginx.org/mailman/listinfo/unit "User mailing list"
 .Pp
-.Lk https://github.com/nginx/unit GitHub
+.Lk https://github.com/freeunitorg/freeunit GitHub
