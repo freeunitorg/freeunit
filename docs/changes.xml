@@ -7,7 +7,7 @@
 
 <changes apply="unit"
          ver="1.37.3" rev="1"
-         date="2026-11-17" time="00:00:00 +0000"
+         date="2026-11-22" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change type="security">
@@ -139,6 +139,105 @@ the router.  Now such a file is served without "Last-Modified".  A date in
 the router, the discovery process, the prototype processes and the
 application processes of embedded language modules kept the listen socket of
 the control API open.  Now only the main process and the controller keep it.
+</para>
+</change>
+
+<change type="security">
+<para>
+the router accepted a "Host" header field with an empty host part.  The
+value of "$host" was empty for such a request.
+</para>
+<para>
+The router found the trailing dot of the host part by the last dot of the
+whole value.  A dot in the port hid the trailing dot of the host part.  A
+host part of one dot stayed ".".  A "host" route rule for the name without
+the dot did not match such a value.
+</para>
+<para>
+A "share" or a "chroot" template with "$host" as a whole path segment named
+the base directory.  The router served the files below that directory.  It
+also served the files of a host that a "host" route rule refused.
+</para>
+<para>
+Now the router looks at the last byte of the host part for the trailing
+dot.  It answers 400 when the host part is empty after the cut.  A request
+without a "Host" field is not changed.
+</para>
+</change>
+
+<change type="security">
+<para>
+the Java module took the path for the servlet mapping from the request URI
+as the client sent it.  The path was decoded, but the "." and ".." segments
+were not removed.  Repeated slashes were not merged.  A target that started
+with "//" lost its first segment.
+</para>
+<para>
+The servlet and filter mappings, the welcome files, the default servlet and
+the JSP servlet all used this path.  A request with such a segment in front
+of WEB-INF or META-INF got the files of these directories from the default
+servlet.  A request with such a segment in front of a mapped path got the
+static file, not the servlet.  A filter with a prefix pattern did not run
+for it.
+</para>
+<para>
+With a context path, the module cut the context path from this path by its
+length.  A client was able to read the files of the directories above the
+application directory.  It was able to climb as many levels up as the context
+path has segments.
+</para>
+<para>
+The refusal of WEB-INF and META-INF was in the default servlet only.  A JSP
+file or a servlet of the application below these directories ran on a direct
+request from a client.
+</para>
+<para>
+Now the module decodes the path once.  It removes the "." and ".." segments
+and merges repeated slashes before the mapping.  An encoded slash ("%2F")
+separates segments as a "/" does.
+</para>
+<para>
+The module answers 400 when the path climbs above the root or holds a NUL
+character.  It also answers 400 for a target that java.net.URI refuses.
+Before, such a target got 500 with a stack trace.
+</para>
+<para>
+The module answers 404 when the first segment of the path is WEB-INF or
+META-INF.  The check works in any letter case and for each servlet.  This
+404 uses the error page of the application.  A forward or an include to
+these directories works as before.
+</para>
+<para>
+A relative path given to getRequestDispatcher() of the request now resolves
+against the path that the module mapped.  Before, it resolved against the
+request URI as the client sent it.  A client was able to choose the
+directory of such a dispatch, also WEB-INF and META-INF.
+</para>
+<para>
+The methods getServletPath() and getPathInfo() now come from the resolved
+path.  getRequestURI() still returns the request URI as the client sent it.
+</para>
+</change>
+
+<change type="security">
+<para>
+the default servlet of the Java module opened the servlet path with
+java.io.File.  java.io.File drops a trailing "/".  The servlet mapping
+compares the path with the slash.
+</para>
+<para>
+A request for a file name followed by "/" matched no exact mapping.  It
+matched no suffix mapping and no filter with a suffix or an exact pattern.
+The default servlet then served the file.
+</para>
+<para>
+A client was able to get the source of a JSP file instead of its output.  A
+client was able to get the static file behind a path that has an exact
+servlet mapping.  A filter with a suffix pattern did not run for the file.
+</para>
+<para>
+Now the default servlet answers 404 when the path ends with "/" and the file
+is not a directory.  A directory with a trailing "/" is served as before.
 </para>
 </change>
 
@@ -278,6 +377,22 @@ The contrib C API pin is 48.0.10 too.
 </para>
 </change>
 
+<change type="security">
+<para>
+update url to 2.5.9 for RUSTSEC-2026-0592 in the OpenTelemetry module, in
+unitctl and in the WebAssembly component module.  In url 2.5.8 and
+earlier, Url::origin() and quirks::origin() parse the path of a "blob:"
+URL and call themselves on the result, so a nested "blob:" URL overflows
+the stack.  No FreeUnit component calls either function; the update
+clears the cargo audit.
+</para>
+<para>
+The vendored Wasmtime 48.0.10 C API source lock keeps url 2.5.7.  This
+exact version has a documented audit exception; the C API does not reach
+the affected functions.
+</para>
+</change>
+
 <change type="bugfix">
 <para>
 with a thread-safe (ZTS) PHP, the working directory of a script followed a
@@ -314,7 +429,7 @@ FPM, CGI and Apache processes do.
                 unit-jsc19 unit-jsc20 unit-jsc21
                 unit-wasm"
          ver="1.37.3" rev="1"
-         date="2026-11-17" time="00:00:00 +0000"
+         date="2026-11-22" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change>
