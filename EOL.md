@@ -48,6 +48,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Fedora | 42 (EOL) † | 2026-05 | 2029-05 | 3.13 |
 | Fedora | 43 | 2026-12 | 2029-12 | 3.14 |
 | Fedora | 44 | 2027-06 | 2030-06 | 3.14 |
+| Fedora | 45 | 2027-12 | 2030-12 | 3.15 |
 | CentOS Stream | 9 | 2027-05 | 2030-05 | 3.11 |
 | CentOS Stream | 10 | 2030-05 | 2033-05 | 3.13 |
 | Amazon Linux | 2 (EOL) † | 2026-06 | 2029-06 | 3.7 ‡ |
