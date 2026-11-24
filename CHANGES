@@ -293,6 +293,11 @@ Changes with FreeUnit 1.37.3                                     22 Nov 2026
        worker now runs this start step, as the PHP FPM, CGI and Apache
        processes do.
 
+    *) Change: Unit is packaged for Homebrew again. The official tap
+       freeunitorg/homebrew-unit builds unitd with njs, ships the released
+       unitctl binaries, and carries the language module formulas and the
+       php-embed formulas. The tap follows the FreeUnit releases.
+
 
 Changes with FreeUnit 1.37.2                                     09 Nov 2026
 

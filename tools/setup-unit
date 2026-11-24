@@ -33,23 +33,23 @@ SYNOPSIS
         $0 [-h[h]] COMMAND [ARGS]
 
     Subcommands
-        ├── repo-config  [-hn] [PKG-MANAGER OS-NAME OS-VERSION]
+        ├── repo-config  [-h]
         └── welcome      [-hn]
 
 DESCRIPTION
-        This script simplifies installing and configuring an NGINX Unit server
+        This script simplifies installing and configuring a FreeUnit server
         for first-time users.
 
         Run '$0 COMMAND -h' for more information on a command.
 
 COMMANDS
         repo-config
-                Configure your package manager with the NGINX Unit repository
-                for later installation.
+                Print where FreeUnit packages are published.  No package
+                repository is configured.
 
         welcome
                 Create an initial configuration to serve a welcome web page
-                with NGINX Unit.
+                with FreeUnit.
 
 OPTIONS
         -h, --help
@@ -77,7 +77,7 @@ SYNOPSIS
         ├── json-ins     [-hn] JSON INDEX
         ├── os-probe     [-h]
         ├── ps           [-h] [-t TYPE]
-        ├── repo-config  [-hn] [PKG-MANAGER OS-NAME OS-VERSION]
+        ├── repo-config  [-h]
         ├── restart      [-hls]
         ├── sock         [-h] SUBCOMMAND [ARGS]
         │   ├── filter   [-chs]
@@ -86,7 +86,7 @@ SYNOPSIS
 
 DESCRIPTION
         This script simplifies installing and configuring
-        an NGINX Unit server for first-time users.
+        a FreeUnit server for first-time users.
 
         Run '$0 COMMAND -h' for more information on a command.
 
@@ -108,8 +108,8 @@ COMMANDS
         ps      List unitd(8) processes.
 
         repo-config
-                Configure your package manager with the NGINX Unit
-                repository for later installation.
+                Print where FreeUnit packages are published.  No
+                package repository is configured.
 
         restart
                 Restart all running unitd(8) instances.
@@ -118,7 +118,7 @@ COMMANDS
 
         welcome
                 Create an initial configuration to serve a welcome web page
-                with NGINX Unit.
+                with FreeUnit.
 
 OPTIONS
         -h, --help
@@ -266,7 +266,7 @@ OPTIONS
                     [http[s]://]host[:port]
 
                 The last form is less secure than the first two; have a look:
-                <https://unit.nginx.org/howto/security/#secure-socket-and-stat>
+                <https://docs.freeunit.org/howto/security/#secure-socket-and-state>
 
 ENVIRONMENT
         Options take precedence over their equivalent environment variables;
@@ -489,7 +489,7 @@ EXAMPLES
         $0 ctl http -c --no-progress-meter GET /config >tmp;
 
 SEE ALSO
-        <https://unit.nginx.org/controlapi/#api-manipulation>
+        <https://docs.freeunit.org/controlapi/#api-manipulation>
 
 __EOF__
 }
@@ -615,7 +615,7 @@ SYNOPSIS
         $0 welcome [-hn]
 
 DESCRIPTION
-        This script tests an NGINX Unit installation by creating an initial
+        This script tests a FreeUnit installation by creating an initial
         configuration and serving a welcome web page.  Recommended for
         first-time users.
 
@@ -673,11 +673,11 @@ unit_ctl_welcome()
     || :;
 
     if test 0 -eq "$nprocs"; then
-        warn "welcome: NGINX Unit isn't running.";
-        warn 'For help with starting NGINX Unit, see:';
-        err  "  <https://unit.nginx.org/installation/#startup-and-shutdown>";
+        warn "welcome: FreeUnit isn't running.";
+        warn 'For help with starting FreeUnit, see:';
+        err  "  <https://docs.freeunit.org/installation/#startup-and-shutdown>";
     elif test 1 -ne "$nprocs"; then
-        err 'welcome: Only one NGINX Unit instance should be running.';
+        err 'welcome: Only one FreeUnit instance should be running.';
     fi;
 
     local sock="$(unit_sock_find)";
@@ -708,7 +708,7 @@ unit_ctl_welcome()
         if test -e $conffile; then
             if ! unit_ctl_http ---s "$sock" 'GET' '/config' </dev/null 2>/dev/null | grep -q '^{}.\?$';  # The '.\?' is for the possible carriage return.
             then
-                warn 'welcome: NGINX Unit is already configured.  To overwrite';
+                warn 'welcome: FreeUnit is already configured.  To overwrite';
                 err  'its current configuration, run the script again with --force.';
             fi;
         fi;
@@ -725,7 +725,7 @@ unit_ctl_welcome()
         <!DOCTYPE html>
         <html>
             <head>
-                <title>Welcome to NGINX Unit</title>
+                <title>Welcome to FreeUnit</title>
                 <style type="text/css">
                     body { background: white; color: black; font-family: sans-serif; margin: 2em; line-height: 1.5; }
                     h1,h2 { color: #00974d; }
@@ -736,16 +736,16 @@ unit_ctl_welcome()
                 </style>
             </head>
             <body>
-                <h1>Welcome to NGINX Unit</h1>
-                <p>Congratulations! NGINX Unit is installed and running.</p>
+                <h1>Welcome to FreeUnit</h1>
+                <p>Congratulations! FreeUnit is installed and running.</p>
                 <h3>Useful Links</h3>
                 <ul>
-                    <li><b><a href="https://unit.nginx.org/configuration/?referer=welcome">https://unit.nginx.org/configuration/</a></b><br>
+                    <li><b><a href="https://docs.freeunit.org/configuration/">https://docs.freeunit.org/configuration/</a></b><br>
                         To get started with Unit, see the <em>Configuration</em> docs, starting with
                         the <em>Quick Start</em> guide.</li>
-                    <li><b><a href="https://github.com/nginx/unit">https://github.com/nginx/unit</a></b><br>
+                    <li><b><a href="https://github.com/freeunitorg/freeunit">https://github.com/freeunitorg/freeunit</a></b><br>
                         See our GitHub repo to browse the code, contribute, or seek help from the
-                        <a href="https://github.com/nginx/unit#community">community</a>.</li>
+                        <a href="https://github.com/freeunitorg/freeunit#community">community</a>.</li>
                 </ul>
 
                 <h2>Next steps</h2>
@@ -768,8 +768,8 @@ unit_ctl_welcome()
                 </div>
 
                 <hr>
-                <p><a href="https://unit.nginx.org/?referer=welcome">NGINX Unit &mdash; the universal web app server</a><br>
-                NGINX, Inc. &copy; 2025</p>
+                <p><a href="https://docs.freeunit.org/">FreeUnit &mdash; the universal web app server</a><br>
+                FreeUnit Community &copy; 2026</p>
             </body>
         </html>
 __EOF__';
@@ -1144,42 +1144,27 @@ help_unit_repo_config()
 {
     cat <<__EOF__ ;
 SYNOPSIS
-        $0 repo-config [-hn] [PKG-MANAGER OS-NAME OS-VERSION]
+        $0 repo-config [-h]
 
 DESCRIPTION
-        This script configures the NGINX Unit repository for the system
-        package manager.
+        FreeUnit ships as container images: ghcr.io/freeunitorg/freeunit.
+        Each GitHub release also has Debian trixie .deb packages:
+        https://github.com/freeunitorg/freeunit/releases
+        There is no FreeUnit apt or dnf repository yet, so there is no
+        repository to configure.  This command prints a notice and does
+        nothing else.  The FreeUnit signing key is already
+        published: https://freeunit.org/media/keys/6C68B7AA.asc
 
-        The script automatically detects the OS and proceeds accordingly.
-        However, if this automatic selection fails, you may specify the
-        package manager and the OS name and version.
+        On macOS, install from the Homebrew tap:
+        brew tap freeunitorg/unit https://github.com/freeunitorg/homebrew-unit
+        brew install freeunitorg/unit/unit
 
-ARGUMENTS
-        PKG-MANAGER
-                Supported: 'apt', 'dnf', and 'yum'.
-
-        OS-NAME
-                Supported: 'debian', 'ubuntu', 'fedora', 'rhel', and 'amzn2'.
-
-        OS-VERSION
-                For most distributions, this should be a numeric value; for
-                Debian derivatives, use the codename instead.
+        Distro-specific install notes live in pkg/community/ in the
+        repository (debian.md, CENTOS.ALMALINUX.md, MACOS.md).
 
 OPTIONS
         -h, --help
                 Print this help.
-
-        -n, --dry-run
-                Dry run.  Print the commands to be run instead of actually
-                running them.  Each command is preceded by a line explaining
-                what it does.
-
-EXAMPLES
-        $ $(basename "$0") repo-config apt debian bullseye;
-        $ $(basename "$0") repo-config apt ubuntu jammy;
-        $ $(basename "$0") repo-config dnf fedora 36;
-        $ $(basename "$0") repo-config dnf rhel 9;
-        $ $(basename "$0") repo-config yum amzn2 2;
 
 __EOF__
 }
@@ -1187,131 +1172,32 @@ __EOF__
 
 unit_repo_config()
 {
-    installAPT ()
-    {
-        local os_name="$2";
-
-        dry_run_echo "Install on $os_name";
-        dry_run_echo;
-        dry_run_eval 'curl --output /usr/share/keyrings/nginx-keyring.gpg https://unit.nginx.org/keys/nginx-keyring.gpg;';
-        dry_run_echo;
-        dry_run_eval 'apt-get install -y apt-transport-https lsb-release ca-certificates;';
-
-        if test $# -ge 3; then
-            local os_version="$3";
-        else
-            local os_version='$(lsb_release -cs)';
-        fi;
-
-        dry_run_echo;
-        dry_run_eval "printf 'deb [signed-by=/usr/share/keyrings/nginx-keyring.gpg] https://packages.nginx.org/unit/$os_name/ %s unit\n' \"$os_version\" | tee /etc/apt/sources.list.d/unit.list;";
-        dry_run_eval "printf 'deb-src [signed-by=/usr/share/keyrings/nginx-keyring.gpg] https://packages.nginx.org/unit/$os_name/ %s unit\n' \"$os_version\" | tee -a /etc/apt/sources.list.d/unit.list;";
-        dry_run_echo;
-        dry_run_eval 'apt-get update;';
-    }
-
-    installYumDnf ()
-    {
-        local pkg_mngr="$1";
-        local os_name="$2";
-
-        if test $# -ge 3; then
-            local os_version="$3";
-        else
-            local os_version='\$releasever';
-        fi;
-
-        dry_run_echo "Install on $os_name";
-        dry_run_echo;
-
-        dry_run_eval "cat >/etc/yum.repos.d/unit.repo <<__EOF__
-[unit]
-name=unit repo
-baseurl=https://packages.nginx.org/unit/$os_name/$os_version/\\\$basearch/
-gpgcheck=0
-enabled=1
-__EOF__";
-
-        dry_run_echo;
-        dry_run_eval "$pkg_mngr makecache;";
-    }
-
     while test $# -ge 1; do
         case "$1" in
         -h | --help)
             help_unit_repo_config;
             exit 0;
             ;;
-        -n | --dry-run)
-            dry_run='yes';
-            ;;
         -*)
             err "repo-config: $1: Unknown option.";
             ;;
         *)
-            break;
+            err "repo-config: $1: Unexpected argument.";
             ;;
         esac;
         shift;
     done;
 
-    if test $# -ge 1; then
-        local pkg_mngr="$1";
-
-        if ! test $# -ge 2; then
-            err "repo-config: OS-NAME: Missing argument.";
-        fi;
-        local os_name="$2";
-
-        if ! test $# -ge 3; then
-            err "repo-config: OS-VERSION: Missing argument.";
-        fi;
-        local os_version="$3";
-    fi;
-
-    command -v curl >/dev/null \
-    || err 'repo-config: curl(1) not found in PATH.  It must be installed to run this script.';
-
-    echo 'This script sets up the NGINX Unit repository';
-
-    if ! test $# -ge 3; then
-        local os_pkg_name_version="$(unit_os_probe || warn "On macOS, try 'brew install nginx/unit/unit'.")"
-        local pkg_mngr="$(echo "$os_pkg_name_version" | awk -F: '{print $1}')"
-        local os_name="$(echo "$os_pkg_name_version" | awk -F: '{print $2}')"
-        local os_version="$(echo "$os_pkg_name_version" | awk -F: '{print $3}')"
-    fi;
-
-    # Call the appropriate installation function
-    case "$pkg_mngr" in
-    apt)
-        case "$os_name" in
-        debian | ubuntu)
-            installAPT "$pkg_mngr" "$os_name" ${3:+$os_version};
-            ;;
-        *)
-            err "repo-config: $os_name: The OS isn't supported.";
-            ;;
-        esac
-        ;;
-    yum | dnf)
-        case "$os_name" in
-        rhel | amzn | fedora)
-            installYumDnf "$pkg_mngr" "$os_name" "$os_version" ${3:+ovr};
-            ;;
-        *)
-            err "repo-config: $os_name: The OS isn't supported.";
-            ;;
-        esac;
-        ;;
-    *)
-        err "repo-config: $pkg_mngr: The package manager isn't supported.";
-        ;;
-    esac;
-
-    echo
-    echo 'All done; the NGINX Unit repository is set up.';
-    echo "Configured with '$pkg_mngr' on '$os_name' '$os_version'.";
-    echo 'Further steps: <https://unit.nginx.org/installation/#official-packages>'
+    info 'FreeUnit ships as container images: ghcr.io/freeunitorg/freeunit.';
+    info 'Each GitHub release also has Debian trixie .deb packages:';
+    info '  <https://github.com/freeunitorg/freeunit/releases>';
+    info 'There is no FreeUnit apt or dnf repository yet; nothing was configured.';
+    info 'On macOS, install from the Homebrew tap:';
+    info '  brew tap freeunitorg/unit https://github.com/freeunitorg/homebrew-unit';
+    info '  brew install freeunitorg/unit/unit';
+    info 'The FreeUnit signing key is already published: <https://freeunit.org/media/keys/6C68B7AA.asc>.';
+    info 'For distro-specific install notes, see pkg/community/ in the repository:';
+    info '  <https://github.com/freeunitorg/freeunit/tree/1.37/pkg/community>';
 }
 
 

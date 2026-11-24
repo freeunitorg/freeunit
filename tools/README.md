@@ -14,8 +14,8 @@ should be considered experimental.
 
 ### A script that simplifies installing and configuring a FreeUnit server for first-time users
 
-* `setup-unit repo-config` configures your package manager with the FreeUnit
-repository for later installation.
+* `setup-unit repo-config` prints where FreeUnit packages are published.
+No package repository is configured.
 * `setup-unit welcome` creates an initial configuration to serve a welcome
 web page with FreeUnit.
 
@@ -76,7 +76,7 @@ the type of control socket:
  * `docker://container_ID[/path/to/control.socket]`
 
 > **Note:** SSH is recommended for remote confguration. Consider the
-> [security implications](https://unit.nginx.org/howto/security/#secure-socket-and-state)
+> [security implications](https://docs.freeunit.org/howto/security/#secure-socket-and-state)
 > of managing remote configuration over plaintext HTTP.
 
 | Options | |

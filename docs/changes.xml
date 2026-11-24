@@ -415,6 +415,15 @@ FPM, CGI and Apache processes do.
 </para>
 </change>
 
+<change type="change">
+<para>
+Unit is packaged for Homebrew again.  The official tap
+freeunitorg/homebrew-unit builds unitd with njs, ships the released
+unitctl binaries, and carries the language module formulas and the
+php-embed formulas.  The tap follows the FreeUnit releases.
+</para>
+</change>
+
 </changes>
 
 
