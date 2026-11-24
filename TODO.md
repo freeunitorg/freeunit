@@ -573,3 +573,72 @@ Workaround today: client-side buffering (`git config http.postBuffer`).
   a disk spill path — not just a flag that buffers everything in-process.
 
 **Related upstream nginx/unit issues:** #445, #1088, #1278
+
+---
+
+## Go module path — `unit.nginx.org/go` still points at the upstream domain
+
+The Go SDK import path is a functional module path, not a documentation link.
+`go get unit.nginx.org/go` today serves the **archived** upstream repo
+(`proxy.golang.org`, frozen at `v0.0.0-20251008181943-76b39e928bd2`,
+2025-10-08). None of the fork's `go/` fixes reach consumers. About 21
+third-party repos still import the path. Affected in-repo spots (~21
+references):
+
+- `go/go.mod:1` — `module unit.nginx.org/go`
+- `auto/modules/go:77` — `NXT_GO_PKG=unit.nginx.org/go`
+- `pkg/rpm/Makefile.go:40-41` — rpm `%dir` paths
+- 10 × `test/go/*/app.go` and 3 × `example-go-app` fixtures
+- `.github/workflows/sanitize.yml:353` (build-path comment)
+- `test/unit/applications/lang/go.py:54-60` (replace directives)
+
+**Decision (2026-11-24): the FreeUnit module path is `docs.freeunit.org/go`.**
+The choice mirrors upstream: `unit.nginx.org` was both the docs domain and
+the vanity host, with the vanity file living in the docs repo. The file is
+`source/go` in `freeunitorg/docs`. Sphinx copies it to the webroot. It
+deploys with every docs build — no other site involved. The same-day
+`freeunit.org/go` attempt is dropped. A bare-domain tag prefix forced a
+second tag onto the domain root, because Go re-verifies a prefix that
+differs from the requested import path. The full-path prefix skips that
+check, so one file is enough.
+
+Target content for `source/go`. The live copy still carries the stale
+upstream tag `unit.nginx.org git https://github.com/nginx/unit` and a dead
+redirect target. `go get docs.freeunit.org/go` currently fails with a
+tag/import-path mismatch:
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="go-import" content="docs.freeunit.org/go git https://github.com/freeunitorg/freeunit" />
+<meta http-equiv="refresh" content="0; url=/configuration/#configuration-go" />
+</head>
+<body>
+Nothing to see here; <a href="/configuration/#configuration-go">move along</a>.
+</body>
+</html>
+```
+
+Version mechanics: our release tags are plain (`1.37.2`, no `v` prefix).
+Plain-tag queries resolve to a pseudo-version anchored at our release
+commit. Docs examples must use the form **without the `v` prefix**. A
+`v`-prefixed query probes only `go/v<semver>` / `v<semver>` refs, which we
+never create.
+
+- [ ] Retag `source/go` in `freeunitorg/docs` to the content above (PR from a
+      fork — `freeunitx` cannot push to `freeunitorg/*`).
+      - [ ] Deploy the docs.
+      - [ ] Verify: `GOPROXY=direct go get docs.freeunit.org/go@1.37.2`. The
+            tag resolves, then fails with a path-mismatch error (`module
+            declares its path as: unit.nginx.org/go`) until the `go.mod`
+            retarget below.
+- [ ] In the same docs PR, fix the examples at
+      `source/configuration/index.rst:4095` and `source/howto/samples.rst:44`
+      to `go get docs.freeunit.org/go@|version|` (no `v`). The live site
+      currently renders `go get unit.nginx.org/go@1.37.2`, which fails —
+      upstream has no `1.37.2` ref.
+- [ ] Re-point `go/go.mod` (`module docs.freeunit.org/go`), `NXT_GO_PKG`,
+      rpm `%dir` paths, tests, and examples.
+- [ ] Keep `unit.nginx.org/go` importable during the transition (deprecation
+      notice), then drop `unit.nginx.org/go`.
