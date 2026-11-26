@@ -1519,3 +1519,19 @@ def test_java_application_path_resolved_context_path(temp_dir):
         '/ctx/dir1/../WEB-INF/web.xml',
     ]:
         assert client.get(url=url)['status'] == 404, url
+
+
+def test_java_application_path_resolved_above_root(temp_dir):
+    client.load('welcome_files')
+
+    Path(f'{temp_dir}/outside.txt').write_text('above-root-marker\n')
+
+    assert client.get(url='/dir1/index.txt')['status'] == 200, 'inside'
+
+    # No context path is set.  The first segment after "//" must not let
+    # the ".." segment leave the application directory.
+
+    resp = client.get(url='//x/../outside.txt')
+
+    assert resp['status'] == 404, 'above the root'
+    assert 'above-root-marker' not in resp['body'], 'above the root body'
