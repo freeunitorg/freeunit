@@ -7,7 +7,7 @@
 
 <changes apply="unit"
          ver="1.37.3" rev="1"
-         date="2026-11-22" time="00:00:00 +0000"
+         date="2026-11-27" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change type="security">
@@ -45,8 +45,8 @@ way.  It is now kept as data too.
 <change type="security">
 <para>
 a "rewrite" result that did not start with "/" kept a leading ".." segment.
-So a "share" that joins a directory and "$uri" could serve a file one level
-above that directory, and a later route rule on "uri" could fail to match.
+So a "share" that joins a directory and "$uri" could serve a file outside
+that directory, and a later route rule on "uri" could fail to match.
 This needed a "rewrite" whose result can start with a value from the client,
 such as an argument or a header.  Now a "rewrite" result that is empty or
 does not start with "/" gives status 500.
@@ -181,10 +181,10 @@ static file, not the servlet.  A filter with a prefix pattern did not run
 for it.
 </para>
 <para>
-With a context path, the module cut the context path from this path by its
-length.  A client was able to read the files of the directories above the
-application directory.  It was able to climb as many levels up as the context
-path has segments.
+A client was able to read the files of the directory above the application
+directory.  With a context path, the module cut the context path from this
+path by its length, and the client was able to climb one more level for each
+segment of the context path.
 </para>
 <para>
 The refusal of WEB-INF and META-INF was in the default servlet only.  A JSP
@@ -272,7 +272,7 @@ decoded.  A value can no longer select a name that holds a slash; before,
 <para>
 An njs "rewrite" or "pass" result is now used as data too.  A "%XX" in it is
 not decoded, and a "?" or "#" in it no longer ends the path.  A NUL byte in
-it gives status 500.  To keep the old meaning, call decodeURIComponent() on
+a "rewrite" result gives status 500.  To keep the old meaning, call decodeURIComponent() on
 text that is encoded on purpose.  An njs "pass" can no longer select a name
 that holds a slash.
 </para>
@@ -438,7 +438,7 @@ php-embed formulas.  The tap follows the FreeUnit releases.
                 unit-jsc19 unit-jsc20 unit-jsc21
                 unit-wasm"
          ver="1.37.3" rev="1"
-         date="2026-11-22" time="00:00:00 +0000"
+         date="2026-11-27" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
 <change>
