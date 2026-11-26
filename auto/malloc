@@ -173,3 +173,91 @@ nxt_feature_test="#include <malloc.h>
                       return 0;
                   }"
 . auto/feature
+
+
+# --malloc=[none|jemalloc|mimalloc] (auto/options).  The default is "none".
+#
+# A chosen allocator is linked into unitd and kept in the link though unitd
+# names no symbol from it, so it precedes libc in the dynamic section and
+# interposes malloc().  The router and the embedded language processes (a
+# fork() of unitd: PHP, Python, Perl, Ruby) then use it without LD_PRELOAD.  An
+# application that runs as its own process (type "external", which includes go
+# and the Node.js runtime) execve()s a separate binary and keeps its own
+# allocator.  This closes the musl mallocng unmap cost measured in #688; it
+# trades memory for CPU, so it is the operator's choice, never a default.
+#
+# The probe needs a symbol that is unique to the library (mallctl for jemalloc,
+# mi_version for mimalloc); a probe that only called malloc() would link against
+# libc and prove nothing.  On failure configure stops: it never falls back to
+# libc, because a silent fallback is exactly the LD_PRELOAD trap this replaces.
+#
+# Language modules must NOT link the allocator.  They are dlopen()ed into a
+# process that already has the interposed malloc; a second copy would mix two
+# heaps under one free().  So NXT_MALLOC_LIBS is appended to the unitd link line
+# only (auto/make), not to any module.
+
+NXT_MALLOC_LIBS=
+
+if [ $NXT_MALLOC != none ]; then
+
+    # Call a symbol that is unique to the library with its real prototype, so
+    # the link needs that library and the probe stays warning-clean under the
+    # build's -Werror.  mallctl and mi_version both return int.
+
+    case "$NXT_MALLOC" in
+        jemalloc)  nxt_malloc_inc="jemalloc/jemalloc.h"
+                   nxt_malloc_call="mallctl(\"version\", (void *) 0,
+                                            (size_t *) 0, (void *) 0, 0)" ;;
+        mimalloc)  nxt_malloc_inc="mimalloc.h"
+                   nxt_malloc_call="mi_version()" ;;
+    esac
+
+    $echo -n "checking for $NXT_MALLOC ..."
+
+    cat << END > $NXT_AUTOTEST.c
+#include <$nxt_malloc_inc>
+
+int main(void) {
+    return $nxt_malloc_call != 0;
+}
+END
+
+    # unitd names no symbol from the allocator, so the link must be told to
+    # keep the library anyway.  The retention flag is linker-specific: GNU ld
+    # needs --no-as-needed, which the Mach-O linker rejects (it uses
+    # -needed-l<name>, and keeps every named library in any case).  Try the
+    # forms in order and use the first that links, so the probe and the real
+    # unitd link (auto/make) carry the same flags.  The plain -l<name> form is
+    # reached only after the GNU form has failed, that is, not on a GNU ld
+    # where --as-needed could drop it.
+    nxt_malloc_found=no
+
+    for nxt_malloc_try in \
+        "-Wl,--no-as-needed -l$NXT_MALLOC -Wl,--as-needed" \
+        "-Wl,-needed-l$NXT_MALLOC" \
+        "-l$NXT_MALLOC"
+    do
+        if /bin/sh -c "($CC $NXT_CFLAGS $NXT_CC_OPT $CFLAGS \
+                        -o $NXT_AUTOTEST $NXT_AUTOTEST.c \
+                        $NXT_LD_OPT $nxt_malloc_try)" \
+            >> $NXT_AUTOCONF_ERR 2>&1
+        then
+            NXT_MALLOC_LIBS="$nxt_malloc_try"
+            nxt_malloc_found=yes
+            break
+        fi
+    done
+
+    rm -rf $NXT_AUTOTEST $NXT_AUTOTEST.c
+
+    if [ $nxt_malloc_found = yes ]; then
+        $echo " found"
+
+    else
+        $echo " not found"
+        $echo
+        $echo $0: error: --malloc=$NXT_MALLOC: $NXT_MALLOC not found.
+        $echo
+        exit 1
+    fi
+fi

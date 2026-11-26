@@ -41,6 +41,7 @@ Unit configuration summary:
 
   debug logging: ............. $NXT_DEBUG
   hardening: ................. $NXT_HARDENING
+  allocator: ................. $NXT_MALLOC
 
   fuzz engine: ............... "$NXT_FUZZ"
 
