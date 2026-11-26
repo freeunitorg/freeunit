@@ -1,5 +1,5 @@
 
-Changes with FreeUnit 1.37.3                                     22 Nov 2026
+Changes with FreeUnit 1.37.3                                     27 Nov 2026
 
     *) Security: the router process could crash when a WebSocket connection
        ended while messages of the application were still unsent, or when
@@ -28,11 +28,11 @@ Changes with FreeUnit 1.37.3                                     22 Nov 2026
 
     *) Security: a "rewrite" result that did not start with "/" kept a
        leading ".." segment. So a "share" that joins a directory and "$uri"
-       could serve a file one level above that directory, and a later route
-       rule on "uri" could fail to match. This needed a "rewrite" whose
-       result can start with a value from the client, such as an argument or
-       a header. Now a "rewrite" result that is empty or does not start with
-       "/" gives status 500.
+       could serve a file outside that directory, and a later route rule on
+       "uri" could fail to match. This needed a "rewrite" whose result can
+       start with a value from the client, such as an argument or a header.
+       Now a "rewrite" result that is empty or does not start with "/" gives
+       status 500.
 
     *) Security: a request target that contains an unencoded space, a
        control character such as HTAB, or DEL now gets a 400 response.
@@ -125,10 +125,10 @@ Changes with FreeUnit 1.37.3                                     22 Nov 2026
        in front of a mapped path got the static file, not the servlet. A
        filter with a prefix pattern did not run for it.
 
-       With a context path, the module cut the context path from this path
-       by its length. A client was able to read the files of the directories
-       above the application directory. It was able to climb as many levels
-       up as the context path has segments.
+       A client was able to read the files of the directory above the
+       application directory. With a context path, the module cut the
+       context path from this path by its length, and the client was able to
+       climb one more level for each segment of the context path.
 
        The refusal of WEB-INF and META-INF was in the default servlet only.
        A JSP file or a servlet of the application below these directories
@@ -201,9 +201,10 @@ Changes with FreeUnit 1.37.3                                     22 Nov 2026
 
        An njs "rewrite" or "pass" result is now used as data too. A "%XX" in
        it is not decoded, and a "?" or "#" in it no longer ends the path. A
-       NUL byte in it gives status 500. To keep the old meaning, call
-       decodeURIComponent() on text that is encoded on purpose. An njs
-       "pass" can no longer select a name that holds a slash.
+       NUL byte in a "rewrite" result gives status 500. To keep the old
+       meaning, call decodeURIComponent() on text that is encoded on
+       purpose. An njs "pass" can no longer select a name that holds a
+       slash.
 
     *) Feature: Docker images for PHP 8.6: "php-8.6" with the
        non-thread-safe build (NTS), like the images of PHP 8.3 to 8.5, and
