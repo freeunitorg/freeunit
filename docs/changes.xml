@@ -282,10 +282,12 @@ that holds a slash.
 <para>
 Docker images for PHP 8.6: "php-8.6" with the non-thread-safe build (NTS),
 like the images of PHP 8.3 to 8.5, and "php-8.6-zts" with the thread-safe
-build (ZTS).  The official PHP images are ZTS only from PHP 8.6, so the NTS
-base is built from the official recipe without the ZTS options and published
-as ghcr.io/freeunitorg/php-nts.  The image check and the tests fail when an
-image or a test leg has the other build.
+build (ZTS).  The official "cli" image of PHP 8.6 is ZTS, and the official
+"nts" image has no embed SAPI, which the PHP module needs.  So the NTS base is
+built from the official "cli" recipe without the ZTS options and published as
+ghcr.io/freeunitorg/php-nts.  Like the official PHP 8.6 images, both images
+have no "pecl" command and no "mbstring" extension.  The image check and the
+tests fail when an image or a test leg has the other build.
 </para>
 </change>
 
