@@ -15,6 +15,7 @@ typedef struct {
     nxt_str_t                       path;
     nxt_conf_value_t                *format;
     nxt_conf_value_t                *expr;
+    uint8_t                         log_credentials;  /* 1 bit */
 } nxt_router_access_log_conf_t;
 
 
@@ -44,9 +45,9 @@ struct nxt_router_access_log_format_s {
 
 
 static nxt_router_access_log_format_t *nxt_router_access_log_format_create(
-    nxt_task_t *task, nxt_router_conf_t *rtcf, nxt_conf_value_t *value);
-static void nxt_router_access_log_warn(nxt_task_t *task,
-    const nxt_str_t *field, nxt_str_t *str);
+    nxt_task_t *task, nxt_router_conf_t *rtcf, nxt_conf_value_t *value,
+    nxt_bool_t log_credentials);
+static nxt_int_t nxt_router_access_log_redact(nxt_mp_t *mp, nxt_str_t *str);
 static void nxt_router_access_log_writer(nxt_task_t *task,
     nxt_http_request_t *r, nxt_router_access_log_t *access_log,
     nxt_router_access_log_format_t *format);
@@ -101,6 +102,12 @@ static nxt_conf_map_t  nxt_router_access_log_conf[] = {
         NXT_CONF_MAP_PTR,
         offsetof(nxt_router_access_log_conf_t, expr),
     },
+
+    {
+        nxt_string("log_credentials"),
+        NXT_CONF_MAP_INT8,
+        offsetof(nxt_router_access_log_conf_t, log_credentials),
+    },
 };
 
 
@@ -140,7 +147,8 @@ nxt_router_access_log_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
     rtcf->access_log = access_log;
 
     rtcf->log_format = nxt_router_access_log_format_create(task, rtcf,
-                                                           alcf.format);
+                                                    alcf.format,
+                                                    alcf.log_credentials);
     if (nxt_slow_path(rtcf->log_format == NULL)) {
         return NXT_ERROR;
     }
@@ -231,7 +239,7 @@ nxt_router_access_log_get(nxt_task_t *task, nxt_router_t *router,
 
 static nxt_router_access_log_format_t *
 nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
-    nxt_conf_value_t *value)
+    nxt_conf_value_t *value, nxt_bool_t log_credentials)
 {
     uint32_t                        i, n, next;
     nxt_str_t                       name, str, *dst;
@@ -275,7 +283,12 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
 
                 nxt_conf_get_string(cv, &str);
 
-                nxt_router_access_log_warn(task, &name, &str);
+                if (!log_credentials
+                    && nxt_router_access_log_redact(rtcf->mem_pool, &str)
+                       != NXT_OK)
+                {
+                    return NULL;
+                }
 
                 member[i].tstr = nxt_tstr_compile(rtcf->tstr_state, &str,
                                                   NXT_TSTR_LOGGING);
@@ -292,7 +305,12 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
         } else {
             nxt_conf_get_string(value, &str);
 
-            nxt_router_access_log_warn(task, NULL, &str);
+            if (!log_credentials
+                && nxt_router_access_log_redact(rtcf->mem_pool, &str)
+                   != NXT_OK)
+            {
+                return NULL;
+            }
         }
 
     } else {
@@ -318,55 +336,83 @@ nxt_router_access_log_format_create(nxt_task_t *task, nxt_router_conf_t *rtcf,
 
 
 /*
- * A format that names a credential header writes a bearer token or a session
- * cookie into the log file.  It is accepted, as in earlier versions, with a
- * warning.  The warning is here and not in the validator, so that a
- * configuration that the control API refuses gives none.  The text describes
- * the format, so it stays true also when the router then fails to apply the
- * configuration, for example when the new log file cannot be opened.  An
- * njs template reads a header through the request object, and the format
- * string cannot show that.
+ * A variable that names a credential header is replaced with the text
+ * "REDACTED" before the format is compiled, so the request path does not
+ * change and the header value never reaches the log.  "log_credentials"
+ * keeps the value.  An njs template reads a header through the request
+ * object and is left as it is.
  */
 
-static void
-nxt_router_access_log_warn(nxt_task_t *task, const nxt_str_t *field,
-    nxt_str_t *str)
+static nxt_int_t
+nxt_router_access_log_redact(nxt_mp_t *mp, nxt_str_t *str)
 {
-    u_char     *p, *end, *next;
-    nxt_str_t  part;
+    u_char      *p, *end, *next, *dst, *start;
+    nxt_str_t   part;
+    nxt_bool_t  found;
+
+    static const nxt_str_t  redacted = nxt_string("REDACTED");
 
     if (nxt_tstr_is_js(str)) {
-        return;
+        return NXT_OK;
     }
 
-    p = str->start;
-    end = p + str->length;
+    /*
+     * The first pass finds a variable to replace, the second one copies the
+     * format.  "REDACTED" is shorter than any variable that it replaces, so
+     * the copy is not longer than the format.
+     */
 
-    while (p < end) {
-        next = nxt_var_next_part(p, end, &part);
+    found = 0;
+    start = NULL;
+    dst = NULL;
 
-        if (next == NULL) {
-            /* The validator has accepted the syntax. */
-            return;
-        }
+    for ( ;; ) {
+        p = str->start;
+        end = p + str->length;
 
-        if (part.start != NULL && nxt_http_var_credential(&part)) {
+        while (p < end) {
+            next = nxt_var_next_part(p, end, &part);
 
-            if (field != NULL) {
-                nxt_log(task, NXT_LOG_WARN, "the access log format uses the "
-                        "\"%V\" variable in the \"%V\" field.  It writes "
-                        "the value of a header that can carry a credential.",
-                        &part, field);
-
-            } else {
-                nxt_log(task, NXT_LOG_WARN, "the access log format uses the "
-                        "\"%V\" variable.  It writes the value of a header "
-                        "that can carry a credential.", &part);
+            if (nxt_slow_path(next == NULL)) {
+                /* The validator has accepted the syntax. */
+                return NXT_ERROR;
             }
+
+            if (part.start != NULL && nxt_http_var_credential(&part)) {
+                if (dst == NULL) {
+                    found = 1;
+                    break;
+                }
+
+                dst = nxt_cpymem(dst, redacted.start, redacted.length);
+
+            } else if (dst != NULL) {
+                dst = nxt_cpymem(dst, p, next - p);
+            }
+
+            p = next;
         }
 
-        p = next;
+        if (!found) {
+            return NXT_OK;
+        }
+
+        if (dst != NULL) {
+            break;
+        }
+
+        start = nxt_mp_nget(mp, str->length);
+        if (nxt_slow_path(start == NULL)) {
+            return NXT_ERROR;
+        }
+
+        dst = start;
     }
+
+    str->start = start;
+    str->length = dst - start;
+
+    return NXT_OK;
 }
 
 
