@@ -41,12 +41,55 @@ class ApplicationWasmComponent(ApplicationProto):
 
         return output
 
-    def load(
-        self, script, execution_timeout=None, limits=None, access=None, **kwargs
-    ):
-        self.prepare_env(script)
+    @staticmethod
+    def prepare_env_wasip2(script, build_dir):
+        """Build a guest with rustc's wasm32-wasip2 target, which links a
+        component by itself.  The WASI 0.3 guests are built this way, as
+        "cargo component" makes WASI 0.2 components.  `build_dir` must
+        outlive the tests that use the component: the per-test temporary
+        directory is removed after each test.  Returns the path of the
+        component, or None if it cannot be built here."""
 
-        component_path = f'{option.temp_dir}/wasm_component/{script}/target/wasm32-wasip1/release/test_wasi_component.wasm'
+        app_path = f'{build_dir}/{script}'
+
+        shutil.copytree(f'{option.test_dir}/wasm_component/{script}', app_path)
+
+        try:
+            subprocess.check_output(
+                [
+                    'cargo',
+                    'build',
+                    '--release',
+                    '--locked',
+                    '--target',
+                    'wasm32-wasip2',
+                ],
+                cwd=app_path,
+                stderr=subprocess.STDOUT,
+            )
+        except KeyboardInterrupt:
+            raise
+
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return None
+
+        return f'{app_path}/target/wasm32-wasip2/release/test_wasi_component.wasm'
+
+    def load(
+        self,
+        script,
+        execution_timeout=None,
+        limits=None,
+        access=None,
+        component=None,
+        **kwargs,
+    ):
+        if component is None:
+            self.prepare_env(script)
+
+            component = f'{option.temp_dir}/wasm_component/{script}/target/wasm32-wasip1/release/test_wasi_component.wasm'
+
+        component_path = component
 
         app = {
             "type": "wasm-wasi-component",
