@@ -32,9 +32,11 @@ async def application(scope, receive, send):
                                 raise RuntimeError('stall gate not released')
                             time.sleep(0.01)
                         Path(gate + '.released').touch()
-                        # The timeout test has already closed the socket;
-                        # do not echo the queued flood during teardown.
-                        return
+                        if os.environ.get('UNIT_TEST_STALL_ECHO') is None:
+                            # The timeout test has already closed the
+                            # socket; do not echo the queued flood during
+                            # teardown.
+                            return
                     continue
 
                 await send(

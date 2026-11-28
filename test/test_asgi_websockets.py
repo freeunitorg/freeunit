@@ -1813,29 +1813,47 @@ def test_asgi_websockets_message_over_buffer_limit():
 
 
 def test_asgi_websockets_app_queue_full(wait_for_record):
-    client.load('websockets/stall')
+    # The router puts each frame of a message in the application port
+    # queue, 16384 items, so 20000 one-byte frames fill it while the
+    # application reads nothing.  The router must wait for room, not close
+    # the connection.  The bytes differ, so a frame out of order shows.
+    #
+    # A fixed application sleep does not guarantee a full queue: on a slow
+    # CPU the client needs longer than the sleep to send 16384 frames, and
+    # the application drains the queue as it fills.  Hold the application
+    # until the router has paused instead.
+    gate = f'{option.temp_dir}/stall-gate'
+    client.load(
+        'websockets/stall',
+        environment={
+            'UNIT_TEST_STALL_GATE': gate,
+            'UNIT_TEST_STALL_ECHO': '1',
+        },
+    )
 
     _, sock, _ = ws.upgrade()
 
-    # The application blocks for 2 s on "stall" and reads nothing.  The
-    # router puts each frame of the next message in the application port
-    # queue, 16384 items, so 20000 one-byte frames fill it.  The router must
-    # wait for room, not close the connection.  The bytes differ, so a frame
-    # out of order shows.
     ws.frame_write(sock, ws.OP_TEXT, 'stall')
 
     payload = bytes(i % 251 for i in range(20000))
-    ws.message(sock, ws.OP_BINARY, payload, fragmention_size=1)
+
+    try:
+        assert waitforfiles(gate + '.started', timeout=150), 'application stalled'
+
+        ws.message(sock, ws.OP_BINARY, payload, fragmention_size=1)
+
+        assert wait_for_record(
+            r'websocket: the application queue is full, reading from the '
+            r'client paused'
+        ), 'paused'
+
+    finally:
+        Path(gate + '.release').touch()
 
     frame = ws.message_read(sock, read_timeout=30)
 
     assert frame['opcode'] == ws.OP_BINARY, 'opcode'
     assert frame['data'] == payload, 'payload'
-
-    assert wait_for_record(
-        r'websocket: the application queue is full, reading from the '
-        r'client paused'
-    ), 'paused'
 
     close_connection(sock)
 
