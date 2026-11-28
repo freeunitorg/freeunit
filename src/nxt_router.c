@@ -3844,7 +3844,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
             certificate = nxt_conf_get_path(listener, &certificate_path);
 
             if (certificate != NULL) {
-                tls_init = nxt_mp_get(tmcf->mem_pool, sizeof(nxt_tls_init_t));
+                tls_init = nxt_mp_zget(tmcf->mem_pool, sizeof(nxt_tls_init_t));
                 if (nxt_slow_path(tls_init == NULL)) {
                     return NXT_ERROR;
                 }

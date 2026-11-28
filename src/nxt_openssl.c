@@ -108,8 +108,12 @@ static nxt_int_t nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
 static nxt_int_t nxt_openssl_chain_file(nxt_task_t *task, SSL_CTX *ctx,
     nxt_tls_conf_t *conf, nxt_mp_t *mp, nxt_bool_t single);
 #if (NXT_HAVE_OPENSSL_CONF_CMD)
+static nxt_int_t nxt_ssl_conf_commands_check(nxt_task_t *task,
+    nxt_tls_init_t *tls_init, nxt_mp_t *mp);
 static nxt_int_t nxt_ssl_conf_commands(nxt_task_t *task, SSL_CTX *ctx,
-    nxt_conf_value_t *value, nxt_mp_t *mp);
+    nxt_tls_init_t *tls_init, nxt_mp_t *mp);
+static const char *nxt_ssl_conf_command_refusal(int ret);
+static const char *nxt_ssl_conf_commands_bounds(SSL_CTX *ctx);
 #endif
 #if (NXT_HAVE_OPENSSL_TLSEXT)
 static nxt_int_t nxt_tls_ticket_keys(nxt_task_t *task, SSL_CTX *ctx,
@@ -228,6 +232,12 @@ nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
     STACK_OF(X509_NAME)    *list;
     nxt_tls_bundle_conf_t  *bundle;
 
+#if (NXT_HAVE_OPENSSL_CONF_CMD)
+    if (tls_init->check) {
+        return nxt_ssl_conf_commands_check(task, tls_init, mp);
+    }
+#endif
+
     conf = tls_init->conf;
 
     bundle = conf->bundle;
@@ -316,7 +326,7 @@ nxt_openssl_server_init(nxt_task_t *task, nxt_mp_t *mp,
 
 #if (NXT_HAVE_OPENSSL_CONF_CMD)
     if (tls_init->conf_cmds != NULL
-        && nxt_ssl_conf_commands(task, ctx, tls_init->conf_cmds, mp) != NXT_OK)
+        && nxt_ssl_conf_commands(task, ctx, tls_init, mp) != NXT_OK)
     {
         goto fail;
     }
@@ -506,16 +516,43 @@ clean:
 
 #if (NXT_HAVE_OPENSSL_CONF_CMD)
 
+/* The dry run of nxt_tls_init_t.check: a scratch context, nothing is kept. */
+
 static nxt_int_t
-nxt_ssl_conf_commands(nxt_task_t *task, SSL_CTX *ctx, nxt_conf_value_t *conf,
+nxt_ssl_conf_commands_check(nxt_task_t *task, nxt_tls_init_t *tls_init,
+    nxt_mp_t *mp)
+{
+    SSL_CTX    *ctx;
+    nxt_int_t  ret;
+
+    ctx = SSL_CTX_new(SSLv23_server_method());
+    if (nxt_slow_path(ctx == NULL)) {
+        nxt_openssl_log_error(task, NXT_LOG_ALERT, "SSL_CTX_new() failed");
+        return NXT_ERROR;
+    }
+
+    ret = nxt_ssl_conf_commands(task, ctx, tls_init, mp);
+
+    SSL_CTX_free(ctx);
+
+    return ret;
+}
+
+
+static nxt_int_t
+nxt_ssl_conf_commands(nxt_task_t *task, SSL_CTX *ctx, nxt_tls_init_t *tls_init,
     nxt_mp_t *mp)
 {
     int               ret;
     char              *zcmd, *zvalue;
     uint32_t          index;
+    nxt_int_t         rc;
     nxt_str_t         cmd, value;
     SSL_CONF_CTX      *cctx;
-    nxt_conf_value_t  *member;
+    nxt_conf_value_t  *conf, *member;
+
+    rc = NXT_ERROR;
+    conf = tls_init->conf_cmds;
 
     cctx = SSL_CONF_CTX_new();
     if (nxt_slow_path(cctx == NULL)) {
@@ -548,7 +585,34 @@ nxt_ssl_conf_commands(nxt_task_t *task, SSL_CTX *ctx, nxt_conf_value_t *conf,
             goto fail;
         }
 
+        if (tls_init->check) {
+            /*
+             * A file or a directory, and what OpenSSL attaches to the
+             * certificate (ServerInfoFile), can only be judged with the
+             * listener's files: the router applies them as before.
+             */
+            ret = SSL_CONF_cmd_value_type(cctx, zcmd);
+
+            if (ret == SSL_CONF_TYPE_FILE || ret == SSL_CONF_TYPE_DIR) {
+                continue;
+            }
+        }
+
         ret = SSL_CONF_cmd(cctx, zcmd, zvalue);
+
+        if (tls_init->check) {
+            /* The validation reports the refusal; nothing is logged. */
+            tls_init->check_error = nxt_ssl_conf_command_refusal(ret);
+
+            if (tls_init->check_error != NULL) {
+                tls_init->check_name = cmd;
+                rc = NXT_DECLINED;
+                goto fail;
+            }
+
+            continue;
+        }
+
         if (ret == -2) {
             nxt_openssl_log_error(task, NXT_LOG_ERR,
                                   "unknown command \"%s\" in "
@@ -567,6 +631,17 @@ nxt_ssl_conf_commands(nxt_task_t *task, SSL_CTX *ctx, nxt_conf_value_t *conf,
         nxt_debug(task, "SSL_CONF_cmd(\"%s\", \"%s\")", zcmd, zvalue);
     }
 
+    if (tls_init->check) {
+        /* The bounds can come from several commands and from the system. */
+        tls_init->check_error = nxt_ssl_conf_commands_bounds(ctx);
+
+        if (tls_init->check_error != NULL) {
+            nxt_str_null(&tls_init->check_name);
+            rc = NXT_DECLINED;
+            goto fail;
+        }
+    }
+
     if (SSL_CONF_CTX_finish(cctx) != 1) {
         nxt_openssl_log_error(task, NXT_LOG_ALERT,
                               "SSL_CONF_finish() failed");
@@ -581,7 +656,45 @@ fail:
 
     SSL_CONF_CTX_free(cctx);
 
-    return NXT_ERROR;
+    return rc;
+}
+
+
+/* Why the validation refuses the command OpenSSL was just given, or NULL. */
+
+static const char *
+nxt_ssl_conf_command_refusal(int ret)
+{
+    const char  *reason;
+
+    if (ret > 0) {
+        return NULL;
+    }
+
+    reason = ERR_reason_error_string(ERR_peek_error());
+
+    ERR_clear_error();
+
+    return (reason != NULL) ? reason : "invalid value";
+}
+
+
+/* Why the protocol bounds after all commands leave no version, or NULL. */
+
+static const char *
+nxt_ssl_conf_commands_bounds(SSL_CTX *ctx)
+{
+#ifdef SSL_CTRL_GET_MIN_PROTO_VERSION
+    /* OpenSSL accepts this, and the listener then refuses every handshake. */
+    if (SSL_CTX_get_max_proto_version(ctx) != 0
+        && SSL_CTX_get_min_proto_version(ctx)
+           > SSL_CTX_get_max_proto_version(ctx))
+    {
+        return "the minimum protocol version is above the maximum";
+    }
+#endif
+
+    return NULL;
 }
 
 #endif

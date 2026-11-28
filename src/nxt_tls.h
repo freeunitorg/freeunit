@@ -89,6 +89,15 @@ struct nxt_tls_init_s {
     nxt_conf_value_t              *tickets_conf;
 
     nxt_tls_conf_t                *conf;
+
+    /*
+     * A dry run for the configuration validation: server_init() only applies
+     * conf_cmds to a scratch context.  If the library refuses a command, it
+     * returns NXT_DECLINED with the command and the reason set here.
+     */
+    uint8_t                       check;  /* 1 bit */
+    nxt_str_t                     check_name;
+    const char                    *check_error;
 };
 
 

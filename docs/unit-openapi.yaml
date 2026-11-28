@@ -8098,7 +8098,11 @@ components:
     configListenerTlsConfCommands:
       type: object
       description: "Defines the SSL configuration commands to be set for
-        the listener."
+        the listener, as OpenSSL's `SSL_CONF_cmd()` takes them. `MinProtocol`
+        and `MaxProtocol` bound the protocol versions; `CipherString` lists
+        the ciphers of TLS 1.2 and below and `CipherSuites` the cipher suites
+        of TLS 1.3, each without effect on the other. A command or a value
+        that OpenSSL refuses is a validation error."
       additionalProperties:
         type: string
 
