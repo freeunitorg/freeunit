@@ -4,7 +4,8 @@
 
 /*
  * The access log record write after a short write or a failed write
- * (src/nxt_router_access_log.c).
+ * (src/nxt_router_access_log.c builds the record; the write loop and the
+ * fault hooks are in src/nxt_log_file_sink.c).
  *
  * The log is a pipe.  The fault hooks set the results of the next write()
  * calls: a call fails before any byte, or writes at most n bytes.  After each
@@ -282,8 +283,8 @@ nxt_router_access_log_test_case(nxt_thread_t *thr, nxt_task_t *task,
             break;
         }
 
-        nxt_router_access_log_test_fault = step->fault;
-        nxt_router_access_log_test_faults = step->nfaults;
+        nxt_log_file_sink_test_fault = step->fault;
+        nxt_log_file_sink_test_faults = step->nfaults;
 
         switch (step->action) {
 
@@ -311,14 +312,14 @@ nxt_router_access_log_test_case(nxt_thread_t *thr, nxt_task_t *task,
         }
 
         /* Every fault was used: the step made the writes it should. */
-        if (nxt_router_access_log_test_faults != 0) {
+        if (nxt_log_file_sink_test_faults != 0) {
             nxt_log_alert(thr->log, "access log test \"%s\", step %ui: "
                           "%ui faults left", c->name, i,
-                          nxt_router_access_log_test_faults);
+                          nxt_log_file_sink_test_faults);
             ret = NXT_ERROR;
         }
 
-        nxt_router_access_log_test_faults = 0;
+        nxt_log_file_sink_test_faults = 0;
 
         for (j = 0; j < 2; j++) {
             if (nxt_router_access_log_test_read(thr, fds[j][0], c->name, i,
@@ -455,6 +456,76 @@ nxt_router_access_log_test_live(nxt_thread_t *thr, nxt_task_t *task,
 }
 
 
+/*
+ * The file sink reports a defined errno when it stops without a system call
+ * error: an exhausted retry budget (three one-byte writes) and a zero-byte
+ * write both leave NXT_EIO, while a failed write leaves the write() error.
+ */
+
+static nxt_int_t
+nxt_router_access_log_sink_test(nxt_thread_t *thr)
+{
+    int                    short_errno, zero_errno, error_errno;
+    ssize_t                short_n, zero_n, error_n;
+    nxt_fd_t               fd;
+
+    static const u_char   record[] = "record\n";
+    static const ssize_t  short_faults[] = { 1, 1, 1 };
+    static const ssize_t  zero_faults[] = { 0 };
+    static const ssize_t  error_faults[] = { -1 };
+
+    fd = open("/dev/null", O_WRONLY);
+    if (nxt_slow_path(fd == -1)) {
+        nxt_log_alert(thr->log, "access log test: open(/dev/null) failed %E",
+                      nxt_errno);
+        return NXT_ERROR;
+    }
+
+    nxt_set_errno(0);
+    nxt_log_file_sink_test_fault = short_faults;
+    nxt_log_file_sink_test_faults = nxt_nitems(short_faults);
+    short_n = nxt_log_file_sink.write(&fd, record, nxt_length("record\n"));
+    short_errno = nxt_errno;
+    nxt_log_file_sink_test_fault = NULL;
+    nxt_log_file_sink_test_faults = 0;
+
+    nxt_set_errno(0);
+    nxt_log_file_sink_test_fault = zero_faults;
+    nxt_log_file_sink_test_faults = nxt_nitems(zero_faults);
+    zero_n = nxt_log_file_sink.write(&fd, record, nxt_length("record\n"));
+    zero_errno = nxt_errno;
+    nxt_log_file_sink_test_fault = NULL;
+    nxt_log_file_sink_test_faults = 0;
+
+    nxt_set_errno(0);
+    nxt_log_file_sink_test_fault = error_faults;
+    nxt_log_file_sink_test_faults = nxt_nitems(error_faults);
+    error_n = nxt_log_file_sink.write(&fd, record, nxt_length("record\n"));
+    error_errno = nxt_errno;
+    nxt_log_file_sink_test_fault = NULL;
+    nxt_log_file_sink_test_faults = 0;
+
+    (void) close(fd);
+
+    NXT_TEST_CHECK(thr->log,
+                   short_n == 3 && short_errno == NXT_EIO,
+                   "access log test: three one-byte writes gave %d/%d, "
+                   "expected 3/%d", (int) short_n, short_errno, NXT_EIO);
+
+    NXT_TEST_CHECK(thr->log,
+                   zero_n == 0 && zero_errno == NXT_EIO,
+                   "access log test: a zero-byte write gave %d/%d, "
+                   "expected 0/%d", (int) zero_n, zero_errno, NXT_EIO);
+
+    NXT_TEST_CHECK(thr->log,
+                   error_n == 0 && error_errno == NXT_ENOSPC,
+                   "access log test: a failed write gave %d/%d, "
+                   "expected 0/%d", (int) error_n, error_errno, NXT_ENOSPC);
+
+    return NXT_OK;
+}
+
+
 nxt_int_t
 nxt_router_access_log_test(nxt_thread_t *thr)
 {
@@ -501,14 +572,18 @@ nxt_router_access_log_test(nxt_thread_t *thr)
         }
     }
 
+    if (nxt_router_access_log_sink_test(thr) != NXT_OK) {
+        failed++;
+    }
+
     if (nxt_router_access_log_test_live(thr, &task, &router) != NXT_OK) {
         failed++;
     }
 
     nxt_router = saved_router;
 
-    nxt_router_access_log_test_fault = NULL;
-    nxt_router_access_log_test_faults = 0;
+    nxt_log_file_sink_test_fault = NULL;
+    nxt_log_file_sink_test_faults = 0;
 
     for (i = 0; i < 2; i++) {
         (void) close(fds[i][0]);

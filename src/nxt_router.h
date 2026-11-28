@@ -9,6 +9,7 @@
 
 
 #include <nxt_main.h>
+#include <nxt_log_sink.h>
 #include <nxt_runtime.h>
 #include <nxt_main_process.h>
 
@@ -439,6 +440,15 @@ struct nxt_router_access_log_s {
                                       nxt_router_access_log_t *access_log,
                                       nxt_router_access_log_format_t *format);
     nxt_fd_t               fd;
+
+    /*
+     * The destination of a complete record, and its context.  NULL is the
+     * built-in file sink, whose context is &fd: the access log keeps the
+     * descriptor for the reopen, so the context points at it, not at a copy.
+     */
+    const nxt_log_sink_t   *sink;
+    void                   *sink_ctx;
+
     nxt_str_t              path;
 
     /*
@@ -520,8 +530,8 @@ void nxt_router_test_app_port_release(nxt_task_t *task, nxt_app_t *app,
     nxt_port_t *port, nxt_apr_action_t action);
 
 /*
- * The access log record write, the loss of a record that could not be built,
- * the reopen reply and the write faults, for the access log test.
+ * The access log record write, the loss of a record that could not be built
+ * and the reopen reply, for the access log test.
  */
 void nxt_router_access_log_test_record(nxt_task_t *task,
     nxt_router_access_log_t *access_log, u_char *start, size_t length);
@@ -530,8 +540,6 @@ void nxt_router_access_log_test_lost(nxt_task_t *task,
 nxt_int_t nxt_router_access_log_test_reopen_ready(nxt_task_t *task,
     nxt_router_access_log_t *access_log, nxt_fd_t fd);
 
-extern const ssize_t  *nxt_router_access_log_test_fault;
-extern nxt_uint_t     nxt_router_access_log_test_faults;
 #endif
 
 #if (NXT_TESTS)
