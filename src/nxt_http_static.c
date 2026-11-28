@@ -233,12 +233,10 @@ nxt_http_static_meta(nxt_time_t mtime, nxt_off_t size, nxt_mp_t *mp)
 
 static nxt_http_action_t *nxt_http_static(nxt_task_t *task,
     nxt_http_request_t *r, nxt_http_action_t *action);
-static void nxt_http_static_iterate(nxt_task_t *task, nxt_http_request_t *r,
+static nxt_int_t nxt_http_static_iterate(nxt_task_t *task,
+    nxt_http_request_t *r, nxt_http_static_ctx_t *ctx);
+static nxt_int_t nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_static_ctx_t *ctx);
-static void nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_http_static_ctx_t *ctx);
-static void nxt_http_static_next(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_http_static_ctx_t *ctx, nxt_http_status_t status);
 static nxt_http_status_t nxt_http_static_preconditions(nxt_http_request_t *r,
     nxt_str_t *etag, nxt_bool_t weak, nxt_time_t mtime, nxt_bool_t date_ok);
 static nxt_bool_t nxt_http_static_etag_match(nxt_str_t *list, nxt_str_t *etag,
@@ -384,8 +382,10 @@ static nxt_http_action_t *
 nxt_http_static(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_action_t *action)
 {
-    nxt_bool_t             need_body;
-    nxt_http_static_ctx_t  *ctx;
+    nxt_int_t               ret;
+    nxt_bool_t              need_body;
+    nxt_http_static_ctx_t   *ctx;
+    nxt_http_static_conf_t  *conf;
 
     if (nxt_slow_path(!nxt_str_eq(r->method, "GET", 3))) {
 
@@ -413,13 +413,54 @@ nxt_http_static(nxt_task_t *task, nxt_http_request_t *r,
     ctx->action = action;
     ctx->need_body = need_body;
 
-    nxt_http_static_iterate(task, r, ctx);
+    conf = action->u.conf;
+
+    /*
+     * Try the shares in this loop, and return the fallback to
+     * nxt_http_request_action().  A nested call for each share or each
+     * fallback uses more stack, and a long chain overflows the stack of
+     * the router thread (128 KiB by default on musl).
+     */
+
+    for ( ;; ) {
+        ret = nxt_http_static_iterate(task, r, ctx);
+
+        if (ret != NXT_DECLINED) {
+            /* The request is answered and can be freed already. */
+            return NULL;
+        }
+
+        ctx->share_idx++;
+
+        if (ctx->share_idx >= conf->nshares) {
+            break;
+        }
+    }
+
+    if (action->fallback != NULL) {
+        if (nxt_slow_path(r->log_route)) {
+            nxt_log(task, NXT_LOG_NOTICE, "\"fallback\" taken");
+        }
+
+        r->action = action->fallback;
+        return action->fallback;
+    }
+
+    nxt_http_request_error(task, r, ctx->status);
 
     return NULL;
 }
 
 
-static void
+/*
+ * nxt_http_static_iterate() and nxt_http_static_send() return NXT_OK when
+ * the request is answered with a file, a redirect or an error.  The caller
+ * must not use the request after that.  They return NXT_DECLINED when the
+ * current share has no file to send.  Then ctx->status holds the status
+ * for the error response if no other share and no fallback remains.
+ */
+
+static nxt_int_t
 nxt_http_static_iterate(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_static_ctx_t *ctx)
 {
@@ -498,8 +539,8 @@ nxt_http_static_iterate(nxt_task_t *task, nxt_http_request_t *r,
              * applies to every share, a bad "chroot" dooms the whole action --
              * fail the request rather than advancing to the next share (which
              * would reuse the unchecked value).  Skip straight to the last
-             * share so nxt_http_static_next() bypasses the remaining shares
-             * (never re-resolving the bad chroot) yet still dispatches the
+             * share so nxt_http_static() bypasses the remaining shares
+             * (never re-resolving the bad chroot) yet still takes the
              * action "fallback" when one is configured, matching how the share
              * NUL rejection below behaves.
              */
@@ -510,8 +551,8 @@ nxt_http_static_iterate(nxt_task_t *task, nxt_http_request_t *r,
                 nxt_log(task, NXT_LOG_ERR, "rejected \"chroot\" path with an "
                         "embedded zero byte");
                 ctx->share_idx = conf->nshares - 1;
-                nxt_http_static_next(task, r, ctx, NXT_HTTP_NOT_FOUND);
-                return;
+                ctx->status = NXT_HTTP_NOT_FOUND;
+                return NXT_DECLINED;
             }
         }
 #endif
@@ -525,8 +566,8 @@ nxt_http_static_iterate(nxt_task_t *task, nxt_http_request_t *r,
          */
         if (nxt_slow_path(ctx->share.length == 0)) {
             nxt_log(task, NXT_LOG_ERR, "rejected empty \"share\" path");
-            nxt_http_static_next(task, r, ctx, NXT_HTTP_NOT_FOUND);
-            return;
+            ctx->status = NXT_HTTP_NOT_FOUND;
+            return NXT_DECLINED;
         }
 
         /*
@@ -540,22 +581,22 @@ nxt_http_static_iterate(nxt_task_t *task, nxt_http_request_t *r,
         {
             nxt_log(task, NXT_LOG_ERR, "rejected \"share\" path with an "
                     "embedded zero byte");
-            nxt_http_static_next(task, r, ctx, NXT_HTTP_NOT_FOUND);
-            return;
+            ctx->status = NXT_HTTP_NOT_FOUND;
+            return NXT_DECLINED;
         }
     }
 
-    nxt_http_static_send(task, r, ctx);
-
-    return;
+    return nxt_http_static_send(task, r, ctx);
 
 fail:
 
     nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+
+    return NXT_OK;
 }
 
 
-static void
+static nxt_int_t
 nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_http_static_ctx_t *ctx)
 {
@@ -622,8 +663,8 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             }
 
             if (ret == 0) {
-                nxt_http_static_next(task, r, ctx, NXT_HTTP_FORBIDDEN);
-                return;
+                ctx->status = NXT_HTTP_FORBIDDEN;
+                return NXT_DECLINED;
             }
         }
 
@@ -751,8 +792,8 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         }
 
         if (level == NXT_LOG_ERR) {
-            nxt_http_static_next(task, r, ctx, status);
-            return;
+            ctx->status = status;
+            return NXT_DECLINED;
         }
 
         goto fail;
@@ -970,7 +1011,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             f = NULL;
 
             nxt_http_request_error(task, r, NXT_HTTP_NOT_ACCEPTABLE);
-            return;
+            return NXT_OK;
         } else if (ret != NXT_OK) {
             goto fail;
         }
@@ -994,7 +1035,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 
             if (pcond == NXT_HTTP_PRECONDITION_FAILED) {
                 nxt_http_request_error(task, r, pcond);
-                return;
+                return NXT_OK;
             }
 
             /*
@@ -1299,8 +1340,8 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
             nxt_log(task, NXT_LOG_ERR, "\"%FN\" is not a regular file",
                     f->name);
 
-            nxt_http_static_next(task, r, ctx, NXT_HTTP_NOT_FOUND);
-            return;
+            ctx->status = NXT_HTTP_NOT_FOUND;
+            return NXT_DECLINED;
         }
 
         f = NULL;
@@ -1352,7 +1393,7 @@ send:
     nxt_http_request_header_send(task, r, body_handler, NULL);
 
     r->state = &nxt_http_static_send_state;
-    return;
+    return NXT_OK;
 
 fail:
 
@@ -1361,6 +1402,8 @@ fail:
     }
 
     nxt_http_request_error(task, r, NXT_HTTP_INTERNAL_SERVER_ERROR);
+
+    return NXT_OK;
 }
 
 
@@ -1878,37 +1921,6 @@ nxt_http_static_range(nxt_http_request_t *r, nxt_str_t *etag,
     *end = b;
 
     return NXT_HTTP_PARTIAL_CONTENT;
-}
-
-
-static void
-nxt_http_static_next(nxt_task_t *task, nxt_http_request_t *r,
-    nxt_http_static_ctx_t *ctx, nxt_http_status_t status)
-{
-    nxt_http_action_t       *action;
-    nxt_http_static_conf_t  *conf;
-
-    action = ctx->action;
-    conf = action->u.conf;
-
-    ctx->share_idx++;
-
-    if (ctx->share_idx < conf->nshares) {
-        nxt_http_static_iterate(task, r, ctx);
-        return;
-    }
-
-    if (action->fallback != NULL) {
-        if (nxt_slow_path(r->log_route)) {
-            nxt_log(task, NXT_LOG_NOTICE, "\"fallback\" taken");
-        }
-
-        r->action = action->fallback;
-        nxt_http_request_action(task, r, action->fallback);
-        return;
-    }
-
-    nxt_http_request_error(task, r, status);
 }
 
 

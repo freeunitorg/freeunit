@@ -47,6 +47,16 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        "opcache.restrict_api" is set, when the script is not cached, and on
        PHP older than 8.1.
 
+    *) Bugfix: a GET or HEAD request to a "share" used more of the router
+       thread stack for each share that named no file and for each
+       "fallback". A fallback that passed back to its own route, or a chain
+       of about 180 fallbacks, crashed the router on musl, where the default
+       thread stack is 128 KiB. A "share" array with many thousands of paths
+       crashed it on any system. The shares and the fallbacks now run in a
+       loop. The limit of 255 passes now counts each fallback, so a fallback
+       cycle, or a chain of more than 127 actions with a fallback, gets a
+       500 response.
+
 
 Changes with FreeUnit 1.37.3                                     27 Nov 2026
 

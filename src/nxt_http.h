@@ -211,6 +211,7 @@ typedef struct {
 #endif
     uint32_t                    share_idx;
     uint8_t                     need_body;  /* 1 bit */
+    nxt_http_status_t           status:16;
 } nxt_http_static_ctx_t;
 
 
