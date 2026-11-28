@@ -4,7 +4,6 @@ Makefile
 __pycache__/
 .pytest_cache/
 /.idea/
-/CLAUDE.md
 /.claude/
 /pkg/docker/build-logs/
 /QWEN.md
