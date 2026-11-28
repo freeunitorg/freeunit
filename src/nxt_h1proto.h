@@ -132,4 +132,7 @@ nxt_int_t nxt_h1p_test_transfer_encoding(nxt_http_request_t *r,
 #define nxt_h1p_is_http11(h1p)                                              \
     ((h1p)->parser.version.s.minor != '0')
 
+
+extern nxt_lvlhsh_t  nxt_h1p_fields_hash;
+
 #endif  /* _NXT_H1PROTO_H_INCLUDED_ */
