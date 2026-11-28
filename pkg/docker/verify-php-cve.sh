@@ -13,9 +13,9 @@
 #                    The fixed versions are in pkg/community/PHP.CVE.md.
 #   thread safety    The PHP build is the expected one: non-thread-safe
 #                    (NTS) for a "php-<version>" image, thread-safe (ZTS)
-#                    for a "php-<version>-zts" image.  The official php
-#                    images are ZTS only from PHP 8.6, so a base image
-#                    that changes its build is seen here, not by the users.
+#                    for a "php-<version>-zts" image.  The official "cli"
+#                    image is ZTS from PHP 8.6, so a base image that
+#                    changes its build is seen here, not by the users.
 #   php module       The FreeUnit PHP module finds every library that it
 #                    needs, and one of them is libphp.  The module works
 #                    only with the libphp that it was built with.

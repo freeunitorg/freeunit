@@ -62,10 +62,10 @@ MODULE_PREBUILD_perl ?=	/bin/true
 
 VERSIONS_php ?=		$(call eol_versions,php)
 VARIANT_php ?=		cli-$(VARIANT)
-# The official php images are thread-safe (ZTS) only from PHP 8.6.  A PHP
-# version with "nts_base" in pkg/eol.json takes that non-thread-safe base
-# (built by .github/workflows/php-nts-base.yml) for php-<version>, and
-# "zts_variant" adds php-<version>-zts FROM the official, ZTS image.
+# A PHP version with "nts_base" in pkg/eol.json takes that non-thread-safe
+# base (built by .github/workflows/php-nts-base.yml) for php-<version>, and
+# "zts_variant" adds php-<version>-zts FROM the official "cli" image, which
+# is thread-safe (ZTS) from PHP 8.6.
 PHP_NTS_BASES :=	$(shell jq -r '.runtimes.php[] | select(.nts_base) | .version + "=" + .nts_base' $(EOL_JSON))
 php_nts_base =		$(patsubst $(1)=%,%,$(filter $(1)=%,$(PHP_NTS_BASES)))
 ifeq ($(origin VERSIONS_php_zts),undefined)

@@ -169,8 +169,7 @@ fi
 
 # Informational: the module builds and runs with both kinds of PHP.  A
 # thread-safe (ZTS) libphp and a non-thread-safe (NTS) one have different
-# ABIs, so the module works only with the libphp it was built with.  The
-# official php:8.6 images and later are ZTS only.
+# ABIs, so the module works only with the libphp it was built with.
 
 nxt_feature="PHP Zend Thread Safety"
 nxt_feature_name=""

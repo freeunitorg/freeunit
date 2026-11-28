@@ -4,14 +4,15 @@
 #
 # Usage: generate.sh DOCKER_LIBRARY_PHP_CHECKOUT PHP_BRANCH
 #
-# From PHP 8.6 the official php images are thread-safe (ZTS) only.  The
-# FreeUnit "php-<branch>" image stays non-thread-safe (NTS), like the images
-# of PHP 8.5 and older, so FreeUnit builds its own NTS base: the cli
-# Dockerfile of https://github.com/docker-library/php for Debian trixie,
-# with the ZTS options removed.  Everything else (the PHP tarball and its
-# GPG check, the extensions, the docker-php-ext-* helpers) is the same, so an
-# image FROM the FreeUnit NTS base installs extensions as the official image
-# does.
+# From PHP 8.6 the official "cli" image is thread-safe (ZTS).  The official
+# "nts" image is non-thread-safe (NTS), but it has no embed SAPI, which the
+# FreeUnit PHP module needs.  The FreeUnit "php-<branch>" image stays NTS,
+# like the images of PHP 8.5 and older, so FreeUnit builds its own NTS base:
+# the cli Dockerfile of https://github.com/docker-library/php for Debian
+# trixie, with the ZTS options removed.  Everything else (the PHP tarball and
+# its GPG check, the extensions, the docker-php-ext-* helpers) is the same, so
+# an image FROM the FreeUnit NTS base installs extensions as the official
+# image does.
 #
 # The ZTS options of the recipe are "--enable-zts" and
 # "--disable-zend-signals" with its comment line.  The script fails when the

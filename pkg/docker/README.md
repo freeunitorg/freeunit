@@ -56,8 +56,10 @@ you choose explicitly:
 
 The NTS base of PHP 8.6 is the docker-library recipe of the official image
 with the two ZTS options removed (`pkg/docker/php-nts/`). It has the same
-extensions and the same `docker-php-ext-install`, `docker-php-ext-enable` and
-`pecl` workflow. The workflow `php-nts-base.yml` builds it for amd64 and
+extensions and the same `docker-php-ext-install` and `docker-php-ext-enable`
+workflow. The official `php:8.6-nts` images cannot be the base, because they
+have no embed SAPI. Like the official PHP 8.6 images, `php-8.6` and
+`php-8.6-zts` have no `pecl` command and no `mbstring` extension. The workflow `php-nts-base.yml` builds it for amd64 and
 arm64, checks that it is NTS, has the embed SAPI and builds an extension, and
 rebuilds it every week for Debian updates. A new PHP patch release is a new
 recipe from `pkg/docker/php-nts/generate.sh`.
@@ -71,8 +73,7 @@ What this means for an application:
 - The configuration does not change. An application selects PHP by version:
   `"type": "php 8.6"`, or `"type": "php"` for the newest module.
 - An extension must be built for the same PHP build. In an image made
-  `FROM` a FreeUnit PHP image, `docker-php-ext-install` and `pecl install`
-  do this. An NTS extension binary does not load in the `php-8.6-zts`
+  `FROM` a FreeUnit PHP image, `docker-php-ext-install` does this. An NTS extension binary does not load in the `php-8.6-zts`
   image, and a ZTS one does not load in `php-8.6`.
 - The FreeUnit PHP module works only with the `libphp` that it was built
   with. A ZTS `libphp` and an NTS one have different ABIs. Do not replace
