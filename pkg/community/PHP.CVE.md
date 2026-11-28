@@ -71,6 +71,7 @@ later through the control API.
 
 An application config can also carry the setting under `options.admin`, and Unit
 passes it to PHP as an ini value.
+[PHP.HARDENING.md](PHP.HARDENING.md) lists the other PHP limits to set the same way.
 
 ### The scope of the 1.37.1 release
 
