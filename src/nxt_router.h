@@ -26,6 +26,7 @@ typedef struct nxt_router_access_log_s         nxt_router_access_log_t;
 typedef struct nxt_router_access_log_format_s  nxt_router_access_log_format_t;
 typedef struct nxt_http_comp_conf_s            nxt_http_comp_conf_t;
 typedef struct nxt_http_comp_ctx_s             nxt_http_comp_ctx_t;
+typedef struct nxt_router_comp_hold_s           nxt_router_comp_hold_t;
 
 
 #define NXT_HTTP_ACTION_ERROR  ((nxt_http_action_t *) -1)

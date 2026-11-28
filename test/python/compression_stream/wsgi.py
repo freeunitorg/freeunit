@@ -24,8 +24,10 @@ def application(environ, start_response):
     clen = environ.get('HTTP_X_CONTENT_LENGTH', str(size * parts))
 
     # X-Content-Length: none sends no Content-Length, so the router does not
-    # know the length and sends the body chunked.
-    headers = [('Content-Type', 'text/plain')]
+    # know the length and sends the body chunked.  X-Content-Type replaces
+    # the media type, for the types that a hold exempts.
+    ctype = environ.get('HTTP_X_CONTENT_TYPE', 'text/plain')
+    headers = [('Content-Type', ctype)]
     if clen != 'none':
         headers.append(('Content-Length', clen))
 
