@@ -2,11 +2,10 @@ name: PHP NTS base images
 
 # Non-thread-safe (NTS) PHP base images for the FreeUnit PHP images.
 #
-# From PHP 8.6 the official php images are thread-safe (ZTS) only.  The
-# FreeUnit "php-<branch>" image stays NTS, like the images of PHP 8.5 and
-# older, and "php-<branch>-zts" is the explicit ZTS image FROM the official
-# one.  So FreeUnit builds the NTS base itself, from the docker-library
-# recipe with the ZTS options removed (pkg/docker/php-nts/generate.sh).
+# The FreeUnit "php-<branch>" image stays NTS, like the images of PHP 8.5
+# and older, and "php-<branch>-zts" is the explicit ZTS image FROM the
+# official one.  So FreeUnit builds the NTS base itself.  The reason and the
+# recipe are in pkg/docker/php-nts/generate.sh.
 #
 # For each pkg/docker/php-nts/Dockerfile.<branch> this workflow builds and
 # tests the image on amd64 and arm64, and publishes

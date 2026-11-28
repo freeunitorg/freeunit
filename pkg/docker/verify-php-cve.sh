@@ -13,9 +13,9 @@
 #                    The fixed versions are in pkg/community/PHP.CVE.md.
 #   thread safety    The PHP build is the expected one: non-thread-safe
 #                    (NTS) for a "php-<version>" image, thread-safe (ZTS)
-#                    for a "php-<version>-zts" image.  The official php
-#                    images are ZTS only from PHP 8.6, so a base image
-#                    that changes its build is seen here, not by the users.
+#                    for a "php-<version>-zts" image.  The official "cli"
+#                    image is ZTS from PHP 8.6, so a base image that
+#                    changes its build is seen here, not by the users.
 #   php module       The FreeUnit PHP module finds every library that it
 #                    needs, and one of them is libphp.  The module works
 #                    only with the libphp that it was built with.
@@ -90,7 +90,16 @@ php -r 'echo (ini_get("session.upload_progress.enabled") ? "On" : "Off"), "\n";'
 b=$(dpkg-query -W -f='${Version}' libbrotli1 2>/dev/null) && printf '%s\n' "$b" || echo absent
 unitd --version 2>&1 | head -n 1
 php -r 'echo PHP_ZTS ? "ZTS" : "NTS", "\n";' 2>/dev/null || echo unknown
-m=$(ls /usr/lib/unit/modules/php*.unit.so 2>/dev/null | head -n 1); if [ -z "$m" ]; then echo absent; elif ldd "$m" 2>&1 | grep -q 'not found'; then echo unresolved; elif ldd "$m" 2>&1 | grep -q 'libphp'; then echo linked; else echo nolibphp; fi
+m=$(ls /usr/lib/unit/modules/php*.unit.so 2>/dev/null | head -n 1)
+if [ -z "$m" ]; then
+	echo absent
+else
+	case "$(ldd "$m" 2>&1)" in
+	*'not found'*) echo unresolved ;;
+	*libphp*)      echo linked ;;
+	*)             echo nolibphp ;;
+	esac
+fi
 IN_IMAGE
 ); then
 	out=
