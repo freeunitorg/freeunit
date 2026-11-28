@@ -111,19 +111,11 @@ jobs:
             echo "build_date=${BUILD_DATE}"
           } >> "$GITHUB_OUTPUT"
 
-          # Variant list is derived from pkg/eol.json (single source of truth).
-          # Each runtime version -> "<runtime>-<version>"; a null version (wasm,
-          # minimal) -> just "<runtime>"; "slim": true adds a "-slim" sibling,
-          # "zts_variant": true a thread-safe "-zts" sibling (PHP 8.6+).
+          # The variant list is derived from pkg/eol.json (single source of
+          # truth).  pkg/docker/variants.jq holds the rule.
           # Variant == Dockerfile suffix (pkg/docker/Dockerfile.<variant>).
-          all_variants=$(jq -c '[
-            .runtimes | to_entries[] | .key as $rt | .value[] |
-            if .version == null then $rt
-            else ([$rt + "-" + .version]
-                  + (if .slim then [$rt + "-" + .version + "-slim"] else [] end)
-                  + (if .zts_variant then [$rt + "-" + .version + "-zts"] else [] end))
-            end
-          ] | flatten' pkg/eol.json)
+          all_variants=$(jq -c -L pkg/docker \
+            'include "variants"; [variants]' pkg/eol.json)
 
           if [ -n "${INPUT_VARIANTS}" ]; then
             variants=$(jq -cn \
@@ -305,10 +297,9 @@ jobs:
           IMAGE: ${{ env.GHCR_REGISTRY }}/${{ env.GHCR_IMAGE_NAME }}:${{ needs.setup.outputs.version }}-${{ matrix.variant }}-${{ matrix.arch.name }}
           PLATFORM: ${{ matrix.arch.platform }}
         run: |
-          # The check reads four values inside the pushed image: the PHP
-          # version, the upload progress setting, the libbrotli1 version and
-          # the daemon version.  A failure stops this job, so the merge job
-          # creates no final tag and no floating tag.
+          # The header of pkg/docker/verify-php-cve.sh lists the checks.  A
+          # failure stops this job, so the merge job creates no final tag and
+          # no floating tag.
           #
           # The expected daemon version comes from the release tag, not from
           # the checkout.  The build job checks out the dispatch ref, so the

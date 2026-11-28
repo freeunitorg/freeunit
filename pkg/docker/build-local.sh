@@ -55,21 +55,14 @@ VERSION="${VERSION//\//-}"   # replace / with - (e.g. feat/foo → feat-foo)
 
 # ---------------------------------------------------------------------------
 # All variants — derived from pkg/eol.json (single source of truth, same list
-# release-docker.yml builds). <runtime>-<version>; a null version (wasm,
-# minimal) -> just <runtime>; "slim": true adds a -slim sibling.
+# release-docker.yml builds). variants.jq holds the rule.
 # ---------------------------------------------------------------------------
 EOL_JSON="${SCRIPT_DIR}/../eol.json"
 if ! command -v jq &>/dev/null; then
     echo "ERROR jq not found in PATH (required to read ${EOL_JSON})" >&2; exit 1
 fi
-mapfile -t ALL_VARIANTS < <(jq -r '
-    .runtimes | to_entries[] | .key as $rt | .value[] |
-    if .version == null then $rt
-    else ($rt + "-" + .version),
-         (if .slim then ($rt + "-" + .version + "-slim") else empty end),
-         (if .zts_variant then ($rt + "-" + .version + "-zts") else empty end)
-    end
-' "${EOL_JSON}")
+mapfile -t ALL_VARIANTS < <(jq -r -L "${SCRIPT_DIR}" \
+    'include "variants"; variants' "${EOL_JSON}")
 
 # ---------------------------------------------------------------------------
 # Helpers

@@ -90,7 +90,16 @@ php -r 'echo (ini_get("session.upload_progress.enabled") ? "On" : "Off"), "\n";'
 b=$(dpkg-query -W -f='${Version}' libbrotli1 2>/dev/null) && printf '%s\n' "$b" || echo absent
 unitd --version 2>&1 | head -n 1
 php -r 'echo PHP_ZTS ? "ZTS" : "NTS", "\n";' 2>/dev/null || echo unknown
-m=$(ls /usr/lib/unit/modules/php*.unit.so 2>/dev/null | head -n 1); if [ -z "$m" ]; then echo absent; elif ldd "$m" 2>&1 | grep -q 'not found'; then echo unresolved; elif ldd "$m" 2>&1 | grep -q 'libphp'; then echo linked; else echo nolibphp; fi
+m=$(ls /usr/lib/unit/modules/php*.unit.so 2>/dev/null | head -n 1)
+if [ -z "$m" ]; then
+	echo absent
+else
+	case "$(ldd "$m" 2>&1)" in
+	*'not found'*) echo unresolved ;;
+	*libphp*)      echo linked ;;
+	*)             echo nolibphp ;;
+	esac
+fi
 IN_IMAGE
 ); then
 	out=

@@ -66,8 +66,11 @@ VARIANT_php ?=		cli-$(VARIANT)
 # version with "nts_base" in pkg/eol.json takes that non-thread-safe base
 # (built by .github/workflows/php-nts-base.yml) for php-<version>, and
 # "zts_variant" adds php-<version>-zts FROM the official, ZTS image.
-php_nts_base = $(shell jq -r --arg v '$(1)' '.runtimes.php[] | select(.version == $$v) | .nts_base // empty' $(EOL_JSON))
-VERSIONS_php_zts ?=	$(shell jq -r '.runtimes.php[] | select(.zts_variant == true) | .version' $(EOL_JSON) | tr '\n' ' ')
+PHP_NTS_BASES :=	$(shell jq -r '.runtimes.php[] | select(.nts_base) | .version + "=" + .nts_base' $(EOL_JSON))
+php_nts_base =		$(patsubst $(1)=%,%,$(filter $(1)=%,$(PHP_NTS_BASES)))
+ifeq ($(origin VERSIONS_php_zts),undefined)
+VERSIONS_php_zts :=	$(shell jq -r '.runtimes.php[] | select(.zts_variant == true) | .version' $(EOL_JSON) | tr '\n' ' ')
+endif
 $(foreach phpversion, $(VERSIONS_php), $(eval CONTAINER_php-$(phpversion) = $(or $(call php_nts_base,$(phpversion)),php:$(phpversion)-$(VARIANT_php))))
 $(foreach phpversion, $(VERSIONS_php_zts), $(eval CONTAINER_php-$(phpversion)-zts = php:$(phpversion)-$(VARIANT_php)))
 CONFIGURE_php ?=	php
@@ -111,16 +114,19 @@ endef
 default:
 	@echo "valid targets: all build dockerfiles library clean"
 
-MODVERSIONS = $(foreach module, $(MODULES), $(foreach modversion, $(shell for v in $(VERSIONS_$(module)); do echo $$v; done | sort -r), $(module)-$(modversion)))
-MODVERSIONS += $(foreach module, $(MODULES_SLIM), $(foreach modversion, $(shell for v in $(VERSIONS_$(module)); do echo $$v; done | sort -r), $(module)-$(modversion)-slim))
-MODVERSIONS += $(foreach modversion, $(shell for v in $(VERSIONS_php_zts); do echo $$v; done | sort -r), php-$(modversion)-zts)
+rsort = $(shell for v in $(1); do echo $$v; done | sort -r)
+
+MODVERSIONS = $(foreach module, $(MODULES), $(foreach modversion, $(call rsort,$(VERSIONS_$(module))), $(module)-$(modversion)))
+MODVERSIONS += $(foreach module, $(MODULES_SLIM), $(foreach modversion, $(call rsort,$(VERSIONS_$(module))), $(module)-$(modversion)-slim))
+MODVERSIONS += $(foreach modversion, $(call rsort,$(VERSIONS_php_zts)), php-$(modversion)-zts)
 MODVERSIONS += wasm minimal
 
 # Every Dockerfile of a PHP image.  The generated ones come from the template.
 # The local ones are written by hand.
 PHP_DOCKERFILES = $(wildcard Dockerfile.php-*) $(wildcard local/Dockerfile.php-*)
 
-modname = $(shell echo $1 | /usr/bin/tr -d '.01234567890-' | sed 's/slim//; s/zts$$//')
+# The module of a variant is the text before its first dash.
+modname = $(firstword $(subst -, ,$1))
 
 dockerfiles: $(addprefix Dockerfile., $(MODVERSIONS))
 build: $(addprefix build-, $(MODVERSIONS))
@@ -154,13 +160,11 @@ check:
 	done
 	@echo "pkg/docker: every PHP Dockerfile carries the ini fragment"
 
-# The check script reads the PHP version, the upload progress setting, the
-# libbrotli1 version and the daemon version of one built image.  The caller
-# names the image with IMAGE=<tag>.  The target passes the version of this
-# Makefile as the expected daemon version.  PHP_TS=zts checks a
-# php-<version>-zts image; the default is a non-thread-safe image.
-PHP_TS ?= nts
-
+# verify-php-cve.sh checks one built image; its header lists the checks.  The
+# caller names the image with IMAGE=<tag>.  The target passes the version of
+# this Makefile as the expected daemon version.  PHP_TS=zts checks a
+# php-<version>-zts image; without it the script expects a non-thread-safe
+# image.
 verify:
 	@if [ -z "$(IMAGE)" ]; then \
 		echo "pkg/docker: the IMAGE variable is empty, name the image with IMAGE=<tag>" >&2; \
