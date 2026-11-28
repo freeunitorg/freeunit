@@ -240,6 +240,17 @@ struct nxt_http_request_s {
     nxt_str_t                       *args;
 
     nxt_str_t                       args_decoded;
+
+    /*
+     * The UTF-8 check results of the values that route regexes match: each
+     * route that tests the value uses the result of the first match.
+     * nxt_http_rewrite() resets "path_utf" when it changes the path.
+     */
+    nxt_regex_utf_t                 host_utf;
+    nxt_regex_utf_t                 path_utf;
+    nxt_regex_utf_t                 method_utf;
+    nxt_regex_utf_t                 query_utf;
+
     nxt_array_t                     *arguments;  /* of nxt_http_name_value_t */
     nxt_array_t                     *cookies;    /* of nxt_http_name_value_t */
     nxt_http_field_t                inline_fields[16];
