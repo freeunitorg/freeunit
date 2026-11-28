@@ -25,6 +25,13 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        mode does not accept matches bytes, and a notice is logged. PCRE 1
        and PCRE2 without Unicode support still match bytes.
 
+    *) Change: a TLS session is resumed only under the certificate it was
+       established with: the listener sets the session id context to the
+       SHA-256 digest of the certificate. Before, two listeners with the
+       same session ticket keys and different certificates resumed each
+       other's sessions. After a certificate is replaced, its clients do one
+       full handshake.
+
     *) Feature: the source tarball and the Debian packages attached to a
        release have a build provenance attestation, which names the
        workflow, the tag and the commit that built each file; "gh

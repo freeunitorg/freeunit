@@ -3851,6 +3851,7 @@ nxt_router_conf_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
 
                 tls_init->cache_size = 0;
                 tls_init->timeout = 300;
+                tls_init->sid_ctx_certificate = 1;
 
                 value = nxt_conf_get_path(listener, &conf_cache_path);
                 if (value != NULL) {

@@ -54,6 +54,37 @@ class ApplicationTLS(ApplicationProto):
         context = kwargs.get('context', self._default_context)
         return self.post(wrapper=context.wrap_socket, **kwargs)
 
+    def context(self, version, tickets=True):
+        """A client context for one protocol version only."""
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        context.minimum_version = version
+        context.maximum_version = version
+
+        if not tickets:
+            context.options |= ssl.OP_NO_TICKET
+
+        return context
+
+    def get_session(self, context, session=None, **kwargs):
+        """A request over a new connection that offers a session.  Returns
+        the session to offer next time and whether the handshake resumed
+        the offered one.  A TLS 1.3 server sends its tickets after the
+        handshake, so the session is taken after the response."""
+
+        def wrapper(sock, **wrap_kwargs):
+            return context.wrap_socket(sock, session=session, **wrap_kwargs)
+
+        (resp, sock) = self.get(wrapper=wrapper, start=True, **kwargs)
+
+        assert resp['status'] == 200, 'request over TLS'
+
+        result = (sock.session, sock.session_reused)
+        sock.close()
+
+        return result
+
     def openssl_conf(self, rewrite=False, alt_names=None):
         alt_names = alt_names or []
         conf_path = f'{option.temp_dir}/openssl.conf'
