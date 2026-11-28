@@ -61,8 +61,9 @@ typedef struct {
 static nxt_int_t nxt_http_parse_test_run(nxt_http_request_parse_t *rp,
     nxt_str_t *request, nxt_bool_t one_read);
 static nxt_int_t nxt_http_parse_test_bench(nxt_thread_t *thr,
-    nxt_str_t *request, nxt_lvlhsh_t *hash, const char *name, nxt_uint_t n);
-static void nxt_http_parse_test_hash_destroy(nxt_lvlhsh_t *hash);
+    nxt_str_t *request, nxt_http_fields_hash_t *hash, const char *name,
+    nxt_uint_t n);
+static void nxt_http_parse_test_hash_destroy(nxt_http_fields_hash_t *hash);
 static nxt_int_t nxt_http_parse_test_request_line(nxt_http_request_parse_t *rp,
     nxt_http_parse_test_data_t *data,
     nxt_str_t *request, nxt_log_t *log);
@@ -167,10 +168,6 @@ static const nxt_http_test_field_t  nxt_http_test_headers_32[] = {
     { nxt_string("H-31"), nxt_string("v-31") },
     { nxt_string("H-32"), nxt_string("v-32") },
 };
-
-
-static nxt_int_t nxt_http_test_header_return(void *ctx, nxt_http_field_t *field,
-    uintptr_t data);
 
 
 static nxt_http_parse_test_case_t  nxt_http_test_cases[] = {
@@ -766,10 +763,12 @@ static nxt_http_field_proc_t  nxt_http_test_fields[] = {
 };
 
 
-static nxt_lvlhsh_t  nxt_http_test_fields_hash;
+static nxt_http_fields_hash_t  nxt_http_test_fields_hash;
 
 
-static nxt_http_field_proc_t  nxt_http_test_bench_fields[] = {
+/* nxt_http_fields_table_test() builds its table from these names too. */
+
+nxt_http_field_proc_t  nxt_http_test_bench_fields[] = {
     { nxt_string("Host"),
       &nxt_http_test_header_return, NXT_OK },
     { nxt_string("User-Agent"),
@@ -841,6 +840,9 @@ static nxt_http_field_proc_t  nxt_http_test_bench_fields[] = {
     { nxt_string("Upgrade-Insecure-Requests"),
       &nxt_http_test_header_return, NXT_OK },
 };
+
+const nxt_uint_t  nxt_http_test_bench_nfields =
+    nxt_nitems(nxt_http_test_bench_fields);
 
 
 static nxt_str_t nxt_http_test_simple_request = nxt_string(
@@ -922,20 +924,15 @@ static nxt_str_t nxt_http_test_big_request = nxt_string(
 
 
 /*
- * nxt_http_fields_hash() and nxt_http_fields_hash_collisions() build a
- * lvlhsh with the malloc-based nxt_http_fields_hash_proto (pool is NULL).
- * The test drives them directly, so it must drain the hash itself here,
- * the same way nxt_lvlhsh_retrieve() is used to tear down a lvlhsh in
- * nxt_lvlhsh_test(), otherwise every bucket and level it allocated leaks.
+ * nxt_http_fields_hash() makes one allocation, at "slots", and a process
+ * never frees its tables.  The test builds tables of its own, so it frees
+ * them here, else they leak.
  */
 static void
-nxt_http_parse_test_hash_destroy(nxt_lvlhsh_t *hash)
+nxt_http_parse_test_hash_destroy(nxt_http_fields_hash_t *hash)
 {
-    while (nxt_lvlhsh_retrieve(hash, &nxt_http_fields_hash_proto, NULL)
-           != NULL)
-    {
-        continue;
-    }
+    nxt_free(hash->slots);
+    nxt_memzero(hash, sizeof(nxt_http_fields_hash_t));
 }
 
 
@@ -944,8 +941,8 @@ nxt_http_parse_test(nxt_thread_t *thr)
 {
     nxt_mp_t                    *mp_temp;
     nxt_int_t                   rc;
-    nxt_uint_t                  i, colls, lvl_colls;
-    nxt_lvlhsh_t                hash;
+    nxt_uint_t                  i;
+    nxt_http_fields_hash_t      hash;
     nxt_http_request_parse_t    rp;
     nxt_http_parse_test_case_t  *test;
 
@@ -1005,35 +1002,20 @@ nxt_http_parse_test(nxt_thread_t *thr)
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log, "http parse test passed");
 
-    nxt_memzero(&hash, sizeof(nxt_lvlhsh_t));
-
-    colls = nxt_http_fields_hash_collisions(&hash,
-                                        nxt_http_test_bench_fields,
-                                        nxt_nitems(nxt_http_test_bench_fields),
-                                        0);
-
-    nxt_http_parse_test_hash_destroy(&hash);
-
-    nxt_memzero(&hash, sizeof(nxt_lvlhsh_t));
-
-    lvl_colls = nxt_http_fields_hash_collisions(&hash,
-                                        nxt_http_test_bench_fields,
-                                        nxt_nitems(nxt_http_test_bench_fields),
-                                        1);
-
-    nxt_http_parse_test_hash_destroy(&hash);
-
-    nxt_log_error(NXT_LOG_NOTICE, thr->log,
-                  "http parse test hash collisions %ui out of %uz, level: %ui",
-                  colls, nxt_nitems(nxt_http_test_bench_fields), lvl_colls);
-
-    nxt_memzero(&hash, sizeof(nxt_lvlhsh_t));
+    nxt_memzero(&hash, sizeof(nxt_http_fields_hash_t));
 
     rc = nxt_http_fields_hash(&hash, nxt_http_test_bench_fields,
                               nxt_nitems(nxt_http_test_bench_fields));
     if (rc != NXT_OK) {
         return NXT_ERROR;
     }
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "http parse test hash collisions %ui out of %uz, "
+                  "%ui slots, a lookup reads at most %ui",
+                  nxt_http_fields_hash_collisions(&hash),
+                  nxt_nitems(nxt_http_test_bench_fields),
+                  (nxt_uint_t) hash.mask + 1, (nxt_uint_t) hash.probes);
 
     if (nxt_http_parse_test_bench(thr, &nxt_http_test_simple_request,
                                   &hash, "simple", 1000000)
@@ -1168,7 +1150,7 @@ nxt_http_parse_test_run(nxt_http_request_parse_t *rp, nxt_str_t *request,
 
 static nxt_int_t
 nxt_http_parse_test_bench(nxt_thread_t *thr, nxt_str_t *request,
-    nxt_lvlhsh_t *hash, const char *name, nxt_uint_t n)
+    nxt_http_fields_hash_t *hash, const char *name, nxt_uint_t n)
 {
     nxt_mp_t                  *mp;
     nxt_nsec_t                start, end;
@@ -1322,7 +1304,7 @@ nxt_http_parse_test_fields(nxt_http_request_parse_t *rp,
 }
 
 
-static nxt_int_t
+nxt_int_t
 nxt_http_test_header_return(void *ctx, nxt_http_field_t *field, uintptr_t data)
 {
     return data;
