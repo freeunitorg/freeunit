@@ -815,7 +815,27 @@ nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt)
     if (ls->sockaddr->u.sockaddr.sa_family == AF_UNIX) {
         const char *path = ls->sockaddr->u.sockaddr_un.sun_path;
 
-        nxt_fs_mkdir_p_dirname((const u_char *) path, 0755);
+        /*
+         * An abstract socket has no file, and so neither a directory to
+         * make nor file permissions: every local process in the network
+         * namespace can connect to it.  nxt_controller_check_peer_cred()
+         * is then the only access control, so the socket is refused where
+         * the platform cannot tell who the peer is.
+         */
+
+        if (path[0] != '\0') {
+            nxt_fs_mkdir_p_dirname((const u_char *) path, 0755);
+        }
+
+#if !(NXT_HAVE_UCRED)
+        if (path[0] == '\0') {
+            nxt_alert(task, "an abstract control socket needs peer "
+                      "credentials to tell who connects to it, and this "
+                      "platform has none: use a socket file");
+
+            return NXT_ERROR;
+        }
+#endif
 
         /*
          * Resolve --control-user / --control-group once.  The same ids
@@ -843,9 +863,10 @@ nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt)
 /*
  * A peer may use the control API if it is root, runs as unitd's effective
  * UID, or is one of the principals the control socket was delegated to with
- * --control-user / --control-group.  The socket's file permissions are
- * still enforced by the kernel on connect(), so this never grants more
- * than those permissions already do.
+ * --control-user / --control-group.  For a socket file the kernel still
+ * enforces the file permissions on connect(), so this never grants more
+ * than those permissions already do.  An abstract socket has no file and no
+ * permissions: there this check is the only access control.
  */
 
 nxt_bool_t
@@ -977,8 +998,15 @@ nxt_controller_check_peer_cred(nxt_task_t *task, nxt_conn_t *c)
 #endif
 
         if (!allowed) {
+            /*
+             * The kernel let the peer connect, so the permissions of a
+             * socket file do not keep it out, and an abstract socket has
+             * none.  Name what accepts the peer: nothing else does.
+             */
             nxt_alert(task, "controller: rejecting connection from uid %d "
-                      "(unitd uid %d); set socket permissions accordingly",
+                      "(unitd uid %d); use --control-user or "
+                      "--control-group to accept it, or the permissions of "
+                      "a socket file to keep it out",
                       (int) cred.uid, (int) nxt_euid);
             return NXT_ERROR;
         }

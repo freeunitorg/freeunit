@@ -2,8 +2,8 @@
 #
 # What the FreeUnit image can and cannot do under each common Docker
 # hardening posture.  Every cell starts the same image with the same trivial
-# Python application and asserts the documented outcome -- a served 200, or a
-# refusal at a named point.
+# Python application and asserts the documented outcome -- a served 200, a
+# refusal at a named point, or a container that stops by itself.
 #
 # This is documentation that runs.  It is not a claim that any of these
 # postures is required, and it deliberately does not claim that Docker's
@@ -32,6 +32,16 @@ PORT="${UNIT_HARDENING_PORT:-8099}"
 #   UNIT_HARDENING_PLATFORM=linux/arm64 ./test-hardening.sh
 PLATFORM="${UNIT_HARDENING_PLATFORM:-linux/amd64}"
 
+# Three things a cell can change besides its docker flags: where the
+# configuration is mounted, the line of the container log that says the
+# daemon now running is the one that will serve, and the command of the
+# container.  These defaults are the image as shipped: the entrypoint applies
+# /docker-entrypoint.d/ and then runs the CMD of the image.  The read-only
+# cells at the end change all three.
+CONF=/docker-entrypoint.d/config.json
+READY='ready for start up'
+CMD=
+
 PASS=0
 FAIL=0
 NAME=
@@ -59,24 +69,29 @@ trap 'trap - EXIT; cleanup; exit 130' INT
 trap 'trap - EXIT; cleanup; exit 143' TERM
 
 # Start the image with the given docker flags, wait for the application, and
-# set RESULT to "200", "no-200" or "no-start".  It sets a variable rather than
-# echoing, because a $(command substitution) would run it in a subshell: NAME
-# would never reach the parent, and the EXIT/INT/TERM trap could not remove a
-# container left behind by a Ctrl-C -- leaking both the container and the
-# published port.  Never fails the script itself: a cell that is *expected*
-# to be refused has to be able to report the refusal.
+# set RESULT to "200", "no-200", "no-ready", "no-start" or "exited".  "exited"
+# is a container that stopped by itself before it served; its exit status goes
+# to the log as "exit: status=N", where a cell can match it.  "no-200" and
+# "no-ready" are a container that was still running at the deadline.
+#
+# It sets a variable rather than echoing, because a $(command substitution)
+# would run it in a subshell: NAME would never reach the parent, and the
+# EXIT/INT/TERM trap could not remove a container left behind by a Ctrl-C --
+# leaking both the container and the published port.  Never fails the script
+# itself: a cell that is *expected* to be refused has to be able to report the
+# refusal.
 attempt() {
     NAME="unit-hardening-$$"
     docker rm -f "$NAME" >/dev/null 2>&1 || :
 
     # No --rm: a container that exits on its own would delete itself along
     # with the logs, and the logs are the whole point of a refused cell.
-    # shellcheck disable=SC2086  # $1 is a deliberate list of docker flags
+    # shellcheck disable=SC2086  # $1 and $CMD are deliberate word lists
     docker run -d --name "$NAME" --platform "$PLATFORM" \
         -v "$APP:/www:ro" \
-        -v "$APP/config.json:/docker-entrypoint.d/config.json:ro" \
+        -v "$APP/config.json:$CONF:ro" \
         -p "127.0.0.1:$PORT:8080" \
-        $1 "$IMAGE" >/dev/null 2>"$LOGDIR/start.err" || {
+        $1 "$IMAGE" $CMD >/dev/null 2>"$LOGDIR/start.err" || {
             cp "$LOGDIR/start.err" "$LOGDIR/container.log"
             # docker run can fail *after* creating the container -- a port
             # already allocated, for one -- leaving it in Created state.  The
@@ -92,7 +107,9 @@ attempt() {
     # configuration -- which activates this listener -- and only then execs
     # the real one.  Polling straight away can therefore get a 200 out of the
     # throwaway daemon and pass while the production startup is broken.  Wait
-    # for the entrypoint to say it is done first.
+    # for the entrypoint to say it is done first.  With the configuration in
+    # the state there is no temporary daemon, and READY is the line the
+    # entrypoint prints before it execs the only one.
     # Absolute deadlines, not iteration counts: with a per-request timeout an
     # iteration bound is a bound on attempts, not on time, and a listener that
     # accepts and never answers would spend a hundred five-second timeouts
@@ -100,7 +117,7 @@ attempt() {
     ready=no
     deadline=$(( $(date +%s) + 45 ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        if docker logs "$NAME" 2>&1 | grep -q 'ready for start up'; then
+        if docker logs "$NAME" 2>&1 | grep -q "$READY"; then
             ready=yes
             break
         fi
@@ -114,15 +131,7 @@ attempt() {
     # with the temporary daemon still answering, so a probe would take a 200
     # from it and pass the very failure this wait exists to catch.
     if [ "$ready" = no ]; then
-        docker logs "$NAME" > "$LOGDIR/container.log" 2>&1 || :
-        running=$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || echo false)
-        docker rm -f "$NAME" >/dev/null 2>&1 || :
-        NAME=
-        if [ "$running" = true ]; then
-            RESULT=no-ready
-        else
-            RESULT=no-200
-        fi
+        gave_up no-ready
         return 0
     fi
 
@@ -170,13 +179,29 @@ attempt() {
         sleep 0.2
     done
 
-    docker logs "$NAME" > "$LOGDIR/container.log" 2>&1 || :
-    docker rm -f "$NAME" >/dev/null 2>&1 || :
-    NAME=
-    RESULT=no-200
+    gave_up no-200
 }
 
-# cell DESCRIPTION 200|refused FLAGS [LOG-SUBSTRING]
+# The end of an attempt that got no 200: keep the log, remove the container,
+# and set RESULT to "exited" when the container had stopped by itself, or to
+# $1 when it was still running.  The difference is the whole point of a cell
+# that expects "exits": a daemon that cannot start has to say why and stop,
+# not stay "running" with nothing behind its sockets.
+gave_up() {
+    docker logs "$NAME" > "$LOGDIR/container.log" 2>&1 || :
+    running=$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || echo false)
+    if [ "$running" = true ]; then
+        RESULT=$1
+    else
+        status=$(docker inspect -f '{{.State.ExitCode}}' "$NAME" 2>/dev/null || echo unknown)
+        echo "exit: status=$status" >> "$LOGDIR/container.log"
+        RESULT=exited
+    fi
+    docker rm -f "$NAME" >/dev/null 2>&1 || :
+    NAME=
+}
+
+# cell DESCRIPTION 200|refused|exits FLAGS [LOG-SUBSTRING]
 #
 # LOG-SUBSTRING is how a cell is pinned to its cause.  "no-200" on its own is
 # satisfied by a wholly broken image, so a cell documenting a refusal has to
@@ -194,15 +219,22 @@ cell() {
     got=$RESULT
 
     # "refused" is any of the ways a cell can fail to serve: the container
-    # never started, never reached readiness, or never answered.  Which one a
-    # broken posture produces is not stable -- --cap-drop=ALL leaves the
-    # entrypoint's daemon alive but never ready -- and the cause is pinned by
-    # the log assertion below, not by which shade of failure it was.
+    # never started, never reached readiness, never answered, or stopped.
+    # Which one a broken posture produces is not stable -- --cap-drop=ALL
+    # leaves the entrypoint's daemon alive but never ready -- and the cause is
+    # pinned by the log assertion below, not by which shade of failure it was.
+    #
+    # "exits" is the one shade a cell can insist on: the container stopped by
+    # itself.  Nothing maps to it, so a container that is still running at the
+    # deadline fails the cell as "no-200" or "no-ready".
     case "$expect" in
         refused)
             case "$got" in
-                no-start|no-ready|no-200) got=refused ;;
+                no-start|no-ready|no-200|exited) got=refused ;;
             esac
+            ;;
+        exits)
+            [ "$got" = exited ] && got=exits
             ;;
     esac
 
@@ -309,6 +341,55 @@ cell "--user 1000:1000, --cap-drop=ALL, tmpfs" 200 \
 # And with no-new-privileges on top: the posture to recommend.
 cell "--user 1000:1000, --cap-drop=ALL, no-new-privileges, tmpfs" 200 \
     "$NONROOT --cap-drop=ALL --security-opt no-new-privileges" "$NONROOT_ID"
+
+# Read-only root file system.  Under --read-only Docker keeps /dev and
+# /dev/shm writable and nothing else, and unitd writes to four places: the
+# control socket and the pid file in /var/run, the state in /var/lib/unit and
+# the request bodies that do not fit in memory in /var/tmp.
+
+# The image as shipped cannot start: the control socket has nowhere to go.
+cell "--read-only, config in /docker-entrypoint.d" refused "--read-only" \
+    "control.unit.sock.tmp) failed (30: Read-only file system)"
+
+# A tmpfs for the socket and the pid file is not enough for
+# /docker-entrypoint.d/ either.  The entrypoint applies it through a temporary
+# daemon, and a PUT answers 200 only when the configuration is on the disk:
+# with a read-only state it answers 500, and the entrypoint stops there.
+cell "--read-only, tmpfs /var/run, config in /docker-entrypoint.d" refused \
+    "--read-only --tmpfs /var/run" \
+    "HTTP response status code is '500'
+the configuration was not stored"
+
+# The recipe: the configuration as conf.json in the state directory, where
+# unitd reads it at start, and the socket, the pid file and the temporary
+# files in /dev/shm.  The entrypoint finds a state, so it applies nothing and
+# execs unitd at once: there is no temporary daemon, and so no "ready for
+# start up" line to wait for.
+CONF=/var/lib/unit/conf.json
+READY='skipping initial configuration'
+CMD="unitd --no-daemon --control unix:/dev/shm/control.unit.sock"
+CMD="$CMD --pid /dev/shm/unit.pid --tmpdir /dev/shm"
+
+cell "--read-only, config in the state, socket/pid/tmp in /dev/shm" 200 \
+    "--read-only" "$ROOT_ID"
+
+# The same without root and without capabilities.  /dev/shm is world-writable
+# with the sticky bit, so this posture needs no mount at all -- compare the
+# three chowned tmpfs mounts of the non-root cells above.
+cell "--read-only, --user 1000:1000, --cap-drop=ALL, no-new-privileges, /dev/shm" 200 \
+    "--read-only --user 1000:1000 --cap-drop=ALL --security-opt no-new-privileges" \
+    "$NONROOT_ID"
+
+# The socket moved and the pid file forgotten at its default, read-only path.
+# unitd has to log the reason and exit.  It used to do neither: the open()
+# failure was not logged, and the main process then waited for a SIGCHLD that
+# could not come, so the container stayed "running" and served nothing.
+CMD="unitd --no-daemon --control unix:/dev/shm/control.unit.sock"
+
+cell "--read-only, socket in /dev/shm, pid file left in /var/run" exits \
+    "--read-only" \
+    "unable to create the pid file: open(\"/var/run/unit.pid\") failed (30: Read-only file system)
+^exit: status=1$"
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"

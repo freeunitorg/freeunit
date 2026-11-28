@@ -2779,6 +2779,26 @@ nxt_main_start_exit(nxt_task_t *task)
 
 
 /*
+ * Whether the exit of main waits for nxt_main_process_sigchld_handler().
+ * The handler ends the exit when the registry holds no process but main
+ * and no store child runs.  This is the opposite of that test, and
+ * nxt_runtime_quit() leaves the end of the exit to the handler only when
+ * it is true.
+ *
+ * It is not a count of the children that main can reap.  rt->nprocesses
+ * counts every record of the registry: main itself once its port exists,
+ * the processes that main forks, and the application processes, which a
+ * prototype forks and main registers when their WHOAMI arrives.  The store
+ * child is not in the registry, so it is asked about separately.
+ */
+nxt_bool_t
+nxt_main_process_exit_waits(nxt_runtime_t *rt)
+{
+    return (rt->nprocesses > 1 || nxt_main_store.pid != 0);
+}
+
+
+/*
  * At exit, main waits for the store child and then for the pending store.
  * When a conf.json store is pending and a conf.json store child runs, that
  * child stores a configuration that is no longer the last one, so main

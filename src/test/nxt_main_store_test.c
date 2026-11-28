@@ -29,6 +29,10 @@
  *   - Stores start in the order they came.  A conf.json store that
  *     replaces a pending one takes its place.  So a DELETE never runs
  *     before an older conf.json store.
+ *   - nxt_main_process_exit_waits() is the test nxt_runtime_quit() makes
+ *     before it leaves the end of the exit to the SIGCHLD handler.  It is
+ *     true for a process besides main in the registry, and for a store
+ *     child until main has reaped it, with nothing else to wait for.
  *   - Certificate bundles (with TLS).  nxt_cert_store_put_handler() gives
  *     the bundle to a store child and answers the controller only when the
  *     child exits: nothing is on the reply port while the child runs.  Two
@@ -953,6 +957,116 @@ done:
 }
 
 
+/*
+ * nxt_runtime_quit() leaves the end of the exit of main to the SIGCHLD
+ * handler only while nxt_main_process_exit_waits() is true.  The store
+ * child is not in the process registry.  With no other process it is all
+ * that keeps main from an exit before the last configuration is stored.
+ */
+static nxt_int_t
+nxt_main_store_test_exit_waits(nxt_thread_t *thr, nxt_task_t *task,
+    nxt_runtime_t *rt)
+{
+    int         status;
+    nxt_int_t   ret;
+    nxt_pid_t   pid;
+    nxt_uint_t  nprocesses;
+
+    ret = NXT_ERROR;
+
+    nprocesses = rt->nprocesses;
+
+    nxt_main_store_test_alerts = 0;
+
+    nxt_main_test_store_set_delay(0);
+
+    /* The registry: empty, main alone, main and one more process. */
+
+    rt->nprocesses = 0;
+
+    if (nxt_main_process_exit_waits(rt)) {
+        nxt_main_store_test_fail(thr, "the exit waits with an empty "
+                                 "registry and no store child");
+    }
+
+    rt->nprocesses = 1;
+
+    if (nxt_main_process_exit_waits(rt)) {
+        nxt_main_store_test_fail(thr, "the exit waits with main alone in "
+                                 "the registry and no store child");
+    }
+
+    rt->nprocesses = 2;
+
+    if (!nxt_main_process_exit_waits(rt)) {
+        nxt_main_store_test_fail(thr, "the exit does not wait for a "
+                                 "process in the registry");
+    }
+
+    /* Main alone, and a store child. */
+
+    rt->nprocesses = 1;
+
+    if (nxt_main_store_test_schedule(task, "{\"w\":1}") != NXT_OK) {
+        nxt_main_store_test_fail(thr, "cannot map the store");
+    }
+
+    pid = nxt_main_test_store_pid();
+    if (pid == 0) {
+        nxt_main_store_test_fail(thr, "the store started no child");
+    }
+
+    if (!nxt_main_process_exit_waits(rt)) {
+        nxt_main_store_test_fail(thr, "the exit does not wait for the "
+                                 "store child %PI", pid);
+    }
+
+    if (nxt_main_store_test_wait(pid, &status) != 0) {
+        nxt_main_store_test_fail(thr, "waitpid(%PI) failed %E", pid,
+                                 nxt_errno);
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        nxt_main_store_test_fail(thr, "the store failed: status 0x%Xi",
+                                 (nxt_uint_t) status);
+    }
+
+    /* The child has exited, and main has not reaped it yet. */
+
+    if (!nxt_main_process_exit_waits(rt)) {
+        nxt_main_store_test_fail(thr, "the exit does not wait for the "
+                                 "store child %PI that main has not reaped",
+                                 pid);
+    }
+
+    (void) nxt_main_test_store_exited(task, pid, status);
+
+    if (nxt_main_test_store_pid() != 0) {
+        nxt_main_store_test_fail(thr, "a store child runs with nothing "
+                                 "pending");
+    }
+
+    if (nxt_main_process_exit_waits(rt)) {
+        nxt_main_store_test_fail(thr, "the exit waits after the store "
+                                 "child was reaped");
+    }
+
+    if (nxt_main_store_test_alerts != 0) {
+        nxt_main_store_test_fail(thr, "%ui alerts", nxt_main_store_test_alerts);
+    }
+
+    ret = NXT_OK;
+
+done:
+
+    rt->nprocesses = nprocesses;
+
+    nxt_main_store_test_reap_all(task);
+
+    return ret;
+}
+
+
 #if (NXT_TLS)
 
 /* A message of the controller, as the port layer gives it to main. */
@@ -1446,6 +1560,10 @@ nxt_main_store_test(nxt_thread_t *thr)
 
     if (ret == NXT_OK) {
         ret = nxt_main_store_test_order(thr, task, &paths);
+    }
+
+    if (ret == NXT_OK) {
+        ret = nxt_main_store_test_exit_waits(thr, task, &rt);
     }
 
 #if (NXT_TLS)
