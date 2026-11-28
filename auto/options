@@ -13,6 +13,8 @@ NXT_DEBUG=NO
 
 NXT_HARDENING=off
 
+NXT_MALLOC=none
+
 NXT_INET6=YES
 NXT_UNIX_DOMAIN=YES
 
@@ -107,6 +109,7 @@ do
         --debug)                         NXT_DEBUG=YES                       ;;
 
         --hardening=*)                   NXT_HARDENING="$value"              ;;
+        --malloc=*)                      NXT_MALLOC="$value"                 ;;
 
         --no-ipv6)                       NXT_INET6=NO                        ;;
         --no-unix-sockets)               NXT_UNIX_DOMAIN=NO                  ;;
@@ -179,6 +182,25 @@ if [ $NXT_REGEX_JIT = YES ] && [ $NXT_REGEX = NO ]; then
     $echo "$0: error: --regex-jit requires regex support."
     exit 1
 fi
+
+# The link probe for a chosen allocator is in auto/malloc; it needs the
+# compiler.  Here only the name is checked, so an unknown or empty value is
+# rejected with one line before any probe runs.
+case "$NXT_MALLOC" in
+    none | jemalloc | mimalloc)
+    ;;
+
+    "")
+        $echo "$0: error: --malloc requires a value: none, jemalloc or mimalloc."
+        exit 1
+    ;;
+
+    *)
+        $echo "$0: error: invalid value \"$NXT_MALLOC\" for --malloc."
+        $echo "Valid values are: none, jemalloc, mimalloc."
+        exit 1
+    ;;
+esac
 
 
 NXT_PREFIX="${NXT_PREFIX-"/usr/local"}"

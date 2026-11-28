@@ -48,6 +48,22 @@ checks it.  The source tarball also has a .sha256 checksum file next to its
 
 <change type="feature">
 <para>
+a new "./configure --malloc=jemalloc" or "--malloc=mimalloc" option links the
+named allocator into unitd, so the router and the embedded language processes
+(PHP, Python, Perl and Ruby, each a fork of unitd) use it without LD_PRELOAD.
+An application that runs as its own process, such as a Go or a Node.js
+application, execs a separate binary and keeps its own allocator.  The
+allocator is probed at configure time and shown in the summary as "allocator";
+a missing library stops configure instead of a silent fall back to libc.  On
+musl this closes most of the extra per-request CPU that the system allocator
+spends, at the cost of higher memory use, so it is the operator's choice and
+the default "none" keeps the libc allocator and an unchanged build.  Language
+modules are not linked against the allocator.
+</para>
+</change>
+
+<change type="feature">
+<para>
 PHP exposes the decoded, normalized request path, without the query, in
 $_SERVER['UNIT_REWRITTEN_PATH'] when it differs from the target's path in
 REQUEST_URI, or after a route "rewrite" action.  It is absent for a request

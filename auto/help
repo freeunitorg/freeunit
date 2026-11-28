@@ -74,6 +74,17 @@ cat << END
                                     -Wimplicit-fallthrough and
                                     -ftrivial-auto-var-init=pattern
 
+  --malloc=NAME        link an allocator into unitd; the router and the
+                       embedded language processes (a fork() of unitd: PHP,
+                       Python, Perl, Ruby) then use it without LD_PRELOAD.  An
+                       app that runs as its own process (go, Node.js, and
+                       other "external" apps) keeps its own allocator.  Probed
+                       at configure time (default: none, unchanged build):
+                         none     - system libc allocator (default)
+                         jemalloc - link libjemalloc (needs its -dev package)
+                         mimalloc - link libmimalloc (needs its -dev package)
+                       trades memory for CPU; language modules are not linked
+
   --fuzz=ENGINE        enable fuzz testing
 
 
