@@ -36,6 +36,14 @@ bytes.
 </para>
 </change>
 
+<change type="change">
+<para>
+the Docker images use SIGQUIT as the stop signal, so "docker stop" and
+Kubernetes stop Unit gracefully: the responses in progress are sent, for up
+to 8 seconds.  Send SIGTERM for a stop without the drain.
+</para>
+</change>
+
 <change type="feature">
 <para>
 the source tarball and the Debian packages attached to a release have a build

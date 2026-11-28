@@ -305,6 +305,40 @@ A summary (OK / FAILED) is printed at the end.
 | `ruby-3.4` | ruby:3.4 |
 | `ruby-4.0` | ruby:4.0 |
 
+## Stopping a container
+
+The images set `STOPSIGNAL SIGQUIT`, so `docker stop` and a Kubernetes pod
+termination ask Unit for a graceful stop:
+
+- The router refuses new connections and closes idle keep-alive connections
+  at once.
+- Responses in progress are sent with `Connection: close`.
+- A request that waits for an application process gets a 503 response.
+- The router exits when no client connection is busy, or after 8 seconds.
+  A response that is still in progress then is cut off, for example a
+  WebSocket, a slow client or a request that takes longer.
+- Each application process completes the request it serves, then exits.
+  Unit exits when all its processes have exited.
+
+An application process has no time limit of its own: Unit waits for it,
+also after the router has exited.  The runtime sends SIGKILL at the end of
+its grace period.  Set the grace period longer than 8 seconds plus the time
+your application needs to complete a request and exit:
+
+| Runtime | Setting | Default |
+|---|---|---|
+| `docker stop` | `-t SECONDS` | 10 s |
+| Docker Compose | `stop_grace_period` | 10 s |
+| Kubernetes | `terminationGracePeriodSeconds` | 30 s |
+
+To stop at once without the drain, send SIGTERM:
+`docker kill -s TERM <container>`.  The router then closes the client
+connections at once, also during a graceful stop.  An application process
+that is in a request exits when the request returns; `docker kill` (SIGKILL)
+stops it at once.
+
+Images of FreeUnit 1.37 and older use `STOPSIGNAL SIGTERM`.
+
 ## Alpine / musl allocator note
 
 On musl (Alpine) FreeUnit uses 12 to 17 percent more server CPU per request
