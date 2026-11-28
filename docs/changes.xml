@@ -69,6 +69,15 @@ than 8.1.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+an application process could be counted as idle while it still ran a
+request whose client had closed the connection.  The process could then get
+a new request while busy, and idle_timeout could stop it.  Now the process
+returns to the idle processes only after its last message for the request.
+</para>
+</change>
+
 </changes>
 
 
