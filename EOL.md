@@ -29,6 +29,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | PHP | 8.3 | Dec 2027 | Dec 2028 |
 | PHP | 8.4 | Dec 2028 | Dec 2029 |
 | PHP | 8.5 | Dec 2029 | Dec 2030 |
+| PHP | 8.6 | Dec 2030 | Dec 2031 |
 | Python | 3.12 | Oct 2028 | Oct 2029 |
 | Python | 3.13 | Oct 2029 | Oct 2030 |
 | Python | 3.14 | Oct 2030 | Oct 2031 |
@@ -47,6 +48,7 @@ EOL dates are tracked at [endoflife.date](https://endoflife.date).
 | Fedora | 42 (EOL) † | 2026-05 | 2029-05 | 3.13 |
 | Fedora | 43 | 2026-12 | 2029-12 | 3.14 |
 | Fedora | 44 | 2027-06 | 2030-06 | 3.14 |
+| Fedora | 45 | 2027-12 | 2030-12 | 3.15 |
 | CentOS Stream | 9 | 2027-05 | 2030-05 | 3.11 |
 | CentOS Stream | 10 | 2030-05 | 2033-05 | 3.13 |
 | Amazon Linux | 2 (EOL) † | 2026-06 | 2029-06 | 3.7 ‡ |

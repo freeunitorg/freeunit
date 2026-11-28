@@ -222,7 +222,7 @@ nxt_http_js_ext_get_header(njs_vm_t *vm, njs_object_prop_t *prop,
     nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
 
         if (key.length == f->name_length
-            && memcmp(key.start, f->name, f->name_length) == 0)
+            && nxt_memcasecmp(key.start, f->name, f->name_length) == 0)
         {
             return njs_vm_value_string_create(vm, retval, f->value,
                                               f->value_length);

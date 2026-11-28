@@ -209,9 +209,16 @@ nxt_http_static_meta(nxt_time_t mtime, nxt_off_t size, nxt_mp_t *mp)
     }
 #endif
 
-    nxt_gmtime(mtime, &tm);
+    /* A time that an HTTP date cannot express gives no Last-Modified. */
 
-    m->date_length = nxt_http_date(m->date, &tm) - m->date;
+    if (nxt_http_date_valid(mtime)) {
+        nxt_gmtime(mtime, &tm);
+        m->date_length = nxt_http_date(m->date, &tm) - m->date;
+
+    } else {
+        m->date_length = 0;
+    }
+
     /* "%T" reads an nxt_time_t; a native time_t can differ (QNX). */
     m->etag_length = nxt_sprintf(m->etag, m->etag + sizeof(m->etag),
                                  "\"%xT-%xO", mtime, size)
@@ -561,7 +568,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
     nxt_file_t              *f, file;
     nxt_file_info_t         fi;
     nxt_off_t               range_start, range_end;
-    nxt_bool_t              is_range, etag_weak, svgz;
+    nxt_bool_t              is_range, etag_weak, svgz, date_ok;
     nxt_http_status_t       rstatus;
     nxt_http_field_t        *field, *coding;
     nxt_http_status_t       status, pcond;
@@ -768,27 +775,37 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         r->status = NXT_HTTP_OK;
         r->resp.content_length_n = nxt_file_size(&fi);
 
-        field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
-        if (nxt_slow_path(field == NULL)) {
-            goto fail;
-        }
-
-        nxt_http_field_name_set(field, "Last-Modified");
-
         meta = nxt_http_static_meta(nxt_file_mtime(&fi), nxt_file_size(&fi),
                                     r->mem_pool);
         if (nxt_slow_path(meta == NULL)) {
             goto fail;
         }
 
-        p = nxt_mp_nget(r->mem_pool, meta->date_length);
-        if (nxt_slow_path(p == NULL)) {
-            goto fail;
-        }
+        /*
+         * A file whose mtime has no HTTP date gets no Last-Modified.  Then no
+         * date in If-Modified-Since or If-Range can match it.  The ETag is
+         * still sent and still works.
+         */
 
-        field->value = p;
-        field->value_length = meta->date_length;
-        nxt_memcpy(p, meta->date, meta->date_length);
+        date_ok = (meta->date_length != 0);
+
+        if (date_ok) {
+            field = nxt_http_resp_field_zero_add(&r->resp, r->mem_pool);
+            if (nxt_slow_path(field == NULL)) {
+                goto fail;
+            }
+
+            nxt_http_field_name_set(field, "Last-Modified");
+
+            p = nxt_mp_nget(r->mem_pool, meta->date_length);
+            if (nxt_slow_path(p == NULL)) {
+                goto fail;
+            }
+
+            field->value = p;
+            field->value_length = meta->date_length;
+            nxt_memcpy(p, meta->date, meta->date_length);
+        }
 
         if (exten.start == NULL) {
             nxt_http_static_extract_extension(shr, &exten);
@@ -969,7 +986,7 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
 
         pcond = nxt_http_static_preconditions(r, &etag, etag_weak,
                                               nxt_file_mtime(&fi),
-                                              coding == NULL);
+                                              coding == NULL && date_ok);
 
         if (pcond != NXT_HTTP_OK) {
             nxt_file_close(task, f);
@@ -1034,7 +1051,8 @@ nxt_http_static_send(nxt_task_t *task, nxt_http_request_t *r,
         range_end = 0;
 
         rstatus = nxt_http_static_range(r, &etag, etag_weak,
-                                        nxt_file_mtime(&fi), coding == NULL,
+                                        nxt_file_mtime(&fi),
+                                        coding == NULL && date_ok,
                                         nxt_file_size(&fi), &range_start,
                                         &range_end);
 
@@ -1361,6 +1379,9 @@ fail:
  * the entry it has, and that entry can be stale.  If-Unmodified-Since needs
  * no such gate.  A 412 makes no cache reuse an entry.  A request that passes
  * gets the full 200 with the current header fields.
+ *
+ * A file whose mtime has no HTTP date has no modification date for the
+ * client.  RFC 9110 Sect. 13.1.4: then If-Unmodified-Since is ignored.
  */
 
 static nxt_http_status_t
@@ -1484,7 +1505,7 @@ nxt_http_static_preconditions(nxt_http_request_t *r, nxt_str_t *etag,
             return NXT_HTTP_PRECONDITION_FAILED;
         }
 
-    } else if (ium != NULL) {
+    } else if (ium != NULL && nxt_http_date_valid(mtime)) {
         date = nxt_time_parse(ium->value, ium->value_length);
 
         if (date != (nxt_time_t) -1 && mtime > date) {

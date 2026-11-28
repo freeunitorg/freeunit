@@ -112,6 +112,13 @@
       "package": "humantime",
       "version": "2.1.0",
       "reason": "Linked by the Wasmtime 48.0.10 C API through env_logger 0.11.5: the c-api 'logging' feature is on by default (crates/c-api/cmake/features.cmake), and wasm_engine_new() calls env_logger::try_init() (crates/c-api/src/engine.rs). env_logger uses humantime only to format RFC 3339 log timestamps (format_rfc3339_*, vendor/env_logger/src/fmt/humantime.rs), and logs only when WASMTIME_LOG is set. RUSTSEC-2026-0542 is informational (unmaintained, no patched version), not a vulnerability. The source archive is vendored, so this exact version cannot be updated independently of the source pin. Recheck at the next pin bump."
+    },
+    {
+      "kind": "vulnerability",
+      "id": "RUSTSEC-2026-0592",
+      "package": "url",
+      "version": "2.5.7",
+      "reason": "Linked by the Wasmtime 48.0.10 C API through wasmtime-wasi (crates/wasi), the only crate of the linked graph that depends on url. RUSTSEC-2026-0592 affects url::Url::origin() and url::quirks::origin(): they parse the path of a \"blob:\" URL and call themselves on the result, so a nested \"blob:\" URL overflows the stack. No crate of the Wasmtime tree calls either function: the remaining \"origin\" matches in the archive are unrelated identifiers and prose. crates/wasi uses url only as url::Host::parse for the WASI sock_addr name lookup (crates/wasi/src/sockets/ip_name_lookup.rs:31), a standalone host parser that does not reach the origin code. The source archive is vendored, so this exact version cannot be updated independently of the source pin; the fix is in url 2.5.9. Recheck reachability and remove this exception at the next pin bump."
     }
   ]
 }

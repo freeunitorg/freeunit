@@ -10,10 +10,13 @@ on:
       # that only edits the workflow is never checked by it.
       - .github/workflows/unitctl.yml
   push:
-    # A master push builds only when it changes unitctl.  Path filters are
-    # not evaluated for tag pushes, so a release tag always builds.
+    # A master or 1.37 push builds only when it changes unitctl.  Path
+    # filters are not evaluated for tag pushes, so a release tag always
+    # builds.  Pull requests skip the build job, so without the 1.37 push
+    # a 1.37 change would first be built at the release tag.
     branches:
       - master
+      - '1.37'
     paths:
       - tools/unitctl/**
       - docs/unit-openapi.yaml
@@ -66,9 +69,6 @@ jobs:
           - build: linux-x86_64
             os: ubuntu-26.04
             target: x86_64-unknown-linux-gnu
-          - build: macos-aarch64
-            os: macos-latest
-            target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
 
@@ -80,12 +80,6 @@ jobs:
         uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
         with:
           tool: cross
-
-      - name: Install macOS depedencies
-        if: startsWith(matrix.os, 'macos')
-        run: |
-          brew install make gnu-sed grep gawk
-          echo "MAKE=gmake" >> $GITHUB_ENV
 
       - uses: actions/setup-java@v6
         with:
@@ -192,6 +186,11 @@ jobs:
             | grep -q -- '--no-default-features'
 
   build:
+    # The test job above checks a pull request build.  This job makes the
+    # published binaries, so it runs on a tag, a master or 1.37 push, the
+    # weekly check, or a manual dispatch only.  Keeping it off pull requests keeps
+    # the darwin legs off macOS runners on every unitctl PR.
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     defaults:
@@ -215,6 +214,8 @@ jobs:
           - build: linux-x86_64
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+          # The darwin entries make the published macOS binaries.  The
+          # Homebrew tap downloads them from the release.
           - build: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin

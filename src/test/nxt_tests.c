@@ -238,17 +238,185 @@ nxt_http_comp_name_test(nxt_thread_t *thr)
 }
 
 
+/*
+ * A static file mtime goes to nxt_gmtime() and nxt_http_date() only when
+ * nxt_http_date_valid() accepts it.  Every day that it accepts must give
+ * a month and a weekday inside the name tables and a year of 4 digits.
+ * The times next to the range must be refused.
+ */
+
+static nxt_int_t
+nxt_http_date_range_test(nxt_thread_t *thr)
+{
+    u_char      *end;
+    struct tm   tm;
+    nxt_uint_t  i;
+    nxt_time_t  s;
+    u_char      buf[NXT_HTTP_DATE_LEN];
+
+    static const struct {
+        nxt_time_t  time;
+        const char  *date;
+    } dates[] = {
+#if (NXT_TIME_T_SIZE > 4)
+        { NXT_HTTP_DATE_MIN, "Wed, 01 Jan 1000 00:00:00 GMT" },
+        { NXT_HTTP_DATE_MAX, "Fri, 31 Dec 9999 23:59:59 GMT" },
+#else
+        { INT32_MIN, "Fri, 13 Dec 1901 20:45:52 GMT" },
+        { INT32_MAX, "Tue, 19 Jan 2038 03:14:07 GMT" },
+#endif
+        { 0, "Thu, 01 Jan 1970 00:00:00 GMT" },
+    };
+
+#if (NXT_TIME_T_SIZE > 4)
+    static const nxt_time_t  invalid[] = {
+        NXT_HTTP_DATE_MIN - 1, NXT_HTTP_DATE_MAX + 1,
+        -62135596800LL, -62162000000LL, -62200000000LL, 865550880000LL,
+        INT64_MIN, INT64_MAX,
+    };
+
+    for (i = 0; i < nxt_nitems(invalid); i++) {
+        NXT_TEST_CHECK(thr->log, !nxt_http_date_valid(invalid[i]),
+                       "http date range test failed: %T is accepted",
+                       invalid[i]);
+    }
+
+    for (s = NXT_HTTP_DATE_MIN; s <= NXT_HTTP_DATE_MAX; s += 86400) {
+        NXT_TEST_CHECK(thr->log, nxt_http_date_valid(s),
+                       "http date range test failed: %T is refused", s);
+
+        nxt_gmtime(s, &tm);
+
+        NXT_TEST_CHECK(thr->log,
+                       tm.tm_mon >= 0 && tm.tm_mon <= 11
+                       && tm.tm_wday >= 0 && tm.tm_wday <= 6
+                       && tm.tm_year >= 1000 - 1900
+                       && tm.tm_year <= 9999 - 1900,
+                       "http date range test failed: %T gives month %d, "
+                       "weekday %d, year %d", s, tm.tm_mon, tm.tm_wday,
+                       tm.tm_year + 1900);
+    }
+#endif
+
+    for (i = 0; i < nxt_nitems(dates); i++) {
+        s = dates[i].time;
+
+        NXT_TEST_CHECK(thr->log, nxt_http_date_valid(s),
+                       "http date range test failed: %T is refused", s);
+
+        nxt_gmtime(s, &tm);
+        end = nxt_http_date(buf, &tm);
+
+        NXT_TEST_CHECK(thr->log,
+                       (size_t) (end - buf) == NXT_HTTP_DATE_LEN
+                       && memcmp(buf, dates[i].date, NXT_HTTP_DATE_LEN) == 0,
+                       "http date range test failed: %T gives \"%*s\"",
+                       s, (size_t) (end - buf), buf);
+    }
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log, "http date range test passed");
+
+    return NXT_OK;
+}
+
+
+/*
+ * nxt_encode_complex_uri() and nxt_is_complex_uri_encoded() pass the first
+ * "?" and the first "#" raw.  A NUL byte after them must be escaped, and the
+ * walk must not read past its "?#\0" literal.  The child runs the cases, so
+ * a sanitizer report on that read fails the test.
+ */
+
+static int
+nxt_complex_uri_test_child(void *data)
+{
+    u_char        *end;
+    size_t        n;
+    nxt_bool_t    enc;
+    nxt_uint_t    i;
+    nxt_thread_t  *thr;
+    u_char        buf[64];
+
+    static const struct {
+        nxt_str_t   in;
+        nxt_str_t   out;
+        nxt_bool_t  encoded;
+    } cases[] = {
+        { nxt_string("/a?\0"),       nxt_string("/a?%00"),         0 },
+        { nxt_string("/a#\0"),       nxt_string("/a#%00"),         0 },
+        { nxt_string("/a?#\0"),      nxt_string("/a?#%00"),        0 },
+        { nxt_string("/a?\0 "),      nxt_string("/a?%00%20"),      0 },
+        { nxt_string("/a?#\0\0 "),   nxt_string("/a?#%00%00%20"),  0 },
+        { nxt_string("/a?\0#b"),     nxt_string("/a?%00#b"),       0 },
+        { nxt_string("\0?"),         nxt_string("%00?"),           0 },
+        { nxt_string("/a?\r\n#\r"),  nxt_string("/a?%0D%0A#%0D"),  0 },
+        { nxt_string("/a?b#c"),      nxt_string("/a?b#c"),         1 },
+        { nxt_string("/a?b?c#d#"),   nxt_string("/a?b%3Fc#d%23"),  0 },
+        { nxt_string("#?"),          nxt_string("#%3F"),           0 },
+        { nxt_string("/a?%00"),      nxt_string("/a?%2500"),       1 },
+    };
+
+    thr = data;
+
+    for (i = 0; i < nxt_nitems(cases); i++) {
+        enc = nxt_is_complex_uri_encoded(cases[i].in.start,
+                                         cases[i].in.length);
+
+        NXT_TEST_CHECK(thr->log, enc == cases[i].encoded,
+                       "complex uri test failed: case %ui is %sencoded",
+                       i, enc ? "" : "not ");
+
+        n = nxt_encode_complex_uri(NULL, cases[i].in.start,
+                                   cases[i].in.length);
+
+        NXT_TEST_CHECK(thr->log,
+                       cases[i].in.length + 2 * n == cases[i].out.length,
+                       "complex uri test failed: case %ui counts %uz",
+                       i, n);
+
+        end = (u_char *) nxt_encode_complex_uri(buf, cases[i].in.start,
+                                                cases[i].in.length);
+
+        NXT_TEST_CHECK(thr->log,
+                       nxt_str_eq(&cases[i].out, buf, (size_t) (end - buf)),
+                       "complex uri test failed: case %ui gave \"%*s\", "
+                       "not \"%V\"", i, (size_t) (end - buf), buf,
+                       &cases[i].out);
+    }
+
+    return 0;
+}
+
+
+static nxt_int_t
+nxt_complex_uri_test(nxt_thread_t *thr)
+{
+    int  ret;
+
+    ret = nxt_test_in_child(thr, "complex uri test",
+                            nxt_complex_uri_test_child, thr);
+
+    NXT_TEST_CHECK(thr->log, ret == 0,
+                   "complex uri test failed: the child gave %d", ret);
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log, "complex uri test passed");
+
+    return NXT_OK;
+}
+
+
 static nxt_int_t (*const nxt_security_tests[])(nxt_thread_t *) = {
     nxt_checked_test, nxt_port_mmap_read_test,
     nxt_router_response_parse_test, nxt_port_frag_test,
     nxt_port_release_test, nxt_process_use_test, nxt_nncq_bound_test,
     nxt_nncq_wrap_test,
     nxt_app_queue_test, nxt_size_bound_test, nxt_mp_cluster_cache_test,
-    nxt_casecmp_test, nxt_http_comp_name_test,
+    nxt_casecmp_test, nxt_http_comp_name_test, nxt_http_date_range_test,
+    nxt_complex_uri_test,
 #if (NXT_HAVE_REGEX)
     nxt_regex_test,
 #endif
-    nxt_usdt_test,
+    nxt_usdt_test, nxt_timer_rearm_test,
 };
 
 

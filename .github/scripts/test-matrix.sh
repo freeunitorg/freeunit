@@ -30,7 +30,7 @@
 # run and does not see a new label.
 #
 # The one leg is the newest version that pkg/eol.json marks "lts", or the
-# newest version when the runtime marks none: java-25, node-26, php-8.5,
+# newest version when the runtime marks none: java-25, node-26, php-8.6 (with its php-8.6-zts leg),
 # go-1.27 and ruby-4.0 today.  A java version that is not LTS gets six
 # months of updates, so for java the newest LTS is the version that stays in
 # use longest.  The other versions still run on every master push, apart
@@ -143,7 +143,10 @@ matrix() {
                   else $v end
               else one($v)
               end
-            | map($rt + "-" + .version);
+            # "zts_variant" (PHP 8.6+) adds a thread-safe leg, "-zts", next
+            # to each selected version.
+            | map($rt + "-" + .version,
+                  (if .zts_variant then $rt + "-" + .version + "-zts" else empty end));
 
         def python_legs:
             (.runtimes.python // []) as $v
@@ -178,7 +181,7 @@ self_test() {
   "python": [{"version": "3.12"}, {"version": "3.13"}, {"version": "3.14"}],
   "java": [{"version": "17", "lts": true}, {"version": "21", "lts": true},
            {"version": "25", "lts": true}, {"version": "26"}, {"version": "27"}],
-  "php": [{"version": "8.4"}, {"version": "8.5"}],
+  "php": [{"version": "8.4"}, {"version": "8.5", "zts_variant": true}],
   "go": [{"version": "1.9", "note": "EOL (2026-04)"}, {"version": "1.10"}],
   "node": [{"version": "20", "note": "EOL"}, {"version": "22"},
            {"version": "24"}, {"version": "26", "lts": true}],
@@ -189,7 +192,7 @@ EOF
     local py="python-3.12 python-3.14"
     local pyall="python-3.12 python-3.13 python-3.14"
     local j1="java-25" jall="java-17 java-25 java-27"
-    local p1="php-8.5" pall="php-8.4 php-8.5"
+    local p1="php-8.5 php-8.5-zts" pall="php-8.4 php-8.5 php-8.5-zts"
     local g1="go-1.10" gall="go-1.9 go-1.10"
     local n1="node-26" nall="node-22 node-26"
     local r1="ruby-4.0" rall="ruby-3.4 ruby-4.0"

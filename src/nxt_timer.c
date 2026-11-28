@@ -336,7 +336,16 @@ nxt_timer_handler(nxt_task_t *task, void *obj, void *data)
 
     timer->queued = 0;
 
-    if (timer->enabled && timer->change == NXT_TIMER_NO_CHANGE) {
+    /*
+     * nxt_timer_expire() removed the timer from the tree before it queued
+     * this work.  If the timer is in the tree again, it was armed again and
+     * a full change batch was committed early.  It then fires from the tree
+     * at its new time, as it does when the change is still pending.
+     */
+
+    if (timer->enabled && timer->change == NXT_TIMER_NO_CHANGE
+        && !nxt_timer_is_in_tree(timer))
+    {
         timer->enabled = 0;
 
         timer->handler(task, timer, NULL);

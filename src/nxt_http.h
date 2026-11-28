@@ -452,6 +452,30 @@ struct nxt_http_forward_s {
 
 #define NXT_HTTP_DATE_LEN  nxt_length("Wed, 31 Dec 1986 16:40:00 GMT")
 
+/*
+ * An HTTP date has a year of 4 digits, and "%4d" pads a smaller year with
+ * spaces.  So nxt_http_date() gives a valid date only from January 1, 1000
+ * to December 31, 9999.  nxt_gmtime() is exact in this range.  Outside it,
+ * nxt_gmtime() can give a month that is not an index of the name table.
+ * A caller with a time that is not the current time, such as
+ * a file mtime, checks it with nxt_http_date_valid() first.  A 4-byte
+ * nxt_time_t is always in this range.
+ */
+
+#define NXT_HTTP_DATE_MIN  (-30610224000LL)  /* Wed, 01 Jan 1000 00:00:00. */
+#define NXT_HTTP_DATE_MAX  253402300799LL    /* Fri, 31 Dec 9999 23:59:59. */
+
+nxt_inline nxt_bool_t
+nxt_http_date_valid(nxt_time_t t)
+{
+#if (NXT_TIME_T_SIZE > 4)
+    return (t >= NXT_HTTP_DATE_MIN && t <= NXT_HTTP_DATE_MAX);
+#else
+    return 1;
+#endif
+}
+
+
 nxt_inline u_char *
 nxt_http_date(u_char *buf, struct tm *tm)
 {

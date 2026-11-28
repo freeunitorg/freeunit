@@ -515,6 +515,25 @@ nxt_php_start(nxt_task_t *task, nxt_process_data_t *data)
     conf = data->app;
     c = &conf->u.php;
 
+#if (PHP_VERSION_ID >= 80500)
+    /*
+     * The worker is a fork() of the prototype process, which ran
+     * php_module_startup() in nxt_php_setup().  Every forking PHP SAPI
+     * (fpm, cgi, apache2handler, litespeed, the cli server) calls
+     * php_child_init() in the child after the fork; the module did not.
+     *
+     * Since PHP 8.5 php_child_init() gives the child its own Zend MM heap
+     * key (a release build inherits the prototype's key stream otherwise,
+     * so every worker of an application shares one deterministic sequence;
+     * a debug build aborts at the end of the first request on the
+     * "heap was re-used ... after a fork" assertion).  From PHP 8.7 it also
+     * runs the modules' child_init handlers, such as the session GC seed.
+     * The max_execution_time timer does not need it: init_executor()
+     * re-creates the timer on every request.
+     */
+    php_child_init();
+#endif
+
     n = (c->targets != NULL) ? nxt_conf_object_members_count(c->targets) : 1;
 
     nxt_php_targets = nxt_zalloc(sizeof(nxt_php_target_t) * n);
@@ -1921,6 +1940,24 @@ shutdown:
 nxt_inline void
 nxt_php_vcwd_chdir(nxt_unit_request_info_t *req, u_char *dir)
 {
+#ifdef VIRTUAL_DIR
+    char  real[PATH_MAX];
+
+    /*
+     * A thread-safe (ZTS) PHP has a virtual working directory: VCWD_CHDIR()
+     * is virtual_chdir(), which does no chdir() and resolves the path
+     * through the realpath cache of PHP.  The cache keeps a symlink on the
+     * path for "realpath_cache_ttl" seconds, 120 by default, so after a
+     * deploy that replaces a symlink the requests would run in the old
+     * directory.  The path is resolved by the system here on every request,
+     * as chdir() does for a non-thread-safe PHP.  A resolved path has no
+     * symlink, so the cache cannot make it stale.
+     */
+    if (nxt_fast_path(realpath((char *) dir, real) != NULL)) {
+        dir = (u_char *) real;
+    }
+#endif
+
     if (nxt_slow_path(VCWD_CHDIR((char *) dir) != 0)) {
         nxt_unit_req_alert(req, "VCWD_CHDIR(%s) failed (%d: %s)",
                            dir, errno, strerror(errno));

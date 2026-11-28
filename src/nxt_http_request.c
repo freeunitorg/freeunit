@@ -202,8 +202,19 @@ nxt_http_validate_host(nxt_str_t *host, nxt_mp_t *mp)
         }
     }
 
-    if (dot_pos == host_length - 1) {
+    /*
+     * Cut one trailing dot of the host part.  Test the last byte of the
+     * host part.  The last dot of the value can be in the port.
+     */
+
+    if (host_length != 0 && h[host_length - 1] == '.') {
         host_length--;
+    }
+
+    /* An http URI must not have an empty host (RFC 9110, Section 4.2.1). */
+
+    if (nxt_slow_path(host_length == 0)) {
+        return NXT_HTTP_BAD_REQUEST;
     }
 
     host->length = host_length;

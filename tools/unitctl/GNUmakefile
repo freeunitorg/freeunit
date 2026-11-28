@@ -14,7 +14,6 @@ endif
 
 RPM_ARCH           := $(shell uname -m)
 VERSION            ?= $(shell $(SED) -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' $(CURDIR)/unitctl/Cargo.toml)
-SRC_REPO           := https://github.com/nginxinc/unit-rust-sdk
 DEFAULT_TARGET     ?= $(shell $(RUSTUP) toolchain list | $(GREP) '(default)' | cut -d' ' -f1 | cut -d- -f2-)
 SHELL              := /bin/bash
 OUTPUT_BINARY      ?= unitctl

@@ -8,9 +8,11 @@
 
 
 /*
- * The function is valid for any nxt_time_t that lands on a calendar date
- * from year 1 onward -- that is the whole range of a 32-bit time_t, and
- * every pre-epoch timestamp a filesystem can hold.
+ * The function is exact from February 28 of year 0 onward.  That is the
+ * whole range of a 32-bit time_t.  When nxt_uint_t is 4 bytes, it is exact
+ * only up to March 18, 29398.  Outside this range the month can be a value
+ * outside 0 to 11.  A caller with a time that is not the current time, such
+ * as a file mtime, checks it with nxt_http_date_valid() first.
  */
 
 void

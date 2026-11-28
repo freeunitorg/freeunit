@@ -11,6 +11,7 @@
 #include <nxt_h1proto.h>
 #include <nxt_websocket.h>
 #include <nxt_websocket_header.h>
+#include <nxt_checked.h>
 
 
 /*
@@ -79,6 +80,7 @@ nxt_inline void nxt_h1p_request_error(nxt_task_t *task, nxt_h1proto_t *h1p,
     nxt_http_request_t *r);
 static void nxt_h1p_request_close(nxt_task_t *task, nxt_http_proto_t proto,
     nxt_socket_conf_joint_t *joint);
+static void nxt_h1p_request_unsent(nxt_task_t *task, nxt_conn_t *c);
 static void nxt_h1p_conn_sent(nxt_task_t *task, void *obj, void *data);
 static void nxt_h1p_conn_close(nxt_task_t *task, void *obj, void *data);
 static void nxt_h1p_conn_error(nxt_task_t *task, void *obj, void *data);
@@ -235,19 +237,15 @@ void
 nxt_http_conn_init(nxt_task_t *task, void *obj, void *data)
 {
     nxt_conn_t               *c;
-    nxt_socket_conf_t        *skcf;
     nxt_event_engine_t       *engine;
+#if (NXT_TLS)
     nxt_listen_event_t       *lev;
     nxt_socket_conf_joint_t  *joint;
+#endif
 
     c = obj;
-    lev = data;
 
     nxt_debug(task, "http conn init");
-
-    joint = lev->socket.data;
-    skcf = joint->socket_conf;
-    c->local = skcf->sockaddr;
 
     engine = task->thread->engine;
     c->read_work_queue = &engine->fast_work_queue;
@@ -256,7 +254,10 @@ nxt_http_conn_init(nxt_task_t *task, void *obj, void *data)
     c->read_state = &nxt_h1p_idle_state;
 
 #if (NXT_TLS)
-    if (skcf->tls != NULL) {
+    lev = data;
+    joint = lev->socket.data;
+
+    if (joint->socket_conf->tls != NULL) {
         c->read_state = &nxt_http_idle_state;
     }
 #endif
@@ -600,7 +601,15 @@ nxt_h1p_conn_request_init(nxt_task_t *task, void *obj, void *data)
             skcf = joint->socket_conf;
             r->log_route = skcf->log_route;
 
-            if (c->local == NULL) {
+            /*
+             * The address is memory of the configuration.  Take it from
+             * the joint of this request.  A connection keeps no joint of
+             * a finished request, so the address of an earlier request
+             * can be freed by now.  For a wildcard listener the
+             * address is NULL; then c->local is from getsockname() in the
+             * connection pool and stays valid.
+             */
+            if (skcf->sockaddr != NULL) {
                 c->local = skcf->sockaddr;
             }
 
@@ -744,11 +753,25 @@ static nxt_int_t
 nxt_h1p_header_process(nxt_task_t *task, nxt_h1proto_t *h1p,
     nxt_http_request_t *r)
 {
-    u_char     *m;
+    u_char     *m, *p;
     nxt_int_t  ret;
 
     r->target.start = h1p->parser.target_start;
     r->target.length = h1p->parser.target_end - h1p->parser.target_start;
+
+    /*
+     * A raw "#" starts a fragment.  The parser ends the path and the query
+     * there, and it marks such a target as complex.  The target also ends
+     * there, so a proxy upstream, an application and "$request_uri" do not
+     * get the fragment.  "$request_line" keeps the line as received.
+     */
+    if (h1p->parser.complex_target) {
+        p = memchr(r->target.start, '#', r->target.length);
+
+        if (p != NULL) {
+            r->target.length = p - r->target.start;
+        }
+    }
 
     if (h1p->parser.version.ui64 != 0) {
         r->version.start = h1p->parser.version.str;
@@ -1649,8 +1672,15 @@ nxt_h1p_conn_request_body_read(nxt_task_t *task, void *obj, void *data)
                                                 size);
 
                 } else {
-                    rest = nxt_event_engine_buf_mem_alloc(engine,
-                                       nxt_max(size, skcf->header_buffer_size));
+                    /*
+                     * The client chooses "size".  The engine buffer cache
+                     * keeps one class for each size and never frees it,
+                     * so the buffer comes from the connection pool.  Its
+                     * completion handler frees it into that pool.
+                     */
+                    rest = nxt_buf_mem_alloc(c->mem_pool,
+                                       nxt_max(size, skcf->header_buffer_size),
+                                       0);
                     if (nxt_slow_path(rest == NULL)) {
                         h1p->keepalive = 0;
                         nxt_http_request_error(task, r,
@@ -2628,8 +2658,56 @@ nxt_h1p_request_close(nxt_task_t *task, nxt_http_proto_t proto,
         nxt_h1p_keepalive(task, h1p, c);
 
     } else {
+        nxt_h1p_request_unsent(task, c);
         nxt_h1p_shutdown(task, c);
     }
+}
+
+
+/*
+ * The connection closes, so the buffers still in c->write are not sent.
+ * Usually there are none.  An upgraded connection can have frames of the
+ * application there when the client goes away: its error handler closes
+ * the request directly, and nxt_h1p_request_discard() does not run.
+ * Complete the buffers now, while the request exists: their handlers give
+ * shared memory back to the application and release the request pool.
+ * nxt_conn_close() later only drops the pointer.
+ *
+ * A last buffer is not completed.  Its handler ends the request, and the
+ * request ends here already.  Its memory is in the request pool.
+ */
+
+static void
+nxt_h1p_request_unsent(nxt_task_t *task, nxt_conn_t *c)
+{
+    nxt_buf_t  *b, *next, *out, **tail;
+
+    b = c->write;
+
+    if (b == NULL) {
+        return;
+    }
+
+    c->write = NULL;
+
+    out = NULL;
+    tail = &out;
+
+    do {
+        next = b->next;
+        b->next = NULL;
+
+        if (!nxt_buf_is_last(b)) {
+            *tail = b;
+            tail = &b->next;
+        }
+
+        b = next;
+    } while (b != NULL);
+
+    nxt_debug(task, "h1p request unsent");
+
+    nxt_sendbuf_drain(task, &task->thread->engine->fast_work_queue, out);
 }
 
 
@@ -2950,6 +3028,17 @@ nxt_h1p_shutdown(nxt_task_t *task, nxt_conn_t *c)
                 nxt_debug(task, "h1p already scheduled ws shutdown");
             }
 
+            /*
+             * The connection closes when the timer runs.  Until then it
+             * has no request, and the read and write handlers and the
+             * connection timers expect one.  So read nothing more and
+             * stop the connection timers, as nxt_conn_close() and its
+             * close handler do.
+             */
+            c->block_read = 1;
+            nxt_timer_disable(task->thread->engine, &c->read_timer);
+            nxt_timer_disable(task->thread->engine, &c->write_timer);
+
             return;
         }
     }
@@ -2984,6 +3073,12 @@ nxt_h1p_closing(nxt_task_t *task, nxt_conn_t *c)
 
     if (c->u.tls != NULL) {
         c->write_state = &nxt_h1p_shutdown_state;
+
+        /*
+         * The TLS shutdown clears c->read_state and can wait for the
+         * socket.  A read that is already queued must not run then.
+         */
+        c->block_read = 1;
 
         c->io->shutdown(task, c, NULL);
         return;
@@ -3335,20 +3430,29 @@ nxt_h1p_peer_request_target(nxt_http_request_t *r, nxt_str_t *target)
 
     /*
      * The URI was rewritten, so r->path is the rewrite result, not the request
-     * line as received.  nxt_http_parse_complex_target() copies any byte that
-     * is not "%"-quoted verbatim, so a rewrite that interpolates a variable
-     * (e.g. "$uri") can place a raw CR, LF or space into r->path.  Encode by
-     * the path's actual content so such a byte cannot break the upstream
-     * request line (request smuggling / header injection).
+     * line as received.  The parse of the rewrite result decodes "%XX" and
+     * copies every other byte, so r->path can hold a raw CR, LF or space: from
+     * the value of a variable such as "$uri", or from the text of the
+     * template.  Encode by the path's actual content so such a byte cannot
+     * break the upstream request line (request smuggling / header injection).
+     *
+     * r->path is a decoded path only.  A "?" or "#" in it is data, so it is
+     * encoded too.  The query follows from r->args.
      */
-    encode = nxt_encode_complex_uri(NULL, r->path->start, r->path->length);
+    encode = nxt_encode_uri(NULL, r->path->start, r->path->length);
 
     if (encode == 0 && r->args->length == 0) {
         *target = *r->path;
         return NXT_OK;
     }
 
-    size = r->path->length + encode * 2 + 1 + r->args->length;
+    if (nxt_slow_path(nxt_size_mul(encode, 2, &size) != 0
+                      || nxt_size_add(size, r->path->length, &size) != 0
+                      || nxt_size_add(size, 1, &size) != 0
+                      || nxt_size_add(size, r->args->length, &size) != 0))
+    {
+        return NXT_ERROR;
+    }
 
     target->start = nxt_mp_nget(r->mem_pool, size);
     if (target->start == NULL) {
@@ -3356,8 +3460,8 @@ nxt_h1p_peer_request_target(nxt_http_request_t *r, nxt_str_t *target)
     }
 
     if (encode > 0) {
-        p = (u_char *) nxt_encode_complex_uri(target->start, r->path->start,
-                                              r->path->length);
+        p = (u_char *) nxt_encode_uri(target->start, r->path->start,
+                                      r->path->length);
 
     } else {
         p = nxt_cpymem(target->start, r->path->start, r->path->length);
@@ -3503,10 +3607,17 @@ nxt_h1p_peer_io_read_handler(nxt_task_t *task, nxt_conn_t *c)
 
     n = c->io->recvbuf(c, b);
 
+    /*
+     * NXT_AGAIN does not end the read.  A buffer that was already in
+     * c->read holds a partly read response header, and the parser state
+     * and the stored fields point into it.  Keep it, the next read appends
+     * to it.  Free only a new buffer, or any buffer on a close or an error.
+     */
+
     if (n > 0) {
         c->read = b;
 
-    } else {
+    } else if (n != NXT_AGAIN || b != c->read) {
         c->read = NULL;
         nxt_http_proxy_buf_mem_free(task, r, b);
     }
@@ -3741,6 +3852,9 @@ nxt_h1p_peer_header_read_done(nxt_task_t *task, void *obj, void *data)
         peer->status = NXT_HTTP_BAD_GATEWAY;
         break;
     }
+
+    /* nxt_h1p_peer_free() frees a buffer that is still in c->read. */
+    c->read = NULL;
 
     nxt_http_proxy_buf_mem_free(task, r, b);
 
@@ -4237,11 +4351,30 @@ static const nxt_conn_state_t  nxt_h1p_peer_close_state
 static void
 nxt_h1p_peer_free(nxt_task_t *task, void *obj, void *data)
 {
+    nxt_buf_t   *b;
     nxt_conn_t  *c;
 
     c = obj;
 
     nxt_debug(task, "h1p peer free");
+
+    /*
+     * A response header that is not complete is still in c->read when the
+     * header read ends by a timeout, by an error event, or by a close that
+     * the event engine reports without a read.  Free it here.  No ready
+     * handler of the read state is queued now: the engine runs the read
+     * work queue before the queues of the close.  A queued
+     * nxt_conn_io_read() can still run after this function.  It returns
+     * on c->block_read and does not use c->read.  The buffer holds a
+     * retain of the request pool, so the request in b->parent is still
+     * valid.
+     */
+    b = c->read;
+
+    if (b != NULL) {
+        c->read = NULL;
+        nxt_http_proxy_buf_mem_free(task, b->parent, b);
+    }
 
     nxt_conn_free(task, c);
 }

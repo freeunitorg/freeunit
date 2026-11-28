@@ -215,6 +215,15 @@ The unit-docs repository needs a copy of CHANGES under
 source/CHANGES.txt
 
 
+# The Homebrew tap
+
+After the release tag is pushed and the `unitctl/X.Y.Z` release exists,
+bump the tap
+[freeunitorg/homebrew-unit](https://github.com/freeunitorg/homebrew-unit).
+The steps are in `pkg/community/MACOS.md`, section
+"Bump the tap on a release".
+
+
 # Post release
 
 Immediately after release we should open the next version: add a new

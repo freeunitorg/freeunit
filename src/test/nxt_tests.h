@@ -130,6 +130,7 @@ nxt_int_t nxt_port_doorbell_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_share_test(nxt_thread_t *thr);
 nxt_int_t nxt_cloexec_test(nxt_thread_t *thr);
 nxt_int_t nxt_checked_test(nxt_thread_t *thr);
+nxt_int_t nxt_timer_rearm_test(nxt_thread_t *thr);
 nxt_int_t nxt_conn_close_test(nxt_thread_t *thr);
 nxt_int_t nxt_router_response_parse_test(nxt_thread_t *thr);
 nxt_int_t nxt_port_frag_test(nxt_thread_t *thr);

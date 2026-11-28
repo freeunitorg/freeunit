@@ -1329,12 +1329,13 @@ nxt_isolation_pivot_root(nxt_task_t *task, const char *path)
 static nxt_int_t
 nxt_isolation_make_private_mount(nxt_task_t *task, const char *rootfs)
 {
+    void           *p;
     char           *parent_mnt;
     FILE           *procfile;
     u_char         **mounts;
     size_t         len;
     uint8_t        *shared;
-    nxt_int_t      ret, index, nmounts;
+    nxt_int_t      ret, index, nmounts, nfilled;
     struct mntent  *ent;
 
     static const char  *mount_path = "/proc/self/mounts";
@@ -1345,6 +1346,7 @@ nxt_isolation_make_private_mount(nxt_task_t *task, const char *rootfs)
     procfile = NULL;
     parent_mnt = NULL;
 
+    nfilled = 0;
     nmounts = 256;
 
     mounts = nxt_malloc(nmounts * sizeof(uintptr_t));
@@ -1376,6 +1378,11 @@ again:
         }
 
         mounts[index] = (u_char *) strdup(ent->mnt_dir);
+        if (nxt_slow_path(mounts[index] == NULL)) {
+            goto fail;
+        }
+
+        nfilled = index + 1;
         shared[index] = hasmntopt(ent, "shared") != NULL;
     }
 
@@ -1383,15 +1390,20 @@ again:
         /* there are still entries to be read */
 
         nmounts *= 2;
-        mounts = nxt_realloc(mounts, nmounts);
-        if (nxt_slow_path(mounts == NULL)) {
+
+        p = nxt_realloc(mounts, nmounts * sizeof(uintptr_t));
+        if (nxt_slow_path(p == NULL)) {
             goto fail;
         }
 
-        shared = nxt_realloc(shared, nmounts);
-        if (nxt_slow_path(shared == NULL)) {
+        mounts = p;
+
+        p = nxt_realloc(shared, nmounts);
+        if (nxt_slow_path(p == NULL)) {
             goto fail;
         }
+
+        shared = p;
 
         goto again;
     }
@@ -1469,7 +1481,7 @@ fail:
     }
 
     if (mounts != NULL) {
-        for (index = 0; index < nmounts; index++) {
+        for (index = 0; index < nfilled; index++) {
             nxt_free(mounts[index]);
         }
 

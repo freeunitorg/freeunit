@@ -1,6 +1,6 @@
 openapi: 3.0.0
 info:
-  title: "FreeUnit 1.37.2 (ex NGINX Unit)"
+  title: "FreeUnit 1.37.3 (ex NGINX Unit)"
   description: "FreeUnit (ex NGINX Unit) is a lightweight and versatile application runtime
     that provides the essential components for your web application as a
     single open-source server: running application code, serving static assets,
@@ -56,7 +56,7 @@ paths:
       operationId: getCerts
       summary: "Retrieve the certificates object"
       description: "Retrieves the entire `/certificates` section that represents
-        Unit's [stored certificates](https://unit.nginx.org/certificates/)."
+        Unit's [stored certificates](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -85,7 +85,7 @@ paths:
       summary: "Retrieve the certificate bundle object"
       description: "Retrieves the bundle description that represents
         Unit's [stored certificate bundle]
-        (https://unit.nginx.org/certificates/)."
+        (https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -114,7 +114,7 @@ paths:
       operationId: putCertBundle
       summary: "Create or replace the actual certificate bundle"
       description: "Creates the [stored certificate bundle]
-        (https://unit.nginx.org/certificates/) in Unit, or replaces it in
+        (https://docs.freeunit.org/certificates/) in Unit, or replaces it in
         place when the name exists.  The body is a PEM bundle: the server
         certificate first, then its chain, then the private key.  Main
         writes the bundle to a temporary file and renames it over the old
@@ -171,7 +171,7 @@ paths:
       operationId: getCertBundleKey
       summary: "Retrieve the certificate bundle key type"
       description: "Retrieves the bundle key type from a
-        [stored certificate bundle](https://unit.nginx.org/certificates/)."
+        [stored certificate bundle](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -203,7 +203,7 @@ paths:
       summary: "Retrieve the fingerprint of the server certificate"
       description: "Retrieves the SHA-256 fingerprint of the first
         certificate in a [stored certificate bundle]
-        (https://unit.nginx.org/certificates/), in the form
+        (https://docs.freeunit.org/certificates/), in the form
         `openssl x509 -fingerprint -sha256` prints it."
 
       tags:
@@ -236,7 +236,7 @@ paths:
       operationId: getCertBundleChain
       summary: "Retrieve the certificate bundle chain"
       description: "Retrieves the bundle chain from a
-        [stored certificate bundle](https://unit.nginx.org/certificates/)."
+        [stored certificate bundle](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -267,7 +267,7 @@ paths:
       operationId: getCertBundleChainCert
       summary: "Retrieve certificate object from the chain array"
       description: "Retrieves the individual certificate from a
-        [stored certificate bundle](https://unit.nginx.org/certificates/)."
+        [stored certificate bundle](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -298,7 +298,7 @@ paths:
       operationId: getCertBundleChainCertSubj
       summary: "Retrieve the subject from the certificate object"
       description: "Retrieves the subject from a
-        [stored certificate](https://unit.nginx.org/certificates/)."
+        [stored certificate](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -330,7 +330,7 @@ paths:
       operationId: getCertBundleChainCertSubjCN
       summary: "Retrieve the common name from the certificate subject"
       description: "Retrieves the common name from a
-        [stored certificate's subject](https://unit.nginx.org/certificates/)."
+        [stored certificate's subject](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -362,7 +362,7 @@ paths:
       operationId: getCertBundleChainCertSubjCountry
       summary: "Retrieve the country code from the certificate subject"
       description: "Retrieves the country code from a
-        [stored certificate's subject](https://unit.nginx.org/certificates/)."
+        [stored certificate's subject](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -396,7 +396,7 @@ paths:
         certificate subject"
 
       description: "Retrieves the state or province code from a
-        [stored certificate's subject](https://unit.nginx.org/certificates/)."
+        [stored certificate's subject](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -428,7 +428,7 @@ paths:
       operationId: getCertBundleChainCertSubjOrg
       summary: "Retrieve the organization name from the certificate subject"
       description: "Retrieves the organization name from a
-        [stored certificate's subject](https://unit.nginx.org/certificates/)."
+        [stored certificate's subject](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -462,7 +462,7 @@ paths:
         certificate subject"
 
       description: "Retrieves the alternative names array from a
-        [stored certificate's subject](https://unit.nginx.org/certificates/)."
+        [stored certificate's subject](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -496,7 +496,7 @@ paths:
       operationId: getCertBundleChainCertSubjAlt
       summary: "Retrieve an alternative name from the certificate subject"
       description: "Retrieves an alternative name from a
-        [stored certificate's subject](https://unit.nginx.org/certificates/)."
+        [stored certificate's subject](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -529,7 +529,7 @@ paths:
       operationId: getCertBundleChainCertIssuer
       summary: "Retrieve the issuer object from the certificate object"
       description: "Retrieves the issuer object from a
-        [stored certificate](https://unit.nginx.org/certificates/)."
+        [stored certificate](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -561,7 +561,7 @@ paths:
       operationId: getCertBundleChainCertIssuerCN
       summary: "Retrieve the common name from the certificate issuer"
       description: "Retrieves the common name from a
-        [stored certificate's issuer](https://unit.nginx.org/certificates/)."
+        [stored certificate's issuer](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -593,7 +593,7 @@ paths:
       operationId: getCertBundleChainCertissuerCountry
       summary: "Retrieve the country code from the certificate issuer"
       description: "Retrieves the country code from a
-        [stored certificate's issuer](https://unit.nginx.org/certificates/)."
+        [stored certificate's issuer](https://docs.freeunit.org/certificates/)."
       tags:
         - certificates
 
@@ -624,7 +624,7 @@ paths:
       operationId: getCertBundleChainCertIssuerState
       summary: "Retrieve the state or province code from the certificate issuer"
       description: "Retrieves the state or province code from a
-        [stored certificate's issuer](https://unit.nginx.org/certificates/)."
+        [stored certificate's issuer](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -656,7 +656,7 @@ paths:
       operationId: getCertBundleChainCertIssuerOrg
       summary: "Retrieve the organization name from the certificate issuer"
       description: "Retrieves the organization name from a
-        [stored certificate's issuer](https://unit.nginx.org/certificates/)."
+        [stored certificate's issuer](https://docs.freeunit.org/certificates/)."
       tags:
         - certificates
 
@@ -687,7 +687,7 @@ paths:
       operationId: getCertBundleChainCertValid
       summary: "Retrieve the validity object from the certificate object"
       description: "Retrieves the validity object from a
-        [stored certificate](https://unit.nginx.org/certificates/)."
+        [stored certificate](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -719,7 +719,7 @@ paths:
       operationId: getCertBundleChainCertValidSince
       summary: "Retrieve the starting time of certificate validity"
       description: "Retrieves the starting time of a
-        [stored certificate's validity](https://unit.nginx.org/certificates/)."
+        [stored certificate's validity](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -751,7 +751,7 @@ paths:
       operationId: getCertBundleChainCertValidUntil
       summary: "Retrieve the ending time of certificate validity"
       description: "Retrieves the ending time of a
-        [stored certificate's validity](https://unit.nginx.org/certificates/)."
+        [stored certificate's validity](https://docs.freeunit.org/certificates/)."
 
       tags:
         - certificates
@@ -783,7 +783,7 @@ paths:
       operationId: getConfig
       summary: "Retrieve the config"
       description: "Retrieves the `config` object that represents Unit's
-        [configuration](https://unit.nginx.org/configuration)."
+        [configuration](https://docs.freeunit.org/configuration)."
 
       tags:
         - config
@@ -856,7 +856,7 @@ paths:
       operationId: getAccessLog
       summary: "Retrieve the access log"
       description: "Retrieves the `access_log` entity that represents Unit's
-        [access log](https://unit.nginx.org/configuration/#access-log)."
+        [access log](https://docs.freeunit.org/configuration/#access-log)."
 
       tags:
         - access log
@@ -938,7 +938,7 @@ paths:
       operationId: getAccessLogFormat
       summary: "Retrieve the access log format option"
       description: "Retrieves the `format` option that represents Unit's
-        [access log format](https://unit.nginx.org/configuration/#access-log)
+        [access log format](https://docs.freeunit.org/configuration/#access-log)
         in the `access_log` object."
 
       tags:
@@ -1019,7 +1019,7 @@ paths:
       summary: "Retrieve the access log if option"
       description: "Retrieves the `if` option that represents the condition a
         request must meet to be
-        [logged](https://unit.nginx.org/configuration/#access-log)
+        [logged](https://docs.freeunit.org/configuration/#access-log)
         in the `access_log` object."
 
       tags:
@@ -1102,7 +1102,7 @@ paths:
       operationId: getAccessLogPath
       summary: "Retrieve the access log path option"
       description: "Retrieves the `path` option that represents Unit's
-        [access log path](https://unit.nginx.org/configuration/#access-log)
+        [access log path](https://docs.freeunit.org/configuration/#access-log)
         in the `access_log` object."
 
       tags:
@@ -1180,7 +1180,7 @@ paths:
       operationId: getApplications
       summary: "Retrieve the applications object"
       description: "Retrieves the `applications` object that represents Unit's
-        [applications](https://unit.nginx.org/configuration/#applications)."
+        [applications](https://docs.freeunit.org/configuration/#applications)."
       tags:
         - applications
         - config
@@ -1259,7 +1259,7 @@ paths:
       operationId: getApplication
       summary: "Retrieve an application object"
       description: "Retrieves the `{appName}` object that represents an
-        [application](https://unit.nginx.org/configuration/#applications)
+        [application](https://docs.freeunit.org/configuration/#applications)
         in Unit's control API."
 
       tags:
@@ -1337,7 +1337,7 @@ paths:
       operationId: getAppRestart
       summary: "Restart the {appName} application"
       description: "Tells Unit to [restart]
-        (https://unit.nginx.org/configuration/#process-management)
+        (https://docs.freeunit.org/configuration/#process-management)
         the application identified by `{appName}`."
 
       tags:
@@ -1369,7 +1369,7 @@ paths:
       operationId: getListeners
       summary: "Retrieve all the listeners"
       description: "Retrieves the `listeners` object whose options represent
-        individual [listeners](https://unit.nginx.org/configuration/#listeners);
+        individual [listeners](https://docs.freeunit.org/configuration/#listeners);
         each is a unique combination of a host IP address (or a `*` wildcard to
         match any host IP addresses) and a port."
 
@@ -1454,7 +1454,7 @@ paths:
       operationId: getListener
       summary: "Retrieve a listener object"
       description: "Retrieves the `{listenerName}` object that configures a
-        [listener](https://unit.nginx.org/configuration/#listeners)."
+        [listener](https://docs.freeunit.org/configuration/#listeners)."
 
       tags:
         - listeners
@@ -1546,7 +1546,7 @@ paths:
       summary: "Retrieve the pass option in a listener"
       description: "Retrieves the `pass` option that configures the destination
         where the `{listenerName}` listener object
-        [passes its requests](https://unit.nginx.org/configuration/#listeners)."
+        [passes its requests](https://docs.freeunit.org/configuration/#listeners)."
 
       tags:
         - listeners
@@ -1623,7 +1623,7 @@ paths:
       operationId: getListenerTls
       summary: "Retrieve the tls object in a listener"
       description: "Retrieves the `tls` object that configures [TLS settings]
-        (https://unit.nginx.org/configuration/#ssl-tls-configuration)
+        (https://docs.freeunit.org/configuration/#ssl-tls-configuration)
         for the `{listenerName}` listener."
 
       tags:
@@ -1714,7 +1714,7 @@ paths:
       summary: "Retrieve the conf_commands object in a listener"
       description: "Retrieves the `conf_commands` object that sets
         [TLS configuration commands]
-        (https://unit.nginx.org/configuration/#ssl-tls-configuration)
+        (https://docs.freeunit.org/configuration/#ssl-tls-configuration)
         for the `{listenerName}` listener."
 
       tags:
@@ -1804,7 +1804,7 @@ paths:
       summary: "Retrieve the session object in a listener"
       description: "Retrieves the `session` object that configures
         [TLS session settings]
-        (https://unit.nginx.org/configuration/#ssl-tls-configuration)
+        (https://docs.freeunit.org/configuration/#ssl-tls-configuration)
         for the `{listenerName}` listener."
 
       tags:
@@ -1895,7 +1895,7 @@ paths:
       summary: "Retrieve the tickets option in a listener"
       description: "Retrieves the `tickets` option that lists
         [TLS session ticket keys]
-        (https://unit.nginx.org/configuration/#ssl-tls-configuration)
+        (https://docs.freeunit.org/configuration/#ssl-tls-configuration)
         used with the `{listenerName}` listener."
 
       tags:
@@ -1933,7 +1933,7 @@ paths:
       summary: "Add a new tickets array item in a listener"
       description: "Adds a new session ticket key to the end of the `tickets`
         string array that lists [session ticket keys]
-        (https://unit.nginx.org/configuration/#ssl-tls-configuration)
+        (https://docs.freeunit.org/configuration/#ssl-tls-configuration)
         configured earlier."
 
       tags:
@@ -1973,7 +1973,7 @@ paths:
       summary: "Create or overwrite the tickets option in a listener"
       description: "Creates or overwrites the entire `tickets` option with a
         boolean, string, or string array that configures [session ticket keys]
-        (https://unit.nginx.org/configuration/#ssl-tls-configuration)
+        (https://docs.freeunit.org/configuration/#ssl-tls-configuration)
         used with the `{listenerName}` listener."
 
       tags:
@@ -2136,7 +2136,7 @@ paths:
       operationId: listListenerTlsCertificates
       summary: "Retrieve the certificate option in a listener"
       description: "Retrieves the `certificate` option that lists [certificate
-        bundles](https://unit.nginx.org/configuration/#certificate-management)
+        bundles](https://docs.freeunit.org/configuration/#certificate-management)
         used with the `{listenerName}` listener."
 
       tags:
@@ -2365,7 +2365,7 @@ paths:
       summary: "Retrieve the forwarded object in a listener"
       description: "Retrieves the `forwarded` object that configures
         [originating IP identification]
-        (https://unit.nginx.org/configuration/#ip-protocol-forwarding)
+        (https://docs.freeunit.org/configuration/#ip-protocol-forwarding)
         for the `{listenerName}` listener."
 
       tags:
@@ -2457,7 +2457,7 @@ paths:
       description: "Retrieves the `client_ip` option that configures the headers
         expected by the `{listenerName}` listener for
         [originating IP identification]
-        (https://unit.nginx.org/configuration/#originating-ip-identification)."
+        (https://docs.freeunit.org/configuration/#originating-ip-identification)."
 
       tags:
         - listeners
@@ -2529,7 +2529,7 @@ paths:
       description: "Retrieves the `protocol` option that configures the protocol
         expected by the `{listenerName}` listener for
         [originating IP identification]
-        (https://unit.nginx.org/configuration/#originating-ip-identification)."
+        (https://docs.freeunit.org/configuration/#originating-ip-identification)."
 
       tags:
         - listeners
@@ -2608,7 +2608,7 @@ paths:
       summary: "Retrieve the recursive option in a listener"
       description: "Retrieves the `recursive` option that controls how the
         `{listenerName}` listener uses [originating IP identification]
-        (https://unit.nginx.org/configuration/#originating-ip-identification)."
+        (https://docs.freeunit.org/configuration/#originating-ip-identification)."
 
       tags:
         - listeners
@@ -2709,7 +2709,7 @@ paths:
       description: "Retrieves the `source` option that defines address patterns
         for trusted addresses, used by the `{listenerName}` listener for
         [originating IP identification]
-        (https://unit.nginx.org/configuration/#originating-ip-identification)."
+        (https://docs.freeunit.org/configuration/#originating-ip-identification)."
 
       tags:
         - listeners
@@ -2743,7 +2743,7 @@ paths:
       description: "Adds a new source bundle name to the end of the  `source`
         string array defines address patterns for trusted addresses, used by
         the `{listenerName}` listener for [originating IP identification]
-        (https://unit.nginx.org/configuration/#originating-ip-identification)."
+        (https://docs.freeunit.org/configuration/#originating-ip-identification)."
 
       tags:
         - listeners
@@ -2937,7 +2937,7 @@ paths:
       summary: "Retrieve the backlog option in a listener"
       description: "Retrieves the `backlog` option that configures the
         listen(2) backlog parameter where the `{listenerName}` listener object
-        [passes its requests](https://unit.nginx.org/configuration/#listeners)."
+        [passes its requests](https://docs.freeunit.org/configuration/#listeners)."
 
       tags:
         - listeners
@@ -3002,7 +3002,7 @@ paths:
       operationId: getRoutes
       summary: "Retrieve the routes entity"
       description: "Retrieves the `routes` entity that represents Unit's
-        [routes](https://unit.nginx.org/configuration/#routes)."
+        [routes](https://docs.freeunit.org/configuration/#routes)."
 
       tags:
         - config
@@ -3077,7 +3077,7 @@ paths:
       operationId: getSettings
       summary: "Retrieve the settings object"
       description: "Retrieves the `settings` object that represents Unit's
-        [global settings](https://unit.nginx.org/configuration/#settings)."
+        [global settings](https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -3155,7 +3155,7 @@ paths:
       summary: "Retrieve the listen_threads option from settings"
       description: "Retrieves the `listen_threads` option that represents
         Unit's [listen threads]
-        (https://unit.nginx.org/configuration/#settings)."
+        (https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -3235,7 +3235,7 @@ paths:
       operationId: getSettingsTelemetry
       summary: "Retrieve the `telemetry` object from settings"
       description: "Retrieves the `telemetry` object that represents Unit's
-        [Telemetry settings](https://unit.nginx.org/configuration/#settings)."
+        [Telemetry settings](https://docs.freeunit.org/configuration/#settings)."
       tags:
         - settings
         - config
@@ -3253,7 +3253,7 @@ paths:
       operationId: putSettingsTelemetry
       summary: "Create or update the `telemetry` object in settings"
       description: "Creates or updates the `telemetry` object that represents Unit's
-        [Telemetry settings](https://unit.nginx.org/configuration/#settings)."
+        [Telemetry settings](https://docs.freeunit.org/configuration/#settings)."
       tags:
         - settings
         - config
@@ -3298,7 +3298,7 @@ paths:
       operationId: getSettingsHttp
       summary: "Retrieve the http object from settings"
       description: "Retrieves the `http` object that represents Unit's
-        [HTTP settings](https://unit.nginx.org/configuration/#settings)."
+        [HTTP settings](https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -3457,7 +3457,7 @@ paths:
       summary: "Retrieve the body_read_timeout option from http settings"
       description: "Retrieves the `body_read_timeout` option that represents
         Unit's [request body read timeout]
-        (https://unit.nginx.org/configuration/#settings)."
+        (https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -3538,7 +3538,7 @@ paths:
       summary: "Retrieve the compression object from http settings"
       description: "Retrieves the `compression` object that represents
         Unit's [HTTP compression settings]
-        (https://unit.nginx.org/configuration/#settings)."
+        (https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -4299,7 +4299,7 @@ paths:
       summary: "Retrieve the discard_unsafe_fields option from http settings"
       description: "Retrieves the `discard_unsafe_fields` option that represents
         Unit's [header processing behavior]
-        (https://unit.nginx.org/configuration/#settings)."
+        (https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -4380,7 +4380,7 @@ paths:
       summary: "Retrieve the header_read_timeout option from http settings"
       description: "Retrieves the `header_read_timeout` option that represents
         Unit's [request headers read timeout]
-        (https://unit.nginx.org/configuration/#settings)."
+        (https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -4461,7 +4461,7 @@ paths:
       summary: "Retrieve the idle_timeout option from http settings"
       description: "Retrieves the `idle_timeout` option that represents
         Unit's [keep-alive idling timeout]
-        (https://unit.nginx.org/configuration/#settings)."
+        (https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -4540,7 +4540,7 @@ paths:
       summary: "Retrieve the log_route option from http settings"
       description: "Retrieves the `log_route` option that controls
         Unit's [router logging]
-        (https://unit.nginx.org/troubleshooting/#router-log)."
+        (https://docs.freeunit.org/troubleshooting/#router-log)."
 
       tags:
         - settings
@@ -4621,7 +4621,7 @@ paths:
       summary: "Retrieve the max_body_size option from http settings"
       description: "Retrieves the `max_body_size` option that represents
         Unit's [request body size limit]
-        (https://unit.nginx.org/configuration/#settings)."
+        (https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -4781,7 +4781,7 @@ paths:
       summary: "Retrieve the send_timeout option from http settings"
       description: "Retrieves the `send_timeout` option that represents
         Unit's [response send timeout]
-        (https://unit.nginx.org/configuration/#settings)."
+        (https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -4860,7 +4860,7 @@ paths:
       summary: "Retrieve the server_version option from http settings"
       description: "Retrieves the `server_version` option that controls
         Unit's [Server header field versioning]
-        (https://unit.nginx.org/configuration/#settings)."
+        (https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -4941,7 +4941,7 @@ paths:
       summary: "Retrieve the static object from http settings"
       description: "Retrieves the `static` object that represents
         Unit's [static content settings]
-        (https://unit.nginx.org/configuration/#settings)."
+        (https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -5018,7 +5018,7 @@ paths:
       operationId: getSettingsHttpStaticMimeTypes
       summary: "Retrieve the mime_types object from static settings"
       description: "Retrieves the `mime_types` object that represents Unit's
-        [MIME type settings](https://unit.nginx.org/configuration/#settings)."
+        [MIME type settings](https://docs.freeunit.org/configuration/#settings)."
 
       tags:
         - settings
@@ -5099,7 +5099,7 @@ paths:
       operationId: getSettingsHttpStaticMimeType
       summary: "Retrieve the MIME type option from MIME type settings"
       description: "Retrieves the MIME type option that represents a
-        [MIME type](https://unit.nginx.org/configuration/#settings)
+        [MIME type](https://docs.freeunit.org/configuration/#settings)
         supported by Unit."
 
       tags:
@@ -5177,7 +5177,7 @@ paths:
       operationId: getStatus
       summary: "Retrieve the status object"
       description: "Retrieves the entire `/status` section that represents
-        Unit's [usage statistics and list of loaded modules](https://unit.nginx.org/statusapi/)."
+        Unit's [usage statistics and list of loaded modules](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5201,7 +5201,7 @@ paths:
       operationId: getStatusModules
       summary: "Retrieve the modules status object"
       description: "Retrieves the `modules` status object that represents
-        Unit's [loaded language modules](https://unit.nginx.org/statusapi/)."
+        Unit's [loaded language modules](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5318,7 +5318,7 @@ paths:
       operationId: getStatusConnections
       summary: "Retrieve the connections status object"
       description: "Retrieves the `connections` status object that represents
-        Unit's [connection statistics](https://unit.nginx.org/statusapi/)."
+        Unit's [connection statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5343,7 +5343,7 @@ paths:
       operationId: getStatusConnectionsAccepted
       summary: "Retrieve the accepted connections number"
       description: "Retrieves the `accepted` connections number that represents
-        Unit's [connection statistics](https://unit.nginx.org/statusapi/)."
+        Unit's [connection statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5368,7 +5368,7 @@ paths:
       operationId: getStatusConnectionsActive
       summary: "Retrieve the active connections number"
       description: "Retrieves the `active` connections number that represents
-        Unit's [connection statistics](https://unit.nginx.org/statusapi/)."
+        Unit's [connection statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5393,7 +5393,7 @@ paths:
       operationId: getStatusConnectionsIdle
       summary: "Retrieve the idle connections number"
       description: "Retrieves the `idle` connections number that represents
-        Unit's [connection statistics](https://unit.nginx.org/statusapi/)."
+        Unit's [connection statistics](https://docs.freeunit.org/statusapi/)."
       tags:
         - status
 
@@ -5417,7 +5417,7 @@ paths:
       operationId: getStatusConnectionsClosed
       summary: "Retrieve the closed connections number"
       description: "Retrieves the `closed` connections number that represents
-        Unit's [connection statistics](https://unit.nginx.org/statusapi/)."
+        Unit's [connection statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5443,7 +5443,7 @@ paths:
       summary: "Retrieve the requests status object"
       description: "Retrieves the `requests` status object that represents
         Unit's instance [request statistics]
-        (https://unit.nginx.org/statusapi/)."
+        (https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5467,7 +5467,7 @@ paths:
       operationId: getStatusRequestsTotal
       summary: "Retrieve the total requests number"
       description: "Retrieves the `total` requests number that represents Unit's
-        instance [request statistics](https://unit.nginx.org/statusapi/)."
+        instance [request statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5576,7 +5576,7 @@ paths:
       summary: "Retrieve the telemetry status object"
       description: "Retrieves the `telemetry` status object that represents
         Unit's [OpenTelemetry export statistics]
-        (https://unit.nginx.org/statusapi/)."
+        (https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5605,7 +5605,7 @@ paths:
       summary: "Retrieve the telemetry spans object"
       description: "Retrieves the `spans` object that represents Unit's
         [OpenTelemetry span export counters]
-        (https://unit.nginx.org/statusapi/)."
+        (https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5632,7 +5632,7 @@ paths:
       operationId: getStatusTelemetrySpansExported
       summary: "Retrieve the exported spans number"
       description: "Retrieves the `exported` spans number from Unit's
-        [telemetry statistics](https://unit.nginx.org/statusapi/), the spans
+        [telemetry statistics](https://docs.freeunit.org/statusapi/), the spans
         the collector accepted."
 
       tags:
@@ -5662,7 +5662,7 @@ paths:
       operationId: getStatusTelemetrySpansFailed
       summary: "Retrieve the failed spans number"
       description: "Retrieves the `failed` spans number from Unit's
-        [telemetry statistics](https://unit.nginx.org/statusapi/), the spans
+        [telemetry statistics](https://docs.freeunit.org/statusapi/), the spans
         whose export failed."
 
       tags:
@@ -5692,7 +5692,7 @@ paths:
       summary: "Retrieve the applications status object"
       description: "Retrieves the `applications` status object that represents
         Unit's per-app
-        [process and request statistics](https://unit.nginx.org/statusapi/)."
+        [process and request statistics](https://docs.freeunit.org/statusapi/)."
       tags:
         - status
 
@@ -5717,7 +5717,7 @@ paths:
       summary: "Retrieve the app status object"
       description: "Retrieves the app status object that represents
         Unit's per-app
-        [process and request statistics](https://unit.nginx.org/statusapi/)."
+        [process and request statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5748,7 +5748,7 @@ paths:
       summary: "Retrieve the processes app status object"
       description: "Retrieves the `processes` app status object that represents
         Unit's per-app
-        [process statistics](https://unit.nginx.org/statusapi/)."
+        [process statistics](https://docs.freeunit.org/statusapi/)."
       tags:
         - status
 
@@ -5778,7 +5778,7 @@ paths:
       summary: "Retrieve the running processes app status number"
       description: "Retrieves the `running` processes number that represents
         Unit's per-app
-        [process statistics](https://unit.nginx.org/statusapi/)."
+        [process statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5809,7 +5809,7 @@ paths:
       summary: "Retrieve the starting processes app status number"
       description: "Retrieves the `starting` processes number that represents
         Unit's per-app
-        [process statistics](https://unit.nginx.org/statusapi/)."
+        [process statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5840,7 +5840,7 @@ paths:
       summary: "Retrieve the unaccounted processes app status number"
       description: "Retrieves the `unaccounted` processes number that
         represents Unit's per-app
-        [process statistics](https://unit.nginx.org/statusapi/)."
+        [process statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5873,7 +5873,7 @@ paths:
       summary: "Retrieve the detached processes app status number"
       description: "Retrieves the `detached` processes number that
         represents Unit's per-app
-        [process statistics](https://unit.nginx.org/statusapi/)."
+        [process statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5906,7 +5906,7 @@ paths:
       summary: "Retrieve the idle processes app status number"
       description: "Retrieves the `idle` processes number that represents
         Unit's per-app
-        [process statistics](https://unit.nginx.org/statusapi/)."
+        [process statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5936,7 +5936,7 @@ paths:
       summary: "Retrieve the requests app status object"
       description: "Retrieves the `requests` app status object that represents
         Unit's per-app
-        [request statistics](https://unit.nginx.org/statusapi/)."
+        [request statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -5964,7 +5964,7 @@ paths:
       summary: "Retrieve the active requests app status number"
       description: "Retrieves the `active` requests number that represents
         Unit's per-app
-        [request statistics](https://unit.nginx.org/statusapi/)."
+        [request statistics](https://docs.freeunit.org/statusapi/)."
 
       tags:
         - status
@@ -8681,59 +8681,59 @@ tags:
   - name: access log
     description: Everything about the access log in the /config section
     externalDocs:
-      url: https://unit.nginx.org/configuration/#access-log
+      url: https://docs.freeunit.org/configuration/#access-log
 
   - name: apps
     description: Everything about applications
     externalDocs:
-      url: https://unit.nginx.org/configuration/#applications
+      url: https://docs.freeunit.org/configuration/#applications
 
   - name: certificates
     description:
       Everything about the /certificates section in Unit's control API
       in Unit's control API
     externalDocs:
-      url: https://unit.nginx.org/certificates/
+      url: https://docs.freeunit.org/certificates/
 
   - name: config
     description: Everything about the /config section in Unit's control API
     externalDocs:
-      url: https://unit.nginx.org/configuration/
+      url: https://docs.freeunit.org/configuration/
 
   - name: control
     description: Everything about the /control section in Unit's control API
     externalDocs:
-      url: https://unit.nginx.org/controlapi/
+      url: https://docs.freeunit.org/controlapi/
 
   - name: listeners
     description: Everything about listeners in the /config section
     externalDocs:
-      url: https://unit.nginx.org/configuration/#listeners
+      url: https://docs.freeunit.org/configuration/#listeners
 
   - name: routes
     description: Everything about routes in the /config section
     externalDocs:
-      url: https://unit.nginx.org/configuration/#routes
+      url: https://docs.freeunit.org/configuration/#routes
 
   - name: settings
     description: Everything about the global settings in the /config section
     externalDocs:
-      url: https://unit.nginx.org/configuration/#settings
+      url: https://docs.freeunit.org/configuration/#settings
 
   - name: status
     description: Everything about the /status section in Unit's control API
     externalDocs:
-      url: https://unit.nginx.org/statusapi/
+      url: https://docs.freeunit.org/statusapi/
 
   - name: tls
     description: Everything about SSL/TLS in Unit's control API
     externalDocs:
-      url: https://unit.nginx.org/certificates/
+      url: https://docs.freeunit.org/certificates/
 
   - name: xff
     description: Everything about X-Forwarded-* handling in Unit's control API
     externalDocs:
-      url: https://unit.nginx.org/configuration/#ip-protocol-forwarding
+      url: https://docs.freeunit.org/configuration/#ip-protocol-forwarding
 
 externalDocs:
   description: "Find us on GitHub"

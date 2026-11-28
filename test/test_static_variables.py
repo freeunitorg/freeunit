@@ -101,6 +101,19 @@ def test_static_variables_embedded_zero(temp_dir):
     assert client.get(url='/')['status'] == 404, 'empty share path'
 
 
+@pytest.mark.parametrize('value', ['', '.', ':8080', '.:8080', '.:.'])
+def test_static_variables_host_empty(temp_dir, value):
+    assert 'success' in update_share(f'{temp_dir}/assets/$host$uri')
+
+    def get(host, url):
+        return client.get(
+            url=url, headers={'Host': host, 'Connection': 'close'}
+        )['status']
+
+    assert get('dir', '/file') == 200, 'host directory'
+    assert get(value, '/dir/file') == 400, 'base directory'
+
+
 def test_static_variables_invalid(temp_dir):
     assert 'error' in update_share(f'{temp_dir}/assets/d$r$uri')
     assert 'error' in update_share(f'{temp_dir}/assets/$$uri')

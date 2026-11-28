@@ -134,6 +134,45 @@ def test_njs_variables_cacheable_access_log(findall, temp_dir):
     assert len(findall(r'localhost, 200', 'access.log')) == reqs
 
 
+def test_njs_headers_name_case(findall, wait_for_record, temp_dir):
+    assert 'success' in client.conf({"return": 200}, 'routes/0/action')
+
+    assert 'success' in client.conf(
+        {
+            'path': f'{temp_dir}/access.log',
+            'format': '`${headers["X-Name"]} ${cookies.Foo}`',
+        },
+        'access_log',
+    ), 'access_log configure'
+
+    def get(fields):
+        fields = {'Host': 'localhost', 'Connection': 'close', **fields}
+        assert client.get(headers=fields)['status'] == 200
+
+    # A header field name matches in any letter case.
+    get({'X-Name': 'a'})
+    get({'x-name': 'b'})
+    get({'X-NAME': 'c'})
+
+    # The first field with the name gives the value.
+    get({'x-name': 'd', 'X-Name': 'e'})
+
+    # A cookie name matches only in the same letter case.
+    get({'X-Name': 'f', 'Cookie': 'foo=1'})
+    get({'X-Name': 'end', 'Cookie': 'Foo=2'})
+
+    assert wait_for_record(r'^end 2$', 'access.log') is not None
+
+    assert findall(r'^.+$', 'access.log') == [
+        'a undefined',
+        'b undefined',
+        'c undefined',
+        'd undefined',
+        'f undefined',
+        'end 2',
+    ]
+
+
 def test_njs_invalid(skip_alert):
     skip_alert(r'js exception:')
 

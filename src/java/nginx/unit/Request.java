@@ -1039,7 +1039,14 @@ public class Request implements HttpServletRequest, DynamicPathRequest
         }
 
         try {
-            URI uri = new URI(getRequestURI());
+            /*
+                The base is the path that the container mapped, not the
+                request URI as the client sent it.
+             */
+            String base = context_path
+                          + ((filter_path != null) ? filter_path : "/");
+
+            URI uri = new URI(null, null, base, null);
             uri = uri.resolve(path);
 
             return context.getRequestDispatcher(uri);

@@ -13,7 +13,7 @@
  * field.  It is shared with other frontends, which validate the
  * :authority pseudo-header the same way, so the table pins the contract:
  * the port is cut off, a trailing dot is dropped, upper case is lowered
- * into a pool copy, and an empty label or a slash is a 400.
+ * into a pool copy, and an empty label, an empty host or a slash is a 400.
  */
 
 nxt_int_t
@@ -36,7 +36,18 @@ nxt_http_validate_host_test(nxt_thread_t *thr)
         { nxt_string("example.com.:8080"),  nxt_string("example.com"), NXT_OK },
         { nxt_string("[::1]:8080"),         nxt_string("[::1]"),       NXT_OK },
         { nxt_string("[::1]"),              nxt_string("[::1]"),       NXT_OK },
-        { nxt_string(""),                   nxt_string(""),            NXT_OK },
+        { nxt_string("example.com.:8.0"),   nxt_string("example.com"), NXT_OK },
+        { nxt_string("example.com:"),       nxt_string("example.com"), NXT_OK },
+        { nxt_string(""),                   nxt_null_string,
+                                                     NXT_HTTP_BAD_REQUEST },
+        { nxt_string("."),                  nxt_null_string,
+                                                     NXT_HTTP_BAD_REQUEST },
+        { nxt_string(":8080"),              nxt_null_string,
+                                                     NXT_HTTP_BAD_REQUEST },
+        { nxt_string(".:8080"),             nxt_null_string,
+                                                     NXT_HTTP_BAD_REQUEST },
+        { nxt_string(".:."),                nxt_null_string,
+                                                     NXT_HTTP_BAD_REQUEST },
         { nxt_string("a..b"),               nxt_null_string,
                                                      NXT_HTTP_BAD_REQUEST },
         { nxt_string("example.com/path"),   nxt_null_string,

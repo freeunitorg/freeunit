@@ -1,14 +1,14 @@
 name: "Build & Test (macOS)"
 
 on:
-  pull_request:
-    paths:
-      - configure
-      - 'auto/**'
-      - 'src/**'
-      - '.github/workflows/build-test-macos.yml'
+  # Optional macOS check: after a merge (a push to master or 1.37 that
+  # touches C paths) or by hand from the Actions tab.  No pull request
+  # waits for a macOS runner.
+  workflow_dispatch:
   push:
-    branches: master
+    branches:
+      - master
+      - '1.37'
     paths:
       - configure
       - 'auto/**'
@@ -16,10 +16,8 @@ on:
       - '.github/workflows/build-test-macos.yml'
 
 concurrency:
-  # Same grouping as build-test.yml: cancel superseded PR runs, never group
-  # pushes.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Every run gets its own group, so nothing supersedes or cancels another.
+  group: ${{ github.workflow }}-${{ github.run_id }}
 
 jobs:
   # The C test programs on arm64 macOS, which has 16 KiB pages (issue 595,

@@ -81,11 +81,14 @@ def pytest_addoption(parser):
         "translated onto it (see unit/port.py), so concurrent runs can each "
         "own a private band.  Default: UNIT_TEST_PORT, else 8080",
     )
-    # 300 s sits between two limits.  Below it, the slowest test that
-    # passes: the Autobahn 9.x case with --unsafe, 10.2 s on a release
-    # build, so 300 s leaves a factor of 29 for an emulated builder.  It is
-    # also above faulthandler_timeout in pytest.ini, so the stack dump at
-    # 120 s comes first.  Above it, the step that runs pytest in
+    # 300 s sits between two limits.  Below it, the slowest tests that
+    # pass.  By work: the Autobahn 9.x case with --unsafe, 10.2 s on a
+    # release build, so 300 s leaves a factor of 29 for an emulated
+    # builder.  By the clock: test/test_proxy_header_timeout.py, about
+    # 121 s, of which 120 s are two proxy timeouts that a slow builder
+    # does not stretch.  It is also above faulthandler_timeout in
+    # pytest.ini, so the stack dump at 150 s comes first.  Above it, the
+    # step that runs pytest in
     # .github/workflows/build-test.yml, with timeout-minutes 12, that is
     # 720 s.  That cap covers the whole run, so a hang costs a step its
     # normal time plus this limit, and the step has to finish before the

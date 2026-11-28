@@ -176,15 +176,12 @@ def test_python_targets_lookup_bound(findall):
     assert resp['status'] == 200, 'decoded target'
     assert resp['body'] == '1'
 
-    # The value of $arg_t is decoded two times: when the query is parsed,
-    # and again when nxt_http_pass_segments() decodes the pass segment.  So
-    # "%2531" is also the target "1".  This is existing behaviour, not a
-    # syntax that the documentation describes.  The assertion pins it, so
-    # that a change to it is not silent.
+    # The value of $arg_t is decoded once, when the query is parsed.  The
+    # pass keeps the value as it is, so "%2531" is the target "%31", which
+    # the application does not have.
 
     resp = client.get(url='/targets?t=%2531')
-    assert resp['status'] == 200, 'target decoded two times'
-    assert resp['body'] == '1'
+    assert resp['status'] == 404, 'target decoded once'
 
     resp = client.get(url='/targets?t=2')
     assert resp['status'] == 200, 'known target after misses'
@@ -287,5 +284,15 @@ def test_python_targets_lookup_bound_listener(findall):
 
     resp = client.get(url='/?a=missing', port=8082)
     assert resp['status'] == 404, 'listener, missing application'
+
+    # A listener "pass" keeps the value of a variable as it is, as a route
+    # action does: "%2531" is the target "%31" and "%2570lain" is the
+    # application "%70lain".  Neither exists.
+
+    resp = client.get(url='/?t=%2531')
+    assert resp['status'] == 404, 'listener, target decoded once'
+
+    resp = client.get(url='/?a=%2570lain', port=8082)
+    assert resp['status'] == 404, 'listener, application decoded once'
 
     assert not findall(r'exited on signal'), 'no crash'

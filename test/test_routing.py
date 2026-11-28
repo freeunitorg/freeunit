@@ -1046,15 +1046,21 @@ def test_routes_match_host_port():
     route_match({"host": "example.com"})
 
     host('example.com:8080', 200)
+    host('example.com.:8080', 200)
+    host('example.com.:8.0', 200)
 
 
 def test_routes_match_host_empty():
     route_match({"host": ""})
 
-    host('', 200)
+    host('', 400)
+    host('.', 400)
     assert (
         client.get(http_10=True, headers={})['status'] == 200
     ), 'match host empty 2'
+    assert (
+        client.get(headers={})['status'] == 200
+    ), 'match host empty, no Host, 1.1'
     assert client.get()['status'] == 404, 'match host empty 3'
 
 
@@ -1504,10 +1510,23 @@ def test_routes_match_headers_invalid():
 
 
 def test_routes_match_headers_empty_rule():
-    route_match({"headers": {"host": ""}})
+    route_match({"headers": {"x-blah": ""}})
 
-    assert client.get()['status'] == 404, 'localhost'
-    host('', 200)
+    def blah(value, status):
+        assert (
+            client.get(
+                headers={
+                    'Host': 'localhost',
+                    'X-Blah': value,
+                    'Connection': 'close',
+                }
+            )['status']
+            == status
+        ), 'match headers empty rule'
+
+    assert client.get()['status'] == 404, 'no field'
+    blah('test', 404)
+    blah('', 200)
 
 
 def test_routes_match_headers_empty():

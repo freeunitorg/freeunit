@@ -116,6 +116,10 @@ jobs:
             # configured below.  In the release test legs both the assertions
             # and ASan's report are compiled out.
             #
+            # test_proxy_interim drops 1xx responses of the upstream and keeps
+            # the response header buffer between reads.  Without ASan and
+            # UBSan a released buffer can still hold the old bytes.
+            #
             # test_chunked's split-read case drives a chunked request body whose
             # framing arrives in its own segments, which is how the request read
             # buffer reaches the parser's recycle path.  Without ASan a stale
@@ -163,6 +167,28 @@ jobs:
             # test_settings_body_temp_path is here because the old code read
             # "body_temp_path" from released memory.  Only a --debug build
             # fills that memory, so only this leg makes the test fail.
+            #
+            # test_asgi_websockets_access_log is here because the old code
+            # wrote the access log record of a WebSocket request from header
+            # buffers that were released at the upgrade.  Only ASan reports
+            # the read when the engine has freed such a buffer.
+            #
+            # test_python_local_addr_reconf is here because the old code read
+            # the listener address from a released configuration.  A release
+            # build can keep the old bytes, so only ASan makes the test fail.
+            #
+            # test_static_mtime_range serves files whose mtime has no HTTP
+            # date.  The old code read outside the month table for some of
+            # them, and only ASan reports that read.
+            #
+            # test_asgi_websockets_unsent is here because a WebSocket that
+            # ends with unsent data can leave the router with a freed buffer
+            # in its write chain.  Without ASan that read is often silent.
+            #
+            # test_asgi_websockets_unsent_tls is here because the old code
+            # ran a queued read after the TLS shutdown had cleared the read
+            # state.  A release build crashes there too.  No other test of
+            # this list closes a TLS connection with unsent data.
             tests: >-
               test/test_graceful_reload.py
               test/test_state_store.py
@@ -170,6 +196,7 @@ jobs:
               test/test_static.py
               test/test_conn_task_race.py
               test/test_proxy.py
+              test/test_proxy_interim.py
               test/test_chunked.py
               test/test_conn_recycle.py
               test/test_app_lifecycle.py
@@ -177,6 +204,11 @@ jobs:
               test/test_settings.py
               test/test_python_targets.py
               test/test_settings_body_temp_path.py
+              test/test_asgi_websockets_access_log.py
+              test/test_python_local_addr_reconf.py
+              test/test_static_mtime_range.py
+              test/test_asgi_websockets_unsent.py
+              test/test_asgi_websockets_unsent_tls.py
           - runtime: php
             apt: ""
             configure: php

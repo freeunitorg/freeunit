@@ -4,6 +4,7 @@
  */
 
 #include <nxt_main.h>
+#include <nxt_checked.h>
 
 
 struct nxt_var_s {
@@ -137,11 +138,14 @@ nxt_var_ref_get(nxt_tstr_state_t *state, nxt_str_t *name, nxt_mp_t *mp)
         mp = state->pool;
     }
 
+    ref->uri_encoded = 0;
+
     decl = nxt_var_hash_find(name);
 
     if (decl != NULL) {
         ref->handler = decl->handler;
         ref->cacheable = (mp == state->pool) ? decl->cacheable : 0;
+        ref->uri_encoded = decl->uri_encoded;
 
         goto done;
     }
@@ -623,6 +627,21 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
             escaped += size - value->length;
             length += size;
 
+        } else if ((flags & NXT_VAR_URI_ENCODE)
+                   && !ref[index].uri_encoded
+                   && value->length > 0)
+        {
+            /* Each byte to encode becomes three: "%" and two hex digits. */
+            size = nxt_encode_uri(NULL, value->start, value->length);
+
+            if (nxt_slow_path(nxt_size_mul(size, 2, &size)
+                              || nxt_size_add(escaped, size, &escaped)
+                              || nxt_size_add(length, value->length, &length)
+                              || nxt_size_add(length, size, &length)))
+            {
+                return NXT_ERROR;
+            }
+
         } else {
             length += value->length;
         }
@@ -635,7 +654,7 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
     /* No value has a byte to escape, the common case: copy them as they are. */
 
     if (escaped == 0) {
-        flags &= ~NXT_VAR_ESCAPE;
+        flags &= ~(NXT_VAR_ESCAPE | NXT_VAR_URI_ENCODE);
     }
 
     p = nxt_mp_nget(cache->pool, length);
@@ -660,6 +679,12 @@ nxt_var_interpreter(nxt_task_t *task, nxt_tstr_state_t *state,
 
         if (flags & NXT_VAR_ESCAPE) {
             p = nxt_var_escape(p, part[i]->start, part[i]->length);
+
+        } else if ((flags & NXT_VAR_URI_ENCODE)
+                   && !ref[subs[i].index].uri_encoded
+                   && part[i]->length > 0)
+        {
+            p = (u_char *) nxt_encode_uri(p, part[i]->start, part[i]->length);
 
         } else {
             p = nxt_cpymem(p, part[i]->start, part[i]->length);

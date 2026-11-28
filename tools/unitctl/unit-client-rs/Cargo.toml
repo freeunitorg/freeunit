@@ -1,6 +1,6 @@
 [package]
 name = "unit-client-rs"
-version = "1.37.2"
+version = "1.37.3"
 authors = ["Elijah Zupancic"]
 edition = "2021"
 rust-version = "1.95"
