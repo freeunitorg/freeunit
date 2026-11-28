@@ -41,6 +41,9 @@ typedef struct {
                                       nxt_bool_t last);
     void                          (*server_free)(nxt_task_t *task,
                                       nxt_tls_conf_t *conf);
+
+    void                          (*conn_init)(nxt_task_t *task,
+                                      nxt_tls_conf_t *conf, nxt_conn_t *c);
 } nxt_tls_lib_t;
 
 
@@ -66,9 +69,6 @@ struct nxt_tls_conf_s {
     nxt_lvlhsh_t                  bundle_hash;
 
     nxt_tls_tickets_t             *tickets;
-
-    void                          (*conn_init)(nxt_task_t *task,
-                                      nxt_tls_conf_t *conf, nxt_conn_t *c);
 
     const nxt_tls_lib_t           *lib;
 
