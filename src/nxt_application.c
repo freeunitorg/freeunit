@@ -732,11 +732,9 @@ nxt_proto_setup(nxt_task_t *task, nxt_process_t *process)
         }
     }
 
-    if (nxt_slow_path(nxt_app_set_environment(app_conf->environment)
-                      != NXT_OK))
-    {
-        nxt_alert(task, "failed to set environment");
-        return NXT_ERROR;
+    ret = nxt_app_context_environment(task, app_conf);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return ret;
     }
 
     if (nxt_app->setup != NULL) {
@@ -745,6 +743,48 @@ nxt_proto_setup(nxt_task_t *task, nxt_process_t *process)
             return ret;
         }
     }
+
+    ret = nxt_app_context_root(task, process, app_conf);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        return ret;
+    }
+
+    process->state = NXT_PROCESS_STATE_CREATED;
+
+    return NXT_OK;
+}
+
+
+/*
+ * The context of an application, as its prototype sets it up before it
+ * forks a worker: the environment, then the root and the working
+ * directory.  They are two functions because the prototype runs the setup
+ * of the language module in between: the module reads the environment and
+ * must load its files before the root changes.
+ *
+ * They are not static, so that a process which runs in the context of an
+ * application, but is not its prototype, sets up the same context.
+ */
+
+nxt_int_t
+nxt_app_context_environment(nxt_task_t *task, nxt_common_app_conf_t *app_conf)
+{
+    if (nxt_slow_path(nxt_app_set_environment(app_conf->environment)
+                      != NXT_OK))
+    {
+        nxt_alert(task, "failed to set environment");
+        return NXT_ERROR;
+    }
+
+    return NXT_OK;
+}
+
+
+nxt_int_t
+nxt_app_context_root(nxt_task_t *task, nxt_process_t *process,
+    nxt_common_app_conf_t *app_conf)
+{
+    nxt_int_t  ret;
 
 #if (NXT_HAVE_ISOLATION_ROOTFS)
     if (process->isolation.rootfs != NULL) {
@@ -774,8 +814,6 @@ nxt_proto_setup(nxt_task_t *task, nxt_process_t *process)
             return NXT_ERROR;
         }
     }
-
-    process->state = NXT_PROCESS_STATE_CREATED;
 
     return NXT_OK;
 }

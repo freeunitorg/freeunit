@@ -35,6 +35,7 @@ Unit configuration summary:
   njs support: ............... $NXT_NJS
   otel support: .............. $NXT_OTEL
   USDT support: .............. $NXT_USDT
+  scheduler support: ......... $NXT_SCHEDULER
 
   process isolation: ......... $NXT_ISOLATION
   cgroupv2: .................. $NXT_HAVE_CGROUP
