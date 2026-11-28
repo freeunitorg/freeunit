@@ -191,6 +191,7 @@ struct nxt_app_s {
      */
     nxt_atomic_t           port_hash_count;
 
+    nxt_atomic_t           pending_requests;
     nxt_atomic_t           active_requests;
     nxt_atomic_t           pending_processes;
     nxt_atomic_t           processes;
@@ -224,6 +225,7 @@ struct nxt_app_s {
     uint32_t               max_processes;
     uint32_t               spare_processes;
     uint32_t               max_pending_processes;
+    uint32_t               max_pending_requests;
 
     uint32_t               generation;
     uint32_t               proto_port_requests;
@@ -564,7 +566,7 @@ void nxt_router_test_listen_socket_update(nxt_task_t *task,
     nxt_joint_job_t *job, nxt_socket_conf_joint_t *joint);
 
 /* nxt_router_app_port_get(), for the app-timeout test. */
-void nxt_router_test_app_port_get(nxt_task_t *task, nxt_app_t *app,
+nxt_int_t nxt_router_test_app_port_get(nxt_task_t *task, nxt_app_t *app,
     nxt_request_rpc_data_t *req_rpc_data);
 
 /* Process deaths, failed starts and resends, for the app-timeout test. */
