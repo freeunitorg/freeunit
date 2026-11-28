@@ -441,6 +441,19 @@ nxt_conn_accept_error(nxt_task_t *task, nxt_listen_event_t *lev,
         nxt_conn_accept_close_idle(task, lev);
         return;
 
+    case EINVAL:
+        /*
+         * A graceful quit shuts down a listening socket after it disabled
+         * its read side (nxt_router_quit_close_listeners()); an accept that
+         * was queued before then fails so.
+         */
+        if (!nxt_fd_event_is_active(lev->socket.read)) {
+            nxt_debug(task, "%s(%d) %E", accept_syscall, lev->socket.fd, err);
+            return;
+        }
+
+        nxt_fallthrough;
+
     default:
         nxt_alert(task, "%s(%d) failed %E",
                   accept_syscall, lev->socket.fd, err);

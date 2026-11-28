@@ -24,8 +24,6 @@ static nxt_int_t nxt_runtime_event_engines(nxt_task_t *task, nxt_runtime_t *rt);
 static nxt_int_t nxt_runtime_thread_pools(nxt_thread_t *thr, nxt_runtime_t *rt);
 static void nxt_runtime_start(nxt_task_t *task, void *obj, void *data);
 static void nxt_runtime_initial_start(nxt_task_t *task, nxt_uint_t status);
-static void nxt_runtime_close_idle_connections(nxt_event_engine_t *engine);
-static void nxt_runtime_stop_all_processes(nxt_task_t *task, nxt_runtime_t *rt);
 static void nxt_runtime_exit(nxt_task_t *task, void *obj, void *data);
 static nxt_int_t nxt_runtime_event_engine_change(nxt_task_t *task,
     nxt_runtime_t *rt);
@@ -511,7 +509,7 @@ nxt_runtime_quit(nxt_task_t *task, nxt_uint_t status)
  * protocol state when that item runs and is closed by the next pass.
  */
 
-static void
+void
 nxt_runtime_close_idle_connections(nxt_event_engine_t *engine)
 {
     nxt_conn_t        *c;
@@ -650,7 +648,7 @@ nxt_runtime_stop_app_processes(nxt_task_t *task, nxt_runtime_t *rt)
 }
 
 
-static void
+void
 nxt_runtime_stop_all_processes(nxt_task_t *task, nxt_runtime_t *rt)
 {
     nxt_port_t     *port;

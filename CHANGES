@@ -47,6 +47,15 @@ Changes with FreeUnit 1.38.0                                     09 Nov 2026
        "opcache.restrict_api" is set, when the script is not cached, and on
        PHP older than 8.1.
 
+    *) Bugfix: on SIGQUIT the router exited at once, so the responses of the
+       requests that application processes completed during a graceful stop
+       did not reach the clients. Now the router refuses new connections,
+       closes idle connections, sends the responses in progress with
+       "Connection: close", and exits when no client connection is busy, or
+       after 8 seconds. A request that waits for an application process gets
+       a 503 response. SIGTERM during a graceful stop makes the router exit
+       at once.
+
 
 Changes with FreeUnit 1.37.3                                     27 Nov 2026
 

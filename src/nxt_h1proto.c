@@ -1902,6 +1902,11 @@ nxt_h1p_request_header_send(nxt_task_t *task, nxt_http_request_t *r,
     } else {
         http11 = nxt_h1p_is_http11(h1p);
 
+        if (nxt_slow_path(nxt_router_draining())) {
+            /* A graceful quit: tell the client this conn ends here. */
+            h1p->keepalive = 0;
+        }
+
         if (r->resp.content_length == NULL || r->resp.content_length->skip) {
 
             if (http11) {
@@ -2654,7 +2659,7 @@ nxt_h1p_request_close(nxt_task_t *task, nxt_http_proto_t proto,
      * that follows.
      */
 
-    if (h1p->keepalive) {
+    if (h1p->keepalive && !nxt_router_draining()) {
         nxt_h1p_keepalive(task, h1p, c);
 
     } else {

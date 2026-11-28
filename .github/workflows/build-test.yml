@@ -1227,6 +1227,7 @@ jobs:
       # unitd on its own state directory and stops it while a store runs.
       # test_njs_modules.py stores njs modules and starts unitd again to
       # check what it loads from the state directory.
+      # test_graceful_quit_drain.py sends SIGQUIT and SIGTERM to unitd.
       # test_python_shm_limit_stored, test_settings_timeout_stored,
       # test_settings_size_negative_stored,
       # test_access_log_credential_header_stored,
@@ -1247,6 +1248,7 @@ jobs:
                    JAVA_HOME="${JAVA_HOME:-}" TZ="${TZ:-}" \
             /usr/bin/pytest-3 --print-log --restart --port 18080 \
             test/test_asgi_lifespan.py \
+            test/test_graceful_quit_drain.py \
             test/test_njs_modules.py \
             test/test_state_store.py \
             test/test_python_shm_limit.py::test_python_shm_limit_stored \

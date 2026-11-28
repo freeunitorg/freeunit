@@ -1739,7 +1739,18 @@ nxt_main_process_sigterm_handler(nxt_task_t *task, void *obj, void *data)
      * Fast exit: do not drain in-flight requests.  The QUIT byte sent
      * to libunit workers (see nxt_runtime_stop_app_processes()) carries
      * NXT_PORT_QUIT_NORMAL so nxt_unit_quit() returns immediately.
+     *
+     * SIGTERM during a graceful quit ends the drain: nxt_runtime_quit() sends
+     * QUIT only once, so the NORMAL one is sent here.
      */
+    if (nxt_exiting && rt->quit_mode == NXT_PORT_QUIT_GRACEFUL) {
+        rt->quit_mode = NXT_PORT_QUIT_NORMAL;
+
+        nxt_runtime_stop_all_processes(task, rt);
+
+        return;
+    }
+
     rt->quit_mode = NXT_PORT_QUIT_NORMAL;
 
     nxt_main_start_exit(task);
